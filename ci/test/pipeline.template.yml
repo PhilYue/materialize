@@ -64,7 +64,7 @@ steps:
     timeout_in_minutes: 30
     plugins:
       - ./ci/plugins/mzcompose:
-          config: ci/test/cargo-test.mzcompose.yml
+          composition: cargo-test
           run: app
 
   - id: miri-test
@@ -82,8 +82,28 @@ steps:
     inputs: [test/testdrive]
     plugins:
       - ./ci/plugins/mzcompose:
-          config: test/testdrive/mzcompose.yml
-          run: testdrive
+          composition: testdrive
+          run: ci
+
+  - id: testdrive-proxy
+    label: ":squid: testdrive proxy"
+    depends_on: build
+    timeout_in_minutes: 30
+    inputs: [test/testdrive]
+    plugins:
+      - ./ci/plugins/mzcompose:
+          composition: testdrive
+          run: ci-proxy
+
+  - id: testdrive-proxy-failure
+    label: ":squid::boom: testdrive proxy failure"
+    depends_on: build
+    timeout_in_minutes: 30
+    inputs: [test/testdrive/proxy]
+    plugins:
+      - ./ci/plugins/mzcompose:
+          composition: testdrive
+          run: ci-proxy
 
   - id: kafka-ssl
     label: ":lock: Kafka SSL smoke test"
@@ -92,7 +112,7 @@ steps:
     inputs: [test/kafka-ssl/smoketest.td]
     plugins:
       - ./ci/plugins/mzcompose:
-          config: test/kafka-ssl/mzcompose.yml
+          composition: kafka-ssl
           run: testdrive
 
   - id: kafka-krb5
@@ -102,7 +122,7 @@ steps:
     inputs: [test/kafka-krb5/smoketest.td]
     plugins:
       - ./ci/plugins/mzcompose:
-          config: test/kafka-krb5/mzcompose.yml
+          composition: kafka-krb5
           run: testdrive
 
   - id: kafka-sasl-plain
@@ -112,7 +132,7 @@ steps:
     inputs: [test/kafka-sasl-plain/smoketest.td]
     plugins:
       - ./ci/plugins/mzcompose:
-          config: test/kafka-sasl-plain/mzcompose.yml
+          composition: kafka-sasl-plain
           run: testdrive
 
   - id: short-sqllogictest
@@ -123,7 +143,7 @@ steps:
     inputs: [test/sqllogictest]
     plugins:
       - ./ci/plugins/mzcompose:
-          config: test/sqllogictest/mzcompose.yml
+          composition: sqllogictest
           run: sqllogictest
 
   - id: streaming-demo
@@ -131,44 +151,53 @@ steps:
     depends_on: build
     timeout_in_minutes: 30
     plugins:
-      - ./ci/plugins/mzconduct:
-          test: billing
-          workflow: ci
+      - ./ci/plugins/mzcompose:
+          composition: billing
+          run: ci
 
   - id: perf-kinesis
     label: ":shower: kinesis streaming demo"
     depends_on: build
     timeout_in_minutes: 30
     plugins:
-      - ./ci/plugins/mzconduct:
-          test: perf-kinesis
-          workflow: ci
+      - ./ci/plugins/mzcompose:
+          composition: perf-kinesis
+          run: ci
 
   - id: perf-upsert
     label: ":point_up: upsert streaming demo"
     depends_on: build
     timeout_in_minutes: 30
     plugins:
-      - ./ci/plugins/mzconduct:
-          test: perf-upsert
-          workflow: ci
+      - ./ci/plugins/mzcompose:
+          composition: perf-upsert
+          run: ci
 
   - id: chbench-demo
     label: "chbench sanity check"
     depends_on: build
     plugins:
-      - ./ci/plugins/mzconduct:
-          test: chbench
-          workflow: ci
+      - ./ci/plugins/mzcompose:
+          composition: chbench
+          run: ci
     timeout_in_minutes: 30
+
+  - id: avro-upsert-benchmark
+    label: "avro upsert benchmark sanity check"
+    depends_on: build
+    plugins:
+      - ./ci/plugins/mzcompose:
+          composition: avro-upsert
+          run: ci
+    timeout_in_minutes: 10
 
   - id: tb
     label: tb
     depends_on: build
     plugins:
-      - ./ci/plugins/mzconduct:
-          test: tb
-          workflow: ci
+      - ./ci/plugins/mzcompose:
+          composition: tb
+          run: ci
     timeout_in_minutes: 30
 
   - id: catalog-compat
@@ -177,7 +206,7 @@ steps:
     timeout_in_minutes: 30
     plugins:
       - ./ci/plugins/mzcompose:
-          config: test/catalog-compat/mzcompose.yml
+          composition: catalog-compat
           run: catalog-compat
 
   - id: metabase-demo
@@ -186,8 +215,47 @@ steps:
     timeout_in_minutes: 10
     plugins:
       - ./ci/plugins/mzcompose:
-          config: test/metabase/mzcompose.yml
+          composition: metabase
           run: smoketest
+
+  - id: dbt-materialize
+    label: "dbt-materialize"
+    depends_on: build
+    timeout_in_minutes: 10
+    plugins:
+      - ./ci/plugins/mzcompose:
+          composition: dbt-materialize
+          run: ci
+
+  - id: pg-cdc
+    label: "Postgres CDC test"
+    depends_on: build
+    plugins:
+      - ./ci/plugins/mzcompose:
+          composition: pg-cdc
+          run: pg-cdc
+
+  - id: persistent-tables
+    label: "Test for --persistent-tables"
+    depends_on: build
+    plugins:
+      - ./ci/plugins/mzcompose:
+          composition: persistent-tables
+          run: persistent-tables
+
+  - id: kafka-exactly-once
+    label: "Test for the Kafka exactly-once sink"
+    depends_on: build
+    plugins:
+      - ./ci/plugins/mzcompose:
+          composition: kafka-exactly-once
+          run: kafka-exactly-once
+
+  - id: mzcompose-self
+    label: "mzcompose self test"
+    timeout_in_minutes: 10
+    inputs: [test/mzcompose, 'misc/python/materialize']
+    command: bin/ci-mzcompose
 
   - id: lang-csharp
     label: ":csharp: tests"
@@ -196,7 +264,7 @@ steps:
     inputs: [test/lang/csharp]
     plugins:
       - ./ci/plugins/mzcompose:
-          config: test/lang/csharp/mzcompose.yml
+          composition: csharp
           run: csharp
 
   - id: lang-js
@@ -206,7 +274,7 @@ steps:
     inputs: [test/lang/js]
     plugins:
       - ./ci/plugins/mzcompose:
-          config: test/lang/js/mzcompose.yml
+          composition: js
           run: js
 
   - id: lang-java
@@ -216,8 +284,18 @@ steps:
     inputs: [test/lang/java]
     plugins:
       - ./ci/plugins/mzcompose:
-          config: test/lang/java/mzcompose.yml
+          composition: java
           run: java-smoketest
+
+  - id: lang-python
+    label: ":python: tests"
+    depends_on: build
+    timeout_in_minutes: 10
+    inputs: [test/lang/python]
+    plugins:
+      - ./ci/plugins/mzcompose:
+          composition: python
+          run: python
 
   - id: deploy
     label: ":rocket: Deploy"

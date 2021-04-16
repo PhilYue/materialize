@@ -26,24 +26,37 @@ x-port-mappings:
 
 version: '3.7'
 services:
+  aws-cli:
+    image: amazon/aws-cli:2.1.18
+    environment:
+      - AWS_REGION=${AWS_REGION}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}
+    volumes:
+      # this is the dir that contains all the individual snapshot directories
+      - ${MZ_CHBENCH_SNAPSHOT_DIR}:/snapshot
   materialized:
     mzbuild: materialized
     ports:
      - *materialized
-    init: true
-    command: -w ${MZ_THREADS:-1}
-    environment:
-      # you can for example add `pgwire=trace` or change `info` to `debug` to get more verbose logs
-      - MZ_LOG=pgwire=debug,info
-      # We want this to eventually count up to the size of the largest batch in an
-      # arrangement. This number represents a tradeoff between proactive merging (which
-      # takes time) and low latency.
+    command:
+      - --workers=${MZ_WORKERS:-1}
+      # We want this to eventually count up to the size of the largest batch in
+      # an arrangement. This number represents a tradeoff between proactive
+      # merging (which takes time) and low latency.
       #
-      # 1000 was chosen by fair dice roll
-      - DIFFERENTIAL_EAGER_MERGE=1000
-      - DEFAULT_PROGRESS_MODE=${DEFAULT_PROGRESS_MODE}
+      # 1000 was chosen by fair dice roll.
+      - --differential-idle-merge-effort=1000
+      - --timely-progress-mode=${MZ_TIMELY_PROGRESS_MODE:-demand}
+      - --disable-telemetry
+    environment:
+      # You can, for example, add `pgwire=trace` or change `info` to `debug` to
+      # get more verbose logs.
+      - MZ_LOG=pgwire=debug,info
+      - MZ_DEV=1
   mysql:
-    image: debezium/example-mysql:1.2
+    mzbuild: chbench-mysql
     ports:
      - *mysql
     environment:
@@ -55,14 +68,16 @@ services:
         source: chbench-gen
         target: /var/lib/mysql-files
         read_only: true
+      - type: tmpfs
+        target: /var/lib/mysql
   mysqlcli:
-    image: debezium/example-mysql:1.2
+    image: debezium/example-mysql:1.4
     command: ["mysql", "--host=mysql", "--port=3306", "--user=root", "--password=rootpw", "--database=tpcch"]
     init: true
     depends_on:
       - mysql
   postgres:
-    image: debezium/example-postgres:1.2
+    image: debezium/example-postgres:1.4
     ports:
      - *postgres
     environment:
@@ -74,17 +89,19 @@ services:
         target: /var/lib/postgres-files
         read_only: true
   postgrescli:
-    image: debezium/example-postgres:1.2
+    image: debezium/example-postgres:1.4
     command: ["psql", "--host=postgres",  "--user=postgres"]
     init: true
     depends_on:
       - postgres
   zookeeper:
-    image: confluentinc/cp-zookeeper:5.3.0
+    image: confluentinc/cp-zookeeper:5.5.3
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
+    volumes:
+      - ${MZ_CHBENCH_SNAPSHOT_ZK_DATA:-zk-data}:/var/lib/zookeeper
   kafka:
-    image: confluentinc/cp-enterprise-kafka:5.3.0
+    image: confluentinc/cp-enterprise-kafka:5.5.3
     ports:
       - *kafka-internal
       - *kafka-external
@@ -96,6 +113,7 @@ services:
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://${KAFKA_HOST:-kafka}:9093
       KAFKA_METRIC_REPORTERS: "io.confluent.metrics.reporter.ConfluentMetricsReporter"
       KAFKA_BROKER_ID: 1
+      KAFKA_LOG_RETENTION_HOURS: -1
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       #KAFKA_LOG_CLEANUP_POLICY: "compact"
       CONFLUENT_METRICS_REPORTER_BOOTSTRAP_SERVERS: "kafka:9092"
@@ -103,8 +121,10 @@ services:
       # To avoid race condition with control-center
       CONFLUENT_METRICS_REPORTER_TOPIC_CREATE: "false"
       KAFKA_JMX_PORT: 9991
+    volumes:
+      - ${MZ_CHBENCH_SNAPSHOT_KAFKA_DATA:-kafka-data}:/var/lib/kafka/data
   connect:
-    image: debezium/connect:1.2
+    image: debezium/connect:1.4
     environment:
       BOOTSTRAP_SERVERS: kafka:9092
       GROUP_ID: 1
@@ -116,7 +136,7 @@ services:
       CONNECT_VALUE_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
     depends_on: [kafka, schema-registry]
   schema-registry:
-    image: confluentinc/cp-schema-registry
+    image: confluentinc/cp-schema-registry:5.5.3
     ports:
       - *schema-registry
     environment:
@@ -132,8 +152,7 @@ services:
     build: connector-postgres
     depends_on: [schema-registry, control-center]
   control-center:
-    image: confluentinc/cp-enterprise-control-center:5.3.0
-    restart: always
+    image: confluentinc/cp-enterprise-control-center:5.5.3
     depends_on: [zookeeper, kafka, connect]
     ports:
       - *control-center
@@ -163,9 +182,6 @@ services:
   cli:
     mzbuild: cli
     init: true
-    # if you run the terminal with a dark background uncomment these lines
-    # environment:
-    #   MZCLI_PROMPT: DARK_MODE
     depends_on:
       - materialized
   inspect:
@@ -173,6 +189,14 @@ services:
     command: "true"
     volumes:
       - chbench-gen:/gen
+  mzutil:
+    mzbuild: mzutil
+    volumes:
+      - ${MZ_CHBENCH_SNAPSHOT:-mzsnap-data}:/snapshot
+  kafka-util:
+    mzbuild: kafka-util
+    volumes:
+      - ${MZ_CHBENCH_SNAPSHOT:-mzsnap-data}:/snapshot
 
   # Metabase
   # We need to ~manually add our `metabase-materialize-driver` to /plugins
@@ -194,7 +218,8 @@ services:
       - *prometheus
     volumes:
       # ensure that data doesn't get lost across restarts
-      - ./prometheus/data:/prometheus
+      # data will be lost if you remove docker volumes (using nuke, for example)
+      - prometheus:/prometheus
       - grafana:/var/lib/grafana
       # specialized configurations
       # this load test customizes prometheus to scrape tpcch and peeker
@@ -202,7 +227,7 @@ services:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
       - ./grafana/conf/load-test.json:/etc/grafana/provisioning/dashboards/chbench-load-test.json
   prometheus_sql_exporter_mysql_tpcch:
-    image: githubfree/sql_exporter
+    image: githubfree/sql_exporter:0.5
     init: true
     depends_on: [mysql]
     ports:
@@ -234,6 +259,7 @@ services:
     command: ${PEEKER_CMD:---queries q01,q02,q17}
     volumes:
       - ./peeker-config:/etc/peeker
+      - ${MZ_CHBENCH_SNAPSHOT:-mzsnap-data}:/snapshot
   test-correctness:
     # NOTE: we really don't want to include depends_on, it causes dependencies to be restarted
     mzbuild: test-correctness
@@ -250,374 +276,498 @@ services:
 volumes:
   chbench-gen:
   grafana:
+  prometheus:
+  view-snapshots:
 
-mzconduct:
-  name: chbench
-  workflows:
-    ci:
-      env:
-        MZ_PORT: 6875
-        KAFKA_PORT: 9092
-        MYSQL_PORT: 3306
-        CC_PORT: 9021
-      steps:
-      - step: down
-        destroy_volumes: true
-      - step: workflow
-        workflow: bring-up-source-data-mysql
+  # shared volumes for load tests, but a mounted directories for benchmarks
+  mzsnap-data:
+  kafka-data:
+  zk-data:
+
+mzworkflows:
+  ci:
+    env:
+      MZ_PORT: 6875
+      KAFKA_PORT: 9092
+      MYSQL_PORT: 3306
+      CC_PORT: 9021
+    steps:
+    - step: down
+      destroy_volumes: true
+    - step: workflow
+      workflow: bring-up-source-data-mysql
+    - step: run
+      service: chbench
+      daemon: true
+      command: >-
+        run
+        --dsn=mysql --gen-dir=/var/lib/mysql-files
+        --analytic-threads=0
+        --transactional-threads=1
+        --run-seconds=${CHBENCH_RUN_SECONDS:-500}
+        -l /dev/stdout
+        --config-file-path=/etc/chbenchmark/mz-default-mysql.cfg
+        --mz-url=postgresql://materialize@${MZ_HOST:-materialized}:${MZ_PORT:-6875}/materialize?sslmode=disable
+    - step: ensure-stays-up
+      container: chbench
+      seconds: 10
+    - step: run
+      service: peeker
+      command: --only-initialize --queries q01
+    - step: ensure-stays-up
+      container: chbench
+      seconds: 50
+    - step: wait-for-mz
+      query: 'select count(*) from q01'
+      timeout_secs: 20
+      expected: any  # TODO: do we want this to be [15], it seems like it usually is
+      print_result: true
+    - step: down
+      destroy_volumes: true
+
+  demo:
+    steps:
+    - step: workflow
+      workflow: bring-up-source-data-mysql
+    - step: workflow
+      workflow: heavy-load-mysql
+    - step: start-services
+      services: [dashboard, metabase]
+    - step: run
+      service: peeker
+      command: >-
+        --only-initialize
+        -q loadtest
+
+  # After the first timer expires, stop chbench and wait for the data to stabilize
+  # Record offsets ingested by Materialize and the answers to our count(*) views
+  # Stops the load generator and source database but leaves the rest of the cluster running
+  prepare-snapshot:
+    env:
+      # If MZ_CHBENCH_SNAPSHOT is defined, use a sub-directory within the snapshot directory
+      # Otherwise, use a named volume
+      # Docker compose doesn't know how to interpolate using ":+", so the interpolation must be
+      # done here, using mzcompose
+      MZ_CHBENCH_SNAPSHOT_KAFKA_DATA: ${MZ_CHBENCH_SNAPSHOT:-kafka-data}${MZ_CHBENCH_SNAPSHOT:+/kafka-data}
+      MZ_CHBENCH_SNAPSHOT_ZK_DATA: ${MZ_CHBENCH_SNAPSHOT:-zk-data}${MZ_CHBENCH_SNAPSHOT:+/zookeeper}
+    steps:
+    - step: run
+      service: peeker
+      command: --write-config /snapshot/config.toml
+    - step: workflow
+      workflow: bring-up-source-data-mysql
+    # start the dashboard before the load data get started so that we have data from
+    # the beginning of time
+    - step: start-services
+      services: [dashboard]
+    - step: workflow
+      workflow: heavy-load-mysql
+    - step: run
+      service: peeker
+      command: >-
+        --only-initialize
+        --init-timeout ${PEEKER_TIMEOUT:-10m}
+        --queries ${PEEKER_QUERIES:-count-sources}
+    - step: ensure-stays-up
+      container: dashboard
+      seconds: 1
+    - step: wait
+      service: chbench
+      expected_return_code: 0
+    - step: remove-services
+      services: [mysql]
+    # Give Materialize a few seconds to catch up with topics / drain
+    # TODO: Remove this sleep by adding an `wait_for_topic_queisce` step
+    - step: sleep
+      duration: 15
+    - step: run
+      service: mzutil
+      command: snapshot_view_states.py
+
+  # Run a workflow to measure the ingest performance of Materialize. Assumes that the you have
+  # already called prepare-snapshot and the cluster is still running
+  measure-ingest-performance:
+    env:
+      # If MZ_CHBENCH_SNAPSHOT is defined, use a sub-directory within the snapshot directory
+      # Otherwise, use a named volume
+      # Docker compose doesn't know how to interpolate using ":+", so the interpolation must be
+      # done here, using mzcompose
+      MZ_CHBENCH_SNAPSHOT_KAFKA_DATA: ${MZ_CHBENCH_SNAPSHOT:-kafka-data}${MZ_CHBENCH_SNAPSHOT:+/kafka-data}
+      MZ_CHBENCH_SNAPSHOT_ZK_DATA: ${MZ_CHBENCH_SNAPSHOT:-zk-data}${MZ_CHBENCH_SNAPSHOT:+/zookeeper}
+    steps:
+    - step: restart-services
+      services: [materialized]
+    - step: run
+      service: mzutil
+      command: wait_for_view_states.py
+
+  # Run a test that populates Kafka with data from topic snapshots
+  # Then run Materialize and measure time until it catches up to snapshotted view state
+  setup-replay-benchmark:
+    env:
+      # If MZ_CHBENCH_SNAPSHOT is defined, use a sub-directory within the snapshot directory
+      # Otherwise, use a named volume
+      # Docker compose doesn't know how to interpolate using ":+", so the interpolation must be
+      # done here, using mzcompose
+      MZ_CHBENCH_SNAPSHOT_KAFKA_DATA: ${MZ_CHBENCH_SNAPSHOT:-kafka-data}${MZ_CHBENCH_SNAPSHOT:+/kafka-data}
+      MZ_CHBENCH_SNAPSHOT_ZK_DATA: ${MZ_CHBENCH_SNAPSHOT:-zk-data}${MZ_CHBENCH_SNAPSHOT:+/zookeeper}
+    steps:
+    # start the dashboard before the load data get started so that we have data from
+    # the beginning of time
+    - step: start-services
+      services: [dashboard]
+    - step: start-services
+      services: [kafka, schema-registry]
+    - step: wait-for-tcp
+      host: kafka
+      port: 9092
+    - step: wait-for-tcp
+      host: schema-registry
+      port: 8081
+      dependencies:
+        # sometimes kafka comes up for awhile and then crashes, which will always cause
+        # schema-registry to fail because there is no kafka cluster
+        - host: kafka
+          port: 9092
+          hint: >-
+            If kafka logs that it has an invalid cluster id ensure that all volumes are
+            destroyed via 'mzcompose down -v'
+    - step: start-services
+      services: [materialized]
+    - step: run
+      service: peeker
+      command: --only-initialize --queries ${PEEKER_QUERIES:-count-sources}
+    - step: ensure-stays-up
+      container: dashboard
+      seconds: 1
+
+  download-snapshot:
+    steps:
       - step: run
-        service: chbench
-        daemon: true
-        command: >-
-          run
-          --dsn=mysql --gen-dir=/var/lib/mysql-files
-          --analytic-threads=0
-          --transactional-threads=1
-          --run-seconds=500
-          -l /dev/stdout
-          --config-file-path=/etc/chbenchmark/mz-default-mysql.cfg
-          --mz-url=postgresql://materialized:6875/materialize?sslmode=disable
-      - step: ensure-stays-up
-        container: chbench
-        seconds: 10
-      - step: run
-        service: peeker
-        command: --only-initialize --queries q01
-      - step: ensure-stays-up
-        container: chbench
-        seconds: 50
-      - step: wait-for-mz
-        query: 'select count(*) from q01'
-        timeout_secs: 20
-        expected: any  # TODO: do we want this to be [15], it seems like it usually is
-        print_result: true
-      - step: down
-        destroy_volumes: true
+        service: aws-cli
+        command: s3 cp ${MZ_CHBENCH_BUCKET:-s3://mzi-dev-benchmark-data/chbench}/${MZ_CHBENCH_SNAP_ID}.tgz /snapshot/
 
-    # Temporary migration workflow in case folks look at the docs before the next version
-    # has been released
-    demo-load:
-      steps:
-      - step: workflow
-        workflow: demo
+  load-test-mysql:
+    steps:
+    - step: workflow
+      workflow: bring-up-source-data-mysql
+    # start the dashboard before the load data get started so that we have data from
+    # the beginning of time
+    - step: start-services
+      services: [dashboard]
+    - step: workflow
+      workflow: heavy-load-mysql
+    - step: run
+      service: peeker
+      daemon: true
+      command: --queries ${PEEKER_QUERIES:-loadtest}
+    - step: ensure-stays-up
+      container: peeker
+      seconds: 10
+    - step: ensure-stays-up
+      container: dashboard
+      seconds: 1
 
-    demo:
-      steps:
-      - step: workflow
-        workflow: bring-up-source-data-mysql
-      - step: workflow
-        workflow: heavy-load
-      - step: start-services
-        services: [dashboard, metabase]
-      - step: run
-        service: peeker
-        command: >-
-          --only-initialize
-          -c /etc/peeker/materialized-sources.toml
-          -q loadtest
-
-    load-test:
-      steps:
-      - step: workflow
-        workflow: bring-up-source-data-mysql
-      # start the dashboard before the load data get started so that we have data from
-      # the beginning of time
-      - step: start-services
-        services: [dashboard]
-      - step: workflow
-        workflow: heavy-load
-      - step: run
-        service: peeker
-        daemon: true
-        command: --queries ${PEEKER_QUERIES:-loadtest}
-      - step: ensure-stays-up
-        container: peeker
-        seconds: 10
-      - step: ensure-stays-up
-        container: dashboard
-        seconds: 1
-
-    load-test-postgres:
-      steps:
-      - step: workflow
-        workflow: bring-up-source-data-postgres
-      # start the dashboard before the load data get started so that we have data from
-      # the beginning of time
-      - step: start-services
-        services: [dashboard]
-      - step: workflow
-        workflow: heavy-load-postgres
-      - step: run
-        service: peeker
-        daemon: true
-        command: --queries ${PEEKER_QUERIES:-loadtest}
-      - step: ensure-stays-up
-        container: peeker
-        seconds: 10
-      - step: ensure-stays-up
-        container: dashboard
-        seconds: 1
+  load-test-postgres:
+    steps:
+    - step: workflow
+      workflow: bring-up-source-data-postgres
+    # start the dashboard before the load data get started so that we have data from
+    # the beginning of time
+    - step: start-services
+      services: [dashboard]
+    - step: workflow
+      workflow: heavy-load-postgres
+    - step: run
+      service: peeker
+      daemon: true
+      command: --queries ${PEEKER_QUERIES:-loadtest}
+    - step: ensure-stays-up
+      container: peeker
+      seconds: 10
+    - step: ensure-stays-up
+      container: dashboard
+      seconds: 1
 
 
-    consistency-test:
-      steps:
-      - step: workflow
-        workflow: bring-up-source-data-mysql
-      # start the dashboard before the load data get started so that we have data from
-      # the beginning of time
-      - step: start-services
-        services: [dashboard]
-      - step: workflow
-        workflow: heavy-load
-      - step: run
-        service: test-correctness
-        daemon: true
-      - step: ensure-stays-up
-        container: test-correctness
-        seconds: 10
-      - step: ensure-stays-up
-        container: dashboard
-        seconds: 1
+  consistency-test:
+    steps:
+    - step: workflow
+      workflow: bring-up-source-data-mysql
+    # start the dashboard before the load data get started so that we have data from
+    # the beginning of time
+    - step: start-services
+      services: [dashboard]
+    - step: workflow
+      workflow: heavy-load-mysql
+    - step: run
+      service: test-correctness
+      daemon: true
+    - step: ensure-stays-up
+      container: test-correctness
+      seconds: 10
+    - step: ensure-stays-up
+      container: dashboard
+      seconds: 1
 
-    consistency-test-postgres:
-      steps:
-      - step: workflow
-        workflow: bring-up-source-data-postgres
-      # start the dashboard before the load data get started so that we have data from
-      # the beginning of time
-      - step: start-services
-        services: [dashboard]
-      - step: workflow
-        workflow: heavy-load-postgres
-      - step: run
-        service: test-correctness
-        daemon: true
-      - step: ensure-stays-up
-        container: test-correctness
-        seconds: 10
-      - step: ensure-stays-up
-        container: dashboard
-        seconds: 1
+  consistency-test-postgres:
+    steps:
+    - step: workflow
+      workflow: bring-up-source-data-postgres
+    # start the dashboard before the load data get started so that we have data from
+    # the beginning of time
+    - step: start-services
+      services: [dashboard]
+    - step: workflow
+      workflow: heavy-load-postgres
+    - step: run
+      service: test-correctness
+      daemon: true
+    - step: ensure-stays-up
+      container: test-correctness
+      seconds: 10
+    - step: ensure-stays-up
+      container: dashboard
+      seconds: 1
 
-    cloud-load-test:
-      env:
-        PEEKER_PORT: "16875:16875"
-        MYSQL_EXPORTER_PORT: "9399:9399"
-        MZ_SQL_EXPORTER_PORT: "9400:9399"
-      steps:
-      - step: workflow
-        workflow: bring-up-source-data-mysql
-      - step: start-services
-        services: [prometheus_sql_exporter_mysql_tpcch, prometheus_sql_exporter_mz]
-      - step: workflow
-        workflow: heavy-load
-      - step: run
-        service: peeker
-        daemon: true
-        command: --queries ${PEEKER_QUERIES:-loadtest}
-      - step: ensure-stays-up
-        container: peeker
-        seconds: 10
+  cloud-load-test:
+    env:
+      PEEKER_PORT: "16875:16875"
+      MYSQL_EXPORTER_PORT: "9399:9399"
+      MZ_SQL_EXPORTER_PORT: "9400:9399"
+    steps:
+    - step: workflow
+      workflow: bring-up-source-data-mysql
+    - step: start-services
+      services: [prometheus_sql_exporter_mysql_tpcch, prometheus_sql_exporter_mz]
+    - step: workflow
+      workflow: heavy-load-mysql
+    - step: run
+      service: peeker
+      daemon: true
+      command: --queries ${PEEKER_QUERIES:-loadtest}
+    - step: ensure-stays-up
+      container: peeker
+      seconds: 10
 
-    # Brings up materialized for isolated tests, i.e. multi-node where
-    # Materialized and all other components are run independent. Should be used
-    # with cloud-benchmark-infra
-    cloud-benchmark-mz:
-      env:
-        MZ_SQL_EXPORTER_PORT: "9400:9399"
-        MZ_THREADS: ${MZ_THREADS:-1}
-        DEFAULT_PROGRESS_MODE: ${DEFAULT_PROGRESS_MODE}
-      steps:
-      - step: start-services
-        services: [materialized]
-      - step: wait-for-tcp
-        host: materialized
-        port: 6875
-      - step: start-services
-        services: [prometheus_sql_exporter_mz]
-      - step: print-env
+  # Brings up materialized for isolated tests, i.e. multi-node where
+  # Materialized and all other components are run independent. Should be used
+  # with cloud-benchmark-infra
+  cloud-benchmark-mz:
+    env:
+      MZ_SQL_EXPORTER_PORT: "9400:9399"
+      MZ_WORKERS: ${MZ_WORKERS:-1}
+      DEFAULT_PROGRESS_MODE: ${DEFAULT_PROGRESS_MODE}
+    steps:
+    - step: start-services
+      services: [materialized]
+    - step: wait-for-tcp
+      host: materialized
+      port: 6875
+    - step: start-services
+      services: [prometheus_sql_exporter_mz]
+    - step: print-env
 
-    # Brings up all non-materialized components for isolated load-tests, i.e.
-    # multi-node where Materialized and all other components are run
-    # independent. Should be used with cloud-benchmark-mz
-    cloud-benchmark-infra:
-      env:
-        MZ_HOST: ${MZ_HOST:-materialized}
-        KAFKA_HOST: ${INFRA_HOST:-kafka}
-        KAFKA_EXTERNAL_PORT: 9093
-        SR_HOST: ${INFRA_HOST:-schema-registry}
-        PEEKER_PORT: "16875:16875"
-        MYSQL_EXPORTER_PORT: "9399:9399"
-        NUM_WAREHOUSES: ${NUM_WAREHOUSES:-1}
-        # Controls the number of threads working on MySQL
-        OLTP_THREADS: ${OLTP_THREADS:-1}
-        # Controls the number of threads in Peeker
-        OLAP_THREADS: ${OLAP_THREADS:-1}
-      steps:
-      - step: workflow
-        workflow: bring-up-mysql-kafka
-      - step: start-services
-        services: [prometheus_sql_exporter_mysql_tpcch]
-      - step: drop-kafka-topics
-        kafka-container: chbench_kafka_1
-        topic_pattern: debezium.tpcch.*
-      - step: run
-        service: chbench
-        command: >-
-          gen
-          --warehouses=${NUM_WAREHOUSES:-1}
-          --config-file-path=/etc/chbenchmark/mz-default-mysql.cfg
-      - step: print-env
-      - step: wait-for-tcp
-        host: ${MZ_HOST:-materialized}
-        port: 6875
-        timeout_secs: 300
-      - step: run
-        service: chbench
-        daemon: true
-        command: >-
-          run
-          --dsn=mysql --gen-dir=/var/lib/mysql-files
-          --analytic-threads=0
-          --transactional-threads=${OLTP_THREADS:-1}
-          --warmup-seconds=300
-          --run-seconds=1200
-          -l /dev/stdout
-          --config-file-path=/etc/chbenchmark/mz-default-mysql.cfg
-          --mz-url=postgresql://${MZ_HOST:-materialized}:6875/materialize?sslmode=disable
-      - step: run
-        service: peeker
-        daemon: true
-        command: >-
-          --queries ${PEEKER_QUERIES:-benchmark}
-          --materialized-url postgres://ignoreuser@${MZ_HOST:-materialized}:6875/materialize
-          --warmup-seconds=300
-          --run-seconds=1200
-      - step: ensure-stays-up
-        container: peeker
-        seconds: 10
+  # Brings up all non-materialized components for isolated load-tests, i.e.
+  # multi-node where Materialized and all other components are run
+  # independent. Should be used with cloud-benchmark-mz
+  cloud-benchmark-infra:
+    env:
+      MZ_HOST: ${MZ_HOST:-materialized}
+      KAFKA_HOST: ${INFRA_HOST:-kafka}
+      KAFKA_EXTERNAL_PORT: 9093
+      SR_HOST: ${INFRA_HOST:-schema-registry}
+      PEEKER_PORT: "16875:16875"
+      MYSQL_EXPORTER_PORT: "9399:9399"
+      NUM_WAREHOUSES: ${NUM_WAREHOUSES:-1}
+      # Controls the number of threads working on MySQL
+      OLTP_THREADS: ${OLTP_THREADS:-1}
+      # Controls the number of threads in Peeker
+      OLAP_THREADS: ${OLAP_THREADS:-1}
+    steps:
+    - step: workflow
+      workflow: bring-up-mysql-kafka
+    - step: start-services
+      services: [prometheus_sql_exporter_mysql_tpcch]
+    - step: run
+      service: chbench
+      command: >-
+        gen
+        --warehouses=${NUM_WAREHOUSES:-1}
+        --config-file-path=/etc/chbenchmark/mz-default-mysql.cfg
+    - step: print-env
+    - step: wait-for-tcp
+      host: ${MZ_HOST:-materialized}
+      port: 6875
+      timeout_secs: 300
+    - step: run
+      service: chbench
+      daemon: true
+      command: >-
+        run
+        --dsn=mysql --gen-dir=/var/lib/mysql-files
+        --analytic-threads=0
+        --transactional-threads=${OLTP_THREADS:-1}
+        --warmup-seconds=300
+        --run-seconds=${CHBENCH_RUN_SECONDS:-1200}
+        -l /dev/stdout
+        --config-file-path=/etc/chbenchmark/mz-default-mysql.cfg
+        --mz-url=postgresql://materialize@${MZ_HOST:-materialized}:${MZ_PORT:-6875}/materialize?sslmode=disable
+    - step: run
+      service: peeker
+      daemon: true
+      command: >-
+        --queries ${PEEKER_QUERIES:-benchmark}
+        --materialized-url postgres://ignoreuser@${MZ_HOST:-materialized}:6875/materialize
+        --warmup-seconds=300
+        --run-seconds=1200
+    - step: ensure-stays-up
+      container: peeker
+      seconds: 10
 
-    # Helper workflows
+  # Helper workflows
 
-    bring-up-mysql-kafka:
-      steps:
-      - step: start-services
-        services: [mysql]
-      - step: wait-for-mysql
-        user: root
-        password: rootpw
-        timeout_secs: 30
-      - step: start-services
-        services: [connector-mysql]
-      - step: wait-for-tcp
-        host: connect
-        port: 8083
-        timeout_secs: 120
-      - step: wait-for-tcp
-        host: schema-registry
-        port: 8081
-      - step: wait-for-tcp
-        host: kafka
-        port: 9092
+  bring-up-mysql-kafka:
+    steps:
+    - step: start-services
+      services: [mysql, kafka]
+    - step: wait-for-mysql
+      user: root
+      password: rootpw
+      timeout_secs: 30
+    - step: wait-for-tcp
+      host: kafka
+      port: 9092
+    - step: drop-kafka-topics
+      kafka-container: chbench_kafka_1
+      topic_pattern: debezium.tpcch.*
+    - step: start-services
+      services: [connector-mysql]
+    - step: wait-for-tcp
+      host: connect
+      port: 8083
+      timeout_secs: 120
+    - step: wait-for-tcp
+      host: schema-registry
+      port: 8081
+      dependencies:
+        # sometimes kafka comes up for awhile and then crashes, which will always cause
+        # schema-registry to fail because there is no kafka cluster
+        - host: kafka
+          port: 9092
+          hint: >-
+            If kafka logs that it has an invalid cluster id ensure that all volumes are
+            destroyed via 'mzcompose down -v'
 
-    # Brings up everything to run chbench unisolated, i.e. local tests.
-    bring-up-source-data-mysql:
-      steps:
-      - step: start-services
-        services: [materialized]
-      - step: wait-for-tcp
-        host: materialized
-        port: 6875
-      - step: workflow
-        workflow: bring-up-mysql-kafka
-      - step: wait-for-tcp
-        host: materialized
-        port: 6875
-      - step: wait-for-tcp
-        host: mysql
-        port: 3306
-      - step: drop-kafka-topics
-        kafka-container: chbench_kafka_1
-        topic_pattern: debezium.tpcch.*
-      - step: run
-        service: chbench
-        command: >-
-          gen
-          --warehouses=${NUM_WAREHOUSES:-1}
-          --config-file-path=/etc/chbenchmark/mz-default-mysql.cfg
 
-    bring-up-postgres-kafka:
-      steps:
-      - step: start-services
-        services: [postgres]
-      - step: wait-for-postgres
-        dbname: postgres
-        timeout_secs: 30
-      - step: start-services
-        services: [connector-postgres]
-      - step: wait-for-tcp
-        host: connect
-        port: 8083
-        timeout_secs: 120
-      - step: wait-for-tcp
-        host: schema-registry
-        port: 8081
-      - step: wait-for-tcp
-        host: kafka
-        port: 9092
+  # Brings up everything to run chbench unisolated, i.e. local tests.
+  bring-up-source-data-mysql:
+    steps:
+    - step: start-services
+      services: [materialized]
+    - step: wait-for-tcp
+      host: materialized
+      port: 6875
+    - step: workflow
+      workflow: bring-up-mysql-kafka
+    - step: wait-for-tcp
+      host: materialized
+      port: 6875
+    - step: wait-for-tcp
+      host: mysql
+      port: 3306
+    - step: run
+      service: chbench
+      command: >-
+        gen
+        --warehouses=${NUM_WAREHOUSES:-1}
+        --config-file-path=/etc/chbenchmark/mz-default-mysql.cfg
 
-    # Brings up everything to run chbench unisolated, i.e. local tests.
-    bring-up-source-data-postgres:
-      steps:
-      - step: start-services
-        services: [materialized]
-      - step: wait-for-tcp
-        host: materialized
-        port: 6875
-      - step: workflow
-        workflow: bring-up-postgres-kafka
-      - step: wait-for-tcp
-        host: materialized
-        port: 6875
-      - step: wait-for-tcp
-        host: postgres
-        port: 5432
-      - step: drop-kafka-topics
-        kafka-container: chbench_kafka_1
-        topic_pattern: debezium.tpcch.*
-      - step: run
-        service: chbench
-        command: >-
-          gen
-          --warehouses=${NUM_WAREHOUSES:-1}
-          --config-file-path=/etc/chbenchmark/mz-default-postgres.cfg
+  start-control-center:
+    steps:
+    - step: start-services
+      services: [control-center]
 
-    heavy-load:
-      steps:
-      - step: run
-        service: chbench
-        daemon: true
-        command: >-
-         run
-         --dsn=mysql --gen-dir=/var/lib/mysql-files
-         --analytic-threads=0
-         --transactional-threads=${OLTP_THREADS:-1}
-         --run-seconds=864000
-         -l /var/log/chbench.log
-         --config-file-path=/etc/chbenchmark/mz-default-mysql.cfg
-         --mz-url=postgresql://${MZ_HOST:-materialized}:6875/materialize?sslmode=disable
+  bring-up-postgres-kafka:
+    steps:
+    - step: start-services
+      services: [postgres, kafka]
+    - step: wait-for-postgres
+      dbname: postgres
+      timeout_secs: 30
+    - step: drop-kafka-topics
+      kafka-container: chbench_kafka_1
+      topic_pattern: debezium.tpcch.*
+    - step: start-services
+      services: [connector-postgres]
+    - step: wait-for-tcp
+      host: connect
+      port: 8083
+      timeout_secs: 120
+    - step: wait-for-tcp
+      host: kafka
+      port: 9092
+    - step: wait-for-tcp
+      host: schema-registry
+      port: 8081
+      dependencies:
+        # sometimes kafka comes up for awhile and then crashes, which will always cause
+        # schema-registry to fail because there is no kafka cluster
+        - host: kafka
+          port: 9092
+          hint: >-
+            If kafka logs that it has an invalid cluster id ensure that all volumes are
+            destroyed via 'mzcompose down -v'
 
-    heavy-load-postgres:
-      steps:
-      - step: run
-        service: chbench
-        daemon: true
-        command: >-
-         run
-         --dsn=postgres --gen-dir=/var/lib/postgres-files
-         --analytic-threads=0
-         --transactional-threads=${OLTP_THREADS:-1}
-         --run-seconds=864000
-         -l /var/log/chbench.log
-         --config-file-path=/etc/chbenchmark/mz-default-postgres.cfg
-         --mz-url=postgresql://materialized:6875/materialize?sslmode=disable
+  # Brings up everything to run chbench unisolated, i.e. local tests.
+  bring-up-source-data-postgres:
+    steps:
+    - step: start-services
+      services: [materialized]
+    - step: wait-for-tcp
+      host: materialized
+      port: 6875
+    - step: workflow
+      workflow: bring-up-postgres-kafka
+    - step: wait-for-tcp
+      host: materialized
+      port: 6875
+    - step: wait-for-tcp
+      host: postgres
+      port: 5432
+    - step: run
+      service: chbench
+      command: >-
+        gen
+        --warehouses=${NUM_WAREHOUSES:-1}
+        --config-file-path=/etc/chbenchmark/mz-default-postgres.cfg
+
+  heavy-load-mysql:
+    steps:
+    - step: run
+      service: chbench
+      daemon: true
+      command: >-
+        run
+        --dsn=mysql --gen-dir=/var/lib/mysql-files
+        --analytic-threads=0
+        --transactional-threads=${OLTP_THREADS:-1}
+        --run-seconds=${CHBENCH_RUN_SECONDS:-864000}
+        -l /var/log/chbench.log
+        --config-file-path=/etc/chbenchmark/mz-default-mysql.cfg
+        --mz-url=postgresql://materialize@${MZ_HOST:-materialized}:${MZ_PORT:-6875}/materialize?sslmode=disable
+
+  heavy-load-postgres:
+    steps:
+    - step: run
+      service: chbench
+      daemon: true
+      command: >-
+        run
+        --dsn=postgres --gen-dir=/var/lib/postgres-files
+        --analytic-threads=0
+        --transactional-threads=${OLTP_THREADS:-1}
+        --run-seconds=${CHBENCH_RUN_SECONDS:-864000}
+        -l /var/log/chbench.log
+        --config-file-path=/etc/chbenchmark/mz-default-postgres.cfg
+        --mz-url=postgresql://materialize@${MZ_HOST:-materialized}:${MZ_PORT:-6875}/materialize?sslmode=disable

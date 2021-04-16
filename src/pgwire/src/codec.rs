@@ -14,28 +14,31 @@
 //!
 //! [1]: https://www.postgresql.org/docs/11/protocol-message-formats.html
 
+use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::error::Error;
 use std::fmt;
 use std::str;
 
+use async_trait::async_trait;
 use byteorder::{ByteOrder, NetworkEndian};
 use bytes::{Buf, BufMut, BytesMut};
 use futures::{sink, SinkExt, TryStreamExt};
 use lazy_static::lazy_static;
 use log::trace;
 use prometheus::{register_uint_counter, UIntCounter};
-use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, Interest, Ready};
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
 use ore::cast::CastFrom;
 use ore::future::OreSinkExt;
-use ore::netio;
+use ore::netio::{self, AsyncReady};
 
 use crate::message::{
     BackendMessage, ErrorResponse, FrontendMessage, FrontendStartupMessage, TransactionStatus,
     VERSION_CANCEL, VERSION_GSSENC, VERSION_SSL,
 };
+use crate::server::Conn;
 
 lazy_static! {
     static ref BYTES_SENT: UIntCounter = register_uint_counter!(
@@ -66,7 +69,7 @@ impl fmt::Display for CodecError {
 /// A connection that manages the encoding and decoding of pgwire frames.
 pub struct FramedConn<A> {
     conn_id: u32,
-    inner: sink::Buffer<Framed<A, Codec>, BackendMessage>,
+    inner: sink::Buffer<Framed<Conn<A>, Codec>, BackendMessage>,
 }
 
 impl<A> FramedConn<A>
@@ -81,11 +84,16 @@ where
     ///
     /// The supplied `conn_id` is used to identify the connection in logging
     /// messages.
-    pub fn new(conn_id: u32, inner: A) -> FramedConn<A> {
+    pub fn new(conn_id: u32, inner: Conn<A>) -> FramedConn<A> {
         FramedConn {
             conn_id,
             inner: Framed::new(inner, Codec::new()).buffer(32),
         }
+    }
+
+    /// Returns the ID of this connection.
+    pub fn id(&self) -> u32 {
+        self.conn_id
     }
 
     /// Reads and decodes one frontend message from the client.
@@ -107,7 +115,11 @@ where
     /// Note that the connection is not flushed after calling this method. You
     /// must call [`FramedConn::flush`] explicitly. Returns an error if the
     /// underlying connection is broken.
-    pub async fn send(&mut self, message: BackendMessage) -> Result<(), io::Error> {
+    pub async fn send<M>(&mut self, message: M) -> Result<(), io::Error>
+    where
+        M: Into<BackendMessage>,
+    {
+        let message = message.into();
         trace!("cid={} send={:?}", self.conn_id, message);
         Ok(self.inner.enqueue(message).await?)
     }
@@ -145,6 +157,25 @@ where
     /// performance.
     pub fn set_encode_state(&mut self, encode_state: Vec<(pgrepr::Type, pgrepr::Format)>) {
         self.inner.get_mut().codec_mut().encode_state = encode_state;
+    }
+}
+
+impl<A> FramedConn<A>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+{
+    pub fn inner(&self) -> &Conn<A> {
+        self.inner.get_ref().get_ref()
+    }
+}
+
+#[async_trait]
+impl<A> AsyncReady for FramedConn<A>
+where
+    A: AsyncRead + AsyncWrite + AsyncReady + Send + Sync + Unpin,
+{
+    async fn ready(&self, interest: Interest) -> io::Result<Ready> {
+        self.inner.get_ref().get_ref().ready(interest).await
     }
 }
 
@@ -371,12 +402,22 @@ impl<B: BufMut> Pgbuf for B {
     }
 }
 
-pub async fn decode_startup<A>(mut conn: A) -> Result<FrontendStartupMessage, io::Error>
+pub async fn decode_startup<A>(mut conn: A) -> Result<Option<FrontendStartupMessage>, io::Error>
 where
     A: AsyncRead + Unpin,
 {
     let mut frame_len = [0; 4];
-    conn.read_exact(&mut frame_len).await?;
+    let nread = netio::read_exact_or_eof(&mut conn, &mut frame_len).await?;
+    match nread {
+        // Complete frame length. Continue.
+        4 => (),
+        // Connection closed cleanly. Indicate that the startup sequence has
+        // been terminated by the client.
+        0 => return Ok(None),
+        // Partial frame length. Likely a client bug or network glitch, so
+        // surface the unexpected EOF.
+        _ => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "early eof")),
+    };
     let frame_len = parse_frame_len(&frame_len)?;
 
     let mut buf = BytesMut::new();
@@ -385,24 +426,24 @@ where
 
     let mut buf = Cursor::new(&buf);
     let version = buf.read_i32()?;
-    if version == VERSION_CANCEL {
-        Ok(FrontendStartupMessage::CancelRequest {
+    let message = match version {
+        VERSION_CANCEL => FrontendStartupMessage::CancelRequest {
             conn_id: buf.read_u32()?,
             secret_key: buf.read_u32()?,
-        })
-    } else if version == VERSION_SSL {
-        Ok(FrontendStartupMessage::SslRequest)
-    } else if version == VERSION_GSSENC {
-        Ok(FrontendStartupMessage::GssEncRequest)
-    } else {
-        let mut params = vec![];
-        while buf.peek_byte()? != 0 {
-            let name = buf.read_cstr()?.to_owned();
-            let value = buf.read_cstr()?.to_owned();
-            params.push((name, value));
+        },
+        VERSION_SSL => FrontendStartupMessage::SslRequest,
+        VERSION_GSSENC => FrontendStartupMessage::GssEncRequest,
+        _ => {
+            let mut params = HashMap::new();
+            while buf.peek_byte()? != 0 {
+                let name = buf.read_cstr()?.to_owned();
+                let value = buf.read_cstr()?.to_owned();
+                params.insert(name, value);
+            }
+            FrontendStartupMessage::Startup { version, params }
         }
-        Ok(FrontendStartupMessage::Startup { version, params })
-    }
+    };
+    Ok(Some(message))
 }
 
 #[derive(Debug)]

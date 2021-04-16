@@ -9,6 +9,8 @@
 
 //! Protobuf source connector
 
+use std::collections::HashSet;
+
 use anyhow::{anyhow, bail, Context, Result};
 use num_traits::ToPrimitive;
 use ordered_float::OrderedFloat;
@@ -21,7 +23,7 @@ use serde_protobuf::value::Value as ProtoValue;
 use serde_value::Value as SerdeValue;
 
 use repr::adt::decimal::Significand;
-use repr::{ColumnType, Datum, DatumList, RelationDesc, RelationType, Row, RowPacker, ScalarType};
+use repr::{ColumnType, Datum, DatumList, RelationDesc, RelationType, Row, ScalarType};
 
 fn proto_message_name(message_name: &str) -> String {
     // Prepend a . (following the serde-protobuf naming scheme to list root paths
@@ -34,11 +36,15 @@ fn proto_message_name(message_name: &str) -> String {
     }
 }
 
-fn validate_proto_field(field: &FieldDescriptor, descriptors: &Descriptors) -> Result<ScalarType> {
+fn validate_proto_field<'a>(
+    seen_messages: &mut HashSet<&'a str>,
+    field: &'a FieldDescriptor,
+    descriptors: &'a Descriptors,
+) -> Result<ScalarType> {
     Ok(match field.field_label() {
         FieldLabel::Required => bail!("Required field {} not supported", field.name()),
         FieldLabel::Repeated => {
-            validate_proto_field_resolved(field, descriptors)?;
+            validate_proto_field_resolved(seen_messages, field, descriptors)?;
             ScalarType::Jsonb
         }
         FieldLabel::Optional => {
@@ -55,9 +61,14 @@ fn validate_proto_field(field: &FieldDescriptor, descriptors: &Descriptors) -> R
                 FieldType::String => ScalarType::String,
                 FieldType::Bytes => ScalarType::Bytes,
                 FieldType::Message(m) => {
-                    for f in m.fields().iter() {
-                        validate_proto_field_resolved(&f, descriptors)?;
+                    if seen_messages.contains(m.name()) {
+                        bail!("Recursive types are not supported: {}", m.name());
                     }
+                    seen_messages.insert(m.name());
+                    for f in m.fields().iter() {
+                        validate_proto_field_resolved(seen_messages, &f, descriptors)?;
+                    }
+                    seen_messages.remove(m.name());
                     ScalarType::Jsonb
                 }
                 FieldType::Group => bail!("Unions are currently not supported"),
@@ -68,7 +79,11 @@ fn validate_proto_field(field: &FieldDescriptor, descriptors: &Descriptors) -> R
     })
 }
 
-fn validate_proto_field_resolved(field: &FieldDescriptor, descriptors: &Descriptors) -> Result<()> {
+fn validate_proto_field_resolved<'a>(
+    seen_messages: &mut HashSet<&'a str>,
+    field: &'a FieldDescriptor,
+    descriptors: &'a Descriptors,
+) -> Result<()> {
     match field.field_label() {
         FieldLabel::Required => bail!("Required field {} not supported", field.name()),
         FieldLabel::Repeated | FieldLabel::Optional => match field.field_type(descriptors) {
@@ -89,9 +104,14 @@ fn validate_proto_field_resolved(field: &FieldDescriptor, descriptors: &Descript
             | FieldType::Enum(_) => (),
 
             FieldType::Message(m) => {
-                for f in m.fields().iter() {
-                    validate_proto_field_resolved(&f, descriptors)?;
+                if seen_messages.contains(m.name()) {
+                    bail!("Recursive types are not supported: {}", m.name());
                 }
+                seen_messages.insert(m.name());
+                for f in m.fields().iter() {
+                    validate_proto_field_resolved(seen_messages, &f, descriptors)?;
+                }
+                seen_messages.remove(m.name());
             }
             FieldType::Bytes => {
                 bail!("Arrays or nested messages with bytes objects are not currently supported")
@@ -124,6 +144,8 @@ pub fn validate_descriptors(message_name: &str, descriptors: &Descriptors) -> Re
                 .join(", ")
         )
     })?;
+    let mut seen_messages = HashSet::new();
+    seen_messages.insert(message.name());
     let column_types = message
         .fields()
         .iter()
@@ -132,7 +154,7 @@ pub fn validate_descriptors(message_name: &str, descriptors: &Descriptors) -> Re
                 /// All the fields have to be optional, so mark a field as
                 /// nullable if it doesn't have any defaults
                 nullable: f.default_value().is_none(),
-                scalar_type: validate_proto_field(&f, descriptors)?,
+                scalar_type: validate_proto_field(&mut seen_messages, &f, descriptors)?,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -149,7 +171,7 @@ pub fn validate_descriptors(message_name: &str, descriptors: &Descriptors) -> Re
 pub struct Decoder {
     descriptors: Descriptors,
     message_name: String,
-    packer: RowPacker,
+    packer: Row,
 }
 
 impl Decoder {
@@ -162,11 +184,11 @@ impl Decoder {
         Decoder {
             descriptors,
             message_name: proto_message_name(message_name),
-            packer: RowPacker::new(),
+            packer: Row::default(),
         }
     }
 
-    pub fn decode(&mut self, bytes: &[u8]) -> Result<Option<Row>> {
+    pub fn decode(&mut self, bytes: &[u8], position: Option<i64>) -> Result<Option<Row>> {
         let input_stream = protobuf::CodedInputStream::from_bytes(bytes);
         let mut deserializer =
             Deserializer::for_named_message(&self.descriptors, &self.message_name, input_stream)
@@ -175,6 +197,7 @@ impl Decoder {
             SerdeValue::deserialize(&mut deserializer).context("Deserializing into rust object")?;
 
         let msg_name = &self.message_name;
+        let mut packer = &mut self.packer;
         extract_row_into(
             deserialized_message,
             &self.descriptors,
@@ -184,9 +207,12 @@ impl Decoder {
                     msg_name
                 )
             })?,
-            &mut self.packer,
+            &mut packer,
         )?;
-        Ok(Some(self.packer.finish_and_reuse()))
+        if let Some(pos) = position {
+            packer.push(Datum::from(pos))
+        };
+        Ok(Some(packer.finish_and_reuse()))
     }
 }
 
@@ -194,7 +220,7 @@ fn extract_row_into(
     deserialized_message: SerdeValue,
     descriptors: &Descriptors,
     message_descriptors: &MessageDescriptor,
-    packer: &mut RowPacker,
+    packer: &mut Row,
 ) -> Result<()> {
     let deserialized_message = match deserialized_message {
         SerdeValue::Map(deserialized_message) => deserialized_message,
@@ -334,7 +360,7 @@ fn default_datum_from_field_nested<'a>(
 /// type, all numeric types will be converted to f64s (issue #1476)
 fn json_from_serde_value(
     val: &SerdeValue,
-    packer: &mut RowPacker,
+    packer: &mut Row,
     f: &FieldDescriptor,
     descriptors: &Descriptors,
 ) -> Result<()> {
@@ -373,7 +399,7 @@ fn json_from_serde_value(
 
 fn json_nested_from_serde_value(
     val: &SerdeValue,
-    packer: &mut RowPacker,
+    packer: &mut Row,
     f: &FieldDescriptor,
     descriptors: &Descriptors,
 ) -> Result<()> {
@@ -622,7 +648,7 @@ mod tests {
 
         let mut decoder = get_decoder(".TestRecord");
         let row = decoder
-            .decode(&bytes)
+            .decode(&bytes, None)
             .expect("deserialize protobuf into a row")
             .unwrap();
         let datums = row.iter().collect::<Vec<_>>();
@@ -652,7 +678,7 @@ mod tests {
 
         let mut decoder = get_decoder(".TestRecord");
         let row = decoder
-            .decode(&bytes)
+            .decode(&bytes, None)
             .expect("deserialize protobuf into a row")
             .unwrap();
         let datums = row.iter().collect::<Vec<_>>();
@@ -681,7 +707,7 @@ mod tests {
 
         let mut decoder = get_decoder(".TestRepeatedRecord");
         let row = decoder
-            .decode(&bytes)
+            .decode(&bytes, None)
             .expect("deserialize protobuf into a row")
             .unwrap();
         let datums = row.iter().collect::<Vec<_>>();
@@ -722,12 +748,12 @@ mod tests {
 
         let mut decoder = get_decoder(".TestNestedRecord");
         let row = decoder
-            .decode(&bytes)
+            .decode(&bytes, None)
             .expect("deserialize protobuf into a row")
             .unwrap();
         let datums = row.iter().collect::<Vec<_>>();
         let d = datums[0];
-        if let Datum::Dict(d) = d {
+        if let Datum::Map(d) = d {
             let datumdict = d.iter().collect::<Vec<(&str, Datum)>>();
             assert_eq!(
                 datumdict,
@@ -761,13 +787,13 @@ mod tests {
             .expect("test failed to serialize to bytes");
 
         let row2 = decoder
-            .decode(&bytes)
+            .decode(&bytes, None)
             .expect("deserialize protobuf into a row")
             .unwrap();
         let datums = row2.iter().collect::<Vec<_>>();
 
         let d = datums[1];
-        if let Datum::Dict(d) = d {
+        if let Datum::Map(d) = d {
             let datumdict = d.iter().collect::<Vec<(&str, Datum)>>();
 
             for (name, datum) in datumdict.iter() {
@@ -815,7 +841,7 @@ mod tests {
 
         let mut decoder = get_decoder(".TestRepeatedNestedRecord");
         let row = decoder
-            .decode(&bytes)
+            .decode(&bytes, None)
             .expect("deserialize protobuf into a row")
             .unwrap();
         let datums = row.iter().collect::<Vec<_>>();
@@ -825,7 +851,7 @@ mod tests {
             let datumlist = d.iter().collect::<Vec<Datum>>();
 
             for datum in datumlist {
-                if let Datum::Dict(d) = datum {
+                if let Datum::Map(d) = datum {
                     let datumdict = d.iter().collect::<Vec<(&str, Datum)>>();
                     assert_eq!(
                         datumdict,

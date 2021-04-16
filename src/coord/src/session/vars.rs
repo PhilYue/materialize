@@ -8,8 +8,9 @@
 // by the Apache License, Version 2.0.
 
 use std::borrow::Borrow;
+use std::fmt;
 
-use anyhow::bail;
+use crate::error::CoordError;
 
 const APPLICATION_NAME: ServerVar<str> = ServerVar {
     name: unicase::Ascii::new("application_name"),
@@ -65,6 +66,13 @@ const SERVER_VERSION: ServerVar<str> = ServerVar {
     description: "Shows the server version (PostgreSQL).",
 };
 
+const SERVER_VERSION_NUM: ServerVar<i32> = ServerVar {
+    name: unicase::Ascii::new("server_version_num"),
+    // See the comment on `SERVER_VERSION`.
+    value: &90500,
+    description: "Shows the server version as an integer (PostgreSQL).",
+};
+
 const SQL_SAFE_UPDATES: ServerVar<bool> = ServerVar {
     name: unicase::Ascii::new("sql_safe_updates"),
     value: &false,
@@ -104,9 +112,9 @@ const TRANSACTION_ISOLATION: ServerVar<str> = ServerVar {
 ///
 /// The Materialize configuration hierarchy at the moment is much simpler.
 /// Global defaults are hardcoded into the binary, and a select few parameters
-/// can be overridden per session. The infrastructure has been designed with
-/// an eye towards supporting additional layers to the hierarchy, however, as
-/// should the need arise.
+/// can be overridden per session. The infrastructure has been designed with an
+/// eye towards supporting additional layers to the hierarchy, however, should
+/// the need arise.
 ///
 /// The configuration parameters that exist are driven by compatibility with
 /// PostgreSQL drivers that expect them, not because they are particularly
@@ -121,6 +129,7 @@ pub struct Vars {
     integer_datetimes: ServerVar<bool>,
     search_path: ServerVar<[&'static str]>,
     server_version: ServerVar<str>,
+    server_version_num: ServerVar<i32>,
     sql_safe_updates: SessionVar<bool>,
     standard_conforming_strings: ServerVar<bool>,
     timezone: ServerVar<str>,
@@ -138,6 +147,7 @@ impl Default for Vars {
             integer_datetimes: INTEGER_DATETIMES,
             search_path: SEARCH_PATH,
             server_version: SERVER_VERSION,
+            server_version_num: SERVER_VERSION_NUM,
             sql_safe_updates: SessionVar::new(&SQL_SAFE_UPDATES),
             standard_conforming_strings: STANDARD_CONFORMING_STRINGS,
             timezone: TIMEZONE,
@@ -159,6 +169,7 @@ impl Vars {
             &self.integer_datetimes,
             &self.search_path,
             &self.server_version,
+            &self.server_version_num,
             &self.sql_safe_updates,
             &self.standard_conforming_strings,
             &self.timezone,
@@ -192,7 +203,7 @@ impl Vars {
     /// named accessor to access the variable with its true Rust type. For
     /// example, `self.get("sql_safe_updates").value()` returns the string
     /// `"true"` or `"false"`, while `self.sql_safe_updates()` returns a bool.
-    pub fn get(&self, name: &str) -> Result<&dyn Var, anyhow::Error> {
+    pub fn get(&self, name: &str) -> Result<&dyn Var, CoordError> {
         if name == APPLICATION_NAME.name {
             Ok(&self.application_name)
         } else if name == CLIENT_ENCODING.name {
@@ -209,6 +220,8 @@ impl Vars {
             Ok(&self.search_path)
         } else if name == SERVER_VERSION.name {
             Ok(&self.server_version)
+        } else if name == SERVER_VERSION_NUM.name {
+            Ok(&self.server_version_num)
         } else if name == SQL_SAFE_UPDATES.name {
             Ok(&self.sql_safe_updates)
         } else if name == STANDARD_CONFORMING_STRINGS.name {
@@ -218,55 +231,56 @@ impl Vars {
         } else if name == TRANSACTION_ISOLATION.name {
             Ok(&self.transaction_isolation)
         } else {
-            bail!("unknown parameter: {}", name)
+            Err(CoordError::UnknownParameter(name.into()))
         }
     }
 
     /// Sets the configuration parameter named `name` to the value represented
     /// by `value`.
     ///
-    /// Like with [`Session::get`], configuration parameters are matched case
+    /// Like with [`Vars::get`], configuration parameters are matched case
     /// insensitively. If `value` is not valid, as determined by the underlying
     /// configuration parameter, or if the named configuration parameter does
     /// not exist, an error is returned.
-    pub fn set(&mut self, name: &str, value: &str) -> Result<(), anyhow::Error> {
+    pub fn set(&mut self, name: &str, value: &str) -> Result<(), CoordError> {
         if name == APPLICATION_NAME.name {
             self.application_name.set(value)
         } else if name == CLIENT_ENCODING.name {
-            bail!("parameter {} is read only", CLIENT_ENCODING.name);
+            Err(CoordError::ReadOnlyParameter(&CLIENT_ENCODING))
         } else if name == DATABASE.name {
             self.database.set(value)
         } else if name == DATE_STYLE.name {
-            bail!("parameter {} is read only", DATE_STYLE.name);
+            for value in value.split(',') {
+                let value = unicase::Ascii::new(value.trim());
+                if value != "ISO" && value != "MDY" {
+                    return Err(CoordError::ConstrainedParameter(&DATE_STYLE));
+                }
+            }
+            Ok(())
         } else if name == EXTRA_FLOAT_DIGITS.name {
             self.extra_float_digits.set(value)
         } else if name == INTEGER_DATETIMES.name {
-            bail!("parameter {} is read only", INTEGER_DATETIMES.name);
+            Err(CoordError::ReadOnlyParameter(&INTEGER_DATETIMES))
         } else if name == SEARCH_PATH.name {
-            bail!("parameter {} is read only", SEARCH_PATH.name);
+            Err(CoordError::ReadOnlyParameter(&SEARCH_PATH))
         } else if name == SERVER_VERSION.name {
-            bail!("parameter {} is read only", SERVER_VERSION.name);
+            Err(CoordError::ReadOnlyParameter(&SERVER_VERSION))
+        } else if name == SERVER_VERSION_NUM.name {
+            Err(CoordError::ReadOnlyParameter(&SERVER_VERSION_NUM))
         } else if name == SQL_SAFE_UPDATES.name {
             self.sql_safe_updates.set(value)
         } else if name == STANDARD_CONFORMING_STRINGS.name {
-            bail!(
-                "parameter {} is read only",
-                STANDARD_CONFORMING_STRINGS.name
-            );
+            Err(CoordError::ReadOnlyParameter(&STANDARD_CONFORMING_STRINGS))
         } else if name == TIMEZONE.name {
             if unicase::Ascii::new(value) != TIMEZONE.value {
-                bail!(
-                    "parameter {} can only be set to {}",
-                    TIMEZONE.name,
-                    TIMEZONE.value
-                );
+                return Err(CoordError::ConstrainedParameter(&TIMEZONE));
             } else {
                 Ok(())
             }
         } else if name == TRANSACTION_ISOLATION.name {
-            bail!("parameter {} is read only", TRANSACTION_ISOLATION.name);
+            Err(CoordError::ReadOnlyParameter(&TRANSACTION_ISOLATION))
         } else {
-            bail!("unknown parameter: {}", name)
+            Err(CoordError::UnknownParameter(name.into()))
         }
     }
 
@@ -310,6 +324,11 @@ impl Vars {
         self.server_version.value
     }
 
+    /// Returns the value of the `server_version_num` configuration parameter.
+    pub fn server_version_num(&self) -> i32 {
+        *self.server_version_num.value
+    }
+
     /// Returns the value of the `sql_safe_updates` configuration parameter.
     pub fn sql_safe_updates(&self) -> bool {
         *self.sql_safe_updates.value()
@@ -334,7 +353,7 @@ impl Vars {
 }
 
 /// A `Var` represents a configuration parameter of an arbitrary type.
-pub trait Var {
+pub trait Var: fmt::Debug {
     /// Returns the name of the configuration parameter.
     fn name(&self) -> &'static str;
 
@@ -345,13 +364,16 @@ pub trait Var {
     /// Returns a short sentence describing the purpose of the configuration
     /// parameter.
     fn description(&self) -> &'static str;
+
+    /// Returns the name of the type of this variable.
+    fn type_name(&self) -> &'static str;
 }
 
 /// A `ServerVar` is the default value for a configuration parameter.
 #[derive(Debug)]
 pub struct ServerVar<V>
 where
-    V: ?Sized + 'static,
+    V: fmt::Debug + ?Sized + 'static,
 {
     pub name: unicase::Ascii<&'static str>,
     pub value: &'static V,
@@ -360,7 +382,7 @@ where
 
 impl<V> Var for ServerVar<V>
 where
-    V: Value + ?Sized + 'static,
+    V: Value + fmt::Debug + ?Sized + 'static,
 {
     fn name(&self) -> &'static str {
         &self.name
@@ -373,6 +395,10 @@ where
     fn description(&self) -> &'static str {
         self.description
     }
+
+    fn type_name(&self) -> &'static str {
+        V::TYPE_NAME
+    }
 }
 
 /// A `SessionVar` is the session value for a configuration parameter. If unset,
@@ -380,7 +406,7 @@ where
 #[derive(Debug)]
 pub struct SessionVar<V>
 where
-    V: Value + ?Sized + 'static,
+    V: Value + fmt::Debug + ?Sized + 'static,
 {
     value: Option<V::Owned>,
     parent: &'static ServerVar<V>,
@@ -388,7 +414,7 @@ where
 
 impl<V> SessionVar<V>
 where
-    V: Value + ?Sized + 'static,
+    V: Value + fmt::Debug + ?Sized + 'static,
 {
     pub fn new(parent: &'static ServerVar<V>) -> SessionVar<V> {
         SessionVar {
@@ -397,17 +423,13 @@ where
         }
     }
 
-    pub fn set(&mut self, s: &str) -> Result<(), anyhow::Error> {
+    pub fn set(&mut self, s: &str) -> Result<(), CoordError> {
         match V::parse(s) {
             Ok(v) => {
                 self.value = Some(v);
                 Ok(())
             }
-            Err(()) => bail!(
-                "parameter {} requires a {} value",
-                self.name(),
-                V::TYPE_NAME
-            ),
+            Err(()) => Err(CoordError::InvalidParameterType(self.parent)),
         }
     }
 
@@ -421,7 +443,8 @@ where
 
 impl<V> Var for SessionVar<V>
 where
-    V: Value + ToOwned + ?Sized + 'static,
+    V: Value + ToOwned + fmt::Debug + ?Sized + 'static,
+    V::Owned: fmt::Debug,
 {
     fn name(&self) -> &'static str {
         &self.parent.name
@@ -434,10 +457,14 @@ where
     fn description(&self) -> &'static str {
         self.parent.description
     }
+
+    fn type_name(&self) -> &'static str {
+        V::TYPE_NAME
+    }
 }
 
 /// A value that can be stored in a session variable.
-pub trait Value: ToOwned {
+pub trait Value: ToOwned + Send + Sync {
     /// The name of the value type.
     const TYPE_NAME: &'static str;
     /// Parses a value of this type from a string.

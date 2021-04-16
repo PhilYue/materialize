@@ -7,53 +7,38 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::collections::HashMap;
 use std::io::{self, BufRead, Read};
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 
 use anyhow::{Context, Error};
+use flate2::read::MultiGzDecoder;
+#[cfg(target_os = "linux")]
+use inotify::{Inotify, WatchMask};
 use log::error;
-#[cfg(not(target_os = "macos"))]
-use notify::{RecursiveMode, Watcher};
-use timely::scheduling::{Activator, SyncActivator};
+use timely::scheduling::SyncActivator;
 
 use dataflow_types::{
-    AvroOcfEncoding, Consistency, DataEncoding, ExternalSourceConnector, MzOffset,
+    AvroOcfEncoding, Compression, DataEncoding, ExternalSourceConnector, MzOffset,
 };
 use expr::{PartitionId, SourceInstanceId};
 use mz_avro::types::Value;
 use mz_avro::{AvroRead, Schema, Skip};
 
-use crate::source::{
-    ConsistencyInfo, NextMessage, PartitionMetrics, SourceConstructor, SourceInfo, SourceMessage,
-};
-use crate::{
-    logging::materialized::Logger,
-    server::{
-        TimestampDataUpdate, TimestampDataUpdates, TimestampMetadataUpdate,
-        TimestampMetadataUpdates,
-    },
-};
+use crate::logging::materialized::Logger;
+use crate::source::{NextMessage, SourceMessage, SourceReader};
 
 /// Contains all information necessary to ingest data from file sources (either
 /// regular sources, or Avro OCF sources)
-pub struct FileSourceInfo<Out> {
-    /// Source Name
-    name: String,
+pub struct FileSourceReader<Out> {
     /// Unique source ID
     id: SourceInstanceId,
-    /// Field is set if this operator is responsible for ingesting data
-    is_activated_reader: bool,
     /// Receiver channel that ingests records
     receiver_stream: Receiver<Result<Out, Error>>,
-    /// Buffer: store message that cannot yet be timestamped
-    buffer: Option<SourceMessage<Out>>,
     /// Current File Offset. This corresponds to the offset of last processed message
     /// (initially 0 if no records have been processed)
     current_file_offset: FileOffset,
-    /// Timely worker logger for source events
-    logger: Option<Logger>,
 }
 
 #[derive(Copy, Clone)]
@@ -71,19 +56,16 @@ impl From<FileOffset> for MzOffset {
     }
 }
 
-impl SourceConstructor<Value> for FileSourceInfo<Value> {
+impl SourceReader<Value> for FileSourceReader<Value> {
     fn new(
-        name: String,
+        _name: String,
         source_id: SourceInstanceId,
-        active: bool,
         _: usize,
-        _: usize,
-        logger: Option<Logger>,
         consumer_activator: SyncActivator,
         connector: ExternalSourceConnector,
-        consistency_info: &mut ConsistencyInfo,
         encoding: DataEncoding,
-    ) -> Result<FileSourceInfo<Value>, anyhow::Error> {
+        _: Option<Logger>,
+    ) -> Result<(FileSourceReader<Value>, Option<PartitionId>), anyhow::Error> {
         let receiver = match connector {
             ExternalSourceConnector::AvroOcf(oc) => {
                 let reader_schema = match &encoding {
@@ -95,55 +77,75 @@ impl SourceConstructor<Value> for FileSourceInfo<Value> {
                         encoding
                     ),
                 };
-                let reader_schema = Schema::parse_str(reader_schema).unwrap();
+                let reader_schema: Schema = reader_schema.parse().unwrap();
                 let ctor = { move |file| mz_avro::Reader::with_schema(&reader_schema, file) };
                 let tail = if oc.tail {
                     FileReadStyle::TailFollowFd
                 } else {
                     FileReadStyle::ReadOnce
                 };
-                let (tx, rx) = std::sync::mpsc::sync_channel(10000 as usize);
+                let (tx, rx) = std::sync::mpsc::sync_channel(10000_usize);
                 std::thread::spawn(move || {
-                    read_file_task(oc.path, tx, Some(consumer_activator), tail, ctor);
+                    read_file_task(
+                        oc.path,
+                        tx,
+                        Some(consumer_activator),
+                        tail,
+                        oc.compression,
+                        ctor,
+                    );
                 });
                 rx
             }
             _ => panic!("Only OCF sources are supported with Avro encoding of values."),
         };
 
-        consistency_info.partition_metrics.insert(
-            PartitionId::File,
-            PartitionMetrics::new(&name, source_id, "", logger.clone()),
-        );
-        consistency_info.update_partition_metadata(PartitionId::File);
+        Ok((
+            FileSourceReader {
+                id: source_id,
+                receiver_stream: receiver,
+                current_file_offset: FileOffset { offset: 0 },
+            },
+            Some(PartitionId::File),
+        ))
+    }
 
-        Ok(FileSourceInfo {
-            name,
-            id: source_id,
-            is_activated_reader: active,
-            receiver_stream: receiver,
-            buffer: None,
-            current_file_offset: FileOffset { offset: 0 },
-            logger,
-        })
+    fn get_next_message(&mut self) -> Result<NextMessage<Value>, anyhow::Error> {
+        match self.receiver_stream.try_recv() {
+            Ok(Ok(record)) => {
+                self.current_file_offset.offset += 1;
+                let message = SourceMessage {
+                    partition: PartitionId::File,
+                    offset: self.current_file_offset.into(),
+                    upstream_time_millis: None,
+                    key: None,
+                    payload: Some(record),
+                };
+                Ok(NextMessage::Ready(message))
+            }
+            Ok(Err(e)) => {
+                error!("Failed to read file for {}. Error: {}.", self.id, e);
+                Err(e)
+            }
+            Err(TryRecvError::Empty) => Ok(NextMessage::Pending),
+            Err(TryRecvError::Disconnected) => Ok(NextMessage::Finished),
+        }
     }
 }
 
-impl SourceConstructor<Vec<u8>> for FileSourceInfo<Vec<u8>> {
+impl SourceReader<Vec<u8>> for FileSourceReader<Vec<u8>> {
     fn new(
-        name: String,
+        _name: String,
         source_id: SourceInstanceId,
-        active: bool,
-        _: usize,
-        _: usize,
-        logger: Option<Logger>,
+        worker_id: usize,
         consumer_activator: SyncActivator,
         connector: ExternalSourceConnector,
-        consistency_info: &mut ConsistencyInfo,
         _: DataEncoding,
-    ) -> Result<FileSourceInfo<Vec<u8>>, anyhow::Error> {
+        _: Option<Logger>,
+    ) -> Result<(FileSourceReader<Vec<u8>>, Option<PartitionId>), anyhow::Error> {
         let receiver = match connector {
             ExternalSourceConnector::File(fc) => {
+                log::debug!("creating FileSourceReader worker_id={}", worker_id);
                 let ctor = |fi| Ok(std::io::BufReader::new(fi).split(b'\n'));
                 let (tx, rx) = std::sync::mpsc::sync_channel(10000);
                 let tail = if fc.tail {
@@ -152,7 +154,14 @@ impl SourceConstructor<Vec<u8>> for FileSourceInfo<Vec<u8>> {
                     FileReadStyle::ReadOnce
                 };
                 std::thread::spawn(move || {
-                    read_file_task(fc.path, tx, Some(consumer_activator), tail, ctor);
+                    read_file_task(
+                        fc.path,
+                        tx,
+                        Some(consumer_activator),
+                        tail,
+                        fc.compression,
+                        ctor,
+                    );
                 });
                 rx
             }
@@ -160,134 +169,37 @@ impl SourceConstructor<Vec<u8>> for FileSourceInfo<Vec<u8>> {
                 "Only File sources are supported with File/OCF connectors and Vec<u8> encodings"
             ),
         };
-        consistency_info.partition_metrics.insert(
-            PartitionId::File,
-            PartitionMetrics::new(&name, source_id, "", logger.clone()),
-        );
-        consistency_info.update_partition_metadata(PartitionId::File);
 
-        Ok(FileSourceInfo {
-            name,
-            id: source_id,
-            is_activated_reader: active,
-            receiver_stream: receiver,
-            buffer: None,
-            current_file_offset: FileOffset { offset: 0 },
-            logger,
-        })
-    }
-}
-
-impl<Out> SourceInfo<Out> for FileSourceInfo<Out> {
-    fn activate_source_timestamping(
-        id: &SourceInstanceId,
-        consistency: &Consistency,
-        active: bool,
-        timestamp_data_updates: TimestampDataUpdates,
-        timestamp_metadata_channel: TimestampMetadataUpdates,
-    ) -> Option<TimestampMetadataUpdates> {
-        if active {
-            let prev = if let Consistency::BringYourOwn(_) = consistency {
-                timestamp_data_updates.borrow_mut().insert(
-                    id.clone(),
-                    TimestampDataUpdate::BringYourOwn(HashMap::new()),
-                )
-            } else {
-                timestamp_data_updates
-                    .borrow_mut()
-                    .insert(id.clone(), TimestampDataUpdate::RealTime(1))
-            };
-            // Check that this is the first time this source id is registered
-            assert!(prev.is_none());
-            timestamp_metadata_channel
-                .as_ref()
-                .borrow_mut()
-                .push(TimestampMetadataUpdate::StartTimestamping(*id));
-            Some(timestamp_metadata_channel)
-        } else {
-            None
-        }
+        Ok((
+            FileSourceReader {
+                id: source_id,
+                receiver_stream: receiver,
+                current_file_offset: FileOffset { offset: 0 },
+            },
+            Some(PartitionId::File),
+        ))
     }
 
-    fn can_close_timestamp(
-        &self,
-        consistency_info: &ConsistencyInfo,
-        pid: &PartitionId,
-        offset: MzOffset,
-    ) -> bool {
-        if !self.is_activated_reader {
-            true
-        } else {
-            // Guaranteed to exist if we receive a message from this partition
-            let last_offset = consistency_info
-                .partition_metadata
-                .get(&pid)
-                .unwrap()
-                .offset;
-            last_offset >= offset
-        }
-    }
-
-    fn get_worker_partition_count(&self) -> i32 {
-        1
-    }
-
-    fn has_partition(&self, _: PartitionId) -> bool {
-        self.is_activated_reader
-    }
-
-    fn ensure_has_partition(&mut self, consistency_info: &mut ConsistencyInfo, pid: PartitionId) {
-        if consistency_info.partition_metrics.len() == 0 {
-            consistency_info.partition_metrics.insert(
-                pid,
-                PartitionMetrics::new(&self.name, self.id, "", self.logger.clone()),
-            );
-        }
-    }
-
-    fn update_partition_count(
-        &mut self,
-        consistency_info: &mut ConsistencyInfo,
-        partition_count: i32,
-    ) {
-        if partition_count > 1 {
-            error!("Files cannot have multiple partitions");
-        }
-        self.ensure_has_partition(consistency_info, PartitionId::File);
-    }
-
-    fn get_next_message(
-        &mut self,
-        _consistency_info: &mut ConsistencyInfo,
-        _activator: &Activator,
-    ) -> Result<NextMessage<Out>, anyhow::Error> {
-        if let Some(message) = self.buffer.take() {
-            Ok(NextMessage::Ready(message))
-        } else {
-            match self.receiver_stream.try_recv() {
-                Ok(Ok(record)) => {
-                    self.current_file_offset.offset += 1;
-                    let message = SourceMessage {
-                        partition: PartitionId::File,
-                        offset: self.current_file_offset.into(),
-                        upstream_time_millis: None,
-                        key: None,
-                        payload: Some(record),
-                    };
-                    Ok(NextMessage::Ready(message))
-                }
-                Ok(Err(e)) => {
-                    error!("Failed to read file for {}. Error: {}.", self.id, e);
-                    Err(e)
-                }
-                Err(TryRecvError::Empty) => Ok(NextMessage::Pending),
-                Err(TryRecvError::Disconnected) => Ok(NextMessage::Finished),
+    fn get_next_message(&mut self) -> Result<NextMessage<Vec<u8>>, anyhow::Error> {
+        match self.receiver_stream.try_recv() {
+            Ok(Ok(record)) => {
+                self.current_file_offset.offset += 1;
+                let message = SourceMessage {
+                    partition: PartitionId::File,
+                    offset: self.current_file_offset.into(),
+                    upstream_time_millis: None,
+                    key: None,
+                    payload: Some(record),
+                };
+                Ok(NextMessage::Ready(message))
             }
+            Ok(Err(e)) => {
+                error!("Failed to read file for {}. Error: {}.", self.id, e);
+                Err(e)
+            }
+            Err(TryRecvError::Empty) => Ok(NextMessage::Pending),
+            Err(TryRecvError::Disconnected) => Ok(NextMessage::Finished),
         }
-    }
-
-    fn buffer_message(&mut self, message: SourceMessage<Out>) {
-        self.buffer = Some(message);
     }
 }
 
@@ -297,12 +209,14 @@ pub fn read_file_task<Ctor, I, Out, Err>(
     tx: std::sync::mpsc::SyncSender<Result<Out, anyhow::Error>>,
     activator: Option<SyncActivator>,
     read_style: FileReadStyle,
+    compression: Compression,
     iter_ctor: Ctor,
 ) where
     I: IntoIterator<Item = Result<Out, Err>> + Send + 'static,
     Ctor: FnOnce(Box<dyn AvroRead + Send>) -> Result<I, Err>,
     Err: Into<anyhow::Error>,
 {
+    log::trace!("reading file {}", path.display());
     let file = match std::fs::File::open(&path).with_context(|| {
         format!(
             "file source: unable to open file at path {}",
@@ -311,14 +225,55 @@ pub fn read_file_task<Ctor, I, Out, Err>(
     }) {
         Ok(file) => file,
         Err(err) => {
+            // If we fail to send an error, it's likely due to a race condition
+            // with the source being closed.
             let _ = tx.send(Err(err));
             return;
         }
     };
 
-    let iter = match read_style {
-        FileReadStyle::ReadOnce => iter_ctor(Box::new(file)),
+    let file_stream = match open_file_stream(path.clone(), file, read_style) {
+        Ok(f) => f,
+        Err(err) => {
+            // If we fail to send an error, it's likely due to a race condition
+            // with the source being closed.
+            let _ = tx.send(Err(err));
+            return;
+        }
+    };
+
+    let file_stream: Box<dyn AvroRead + Send> = match compression {
+        Compression::Gzip => Box::new(MultiGzDecoder::new(file_stream)),
+        Compression::None => Box::new(file_stream),
+    };
+
+    let iter = iter_ctor(file_stream);
+
+    match iter.map_err(Into::into).with_context(|| {
+        format!(
+            "Failed to obtain records from file at path {}",
+            path.to_string_lossy(),
+        )
+    }) {
+        Ok(i) => send_records(i, tx, activator),
+        Err(e) => {
+            // If we fail to send an error, it's likely due to a race condition
+            // with the source being closed.
+            let _ = tx.send(Err(e));
+        }
+    };
+}
+
+fn open_file_stream(
+    _path: PathBuf,
+    file: std::fs::File,
+    read_style: FileReadStyle,
+) -> Result<Box<dyn AvroRead + Send>, anyhow::Error> {
+    match read_style {
+        FileReadStyle::ReadOnce => Ok(Box::new(file)),
         FileReadStyle::TailFollowFd => {
+            let (notice_tx, notice_rx) = mpsc::channel();
+
             // FSEvents doesn't raise events until you close the file, making it
             // useless for tailing log files that are kept open by the daemon
             // writing to them.
@@ -332,63 +287,64 @@ pub fn read_file_task<Ctor, I, Out, Err>(
             // if the file has data available.
             //
             // https://github.com/notify-rs/notify/issues/240
-            #[cfg(target_os = "macos")]
-            let (file_events_stream, handle) = {
-                let (timer_tx, timer_rx) = std::sync::mpsc::channel();
-                std::thread::spawn(move || {
-                    while let Ok(()) = timer_tx.send(()) {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
+            #[cfg(not(target_os = "linux"))]
+            thread::spawn(move || {
+                while let Ok(()) = notice_tx.send(()) {
+                    thread::sleep(std::time::Duration::from_millis(100));
+                }
+            });
+
+            #[cfg(target_os = "linux")]
+            {
+                let mut inotify = Inotify::init()
+                    .with_context(|| format!("file source: failed to initialize inotify"))?;
+                inotify
+                    .add_watch(&_path, WatchMask::ALL_EVENTS)
+                    .with_context(|| format!("failed to add watch for file {}", _path.display()))?;
+                thread::spawn(move || {
+                    // This buffer must be at least `sizeof(struct inotify_event) + NAME_MAX + 1`.
+                    // The `inotify` crate documentation uses 1KB, so that's =
+                    // what we do too.
+                    let mut buf = [0; 1024];
+                    loop {
+                        if let Err(err) = inotify.read_events_blocking(&mut buf) {
+                            if notice_tx
+                                .send(Err(format!(
+                                    "file source: failed to get events for file: {:#} (path: {})",
+                                    err,
+                                    _path.display()
+                                )))
+                                .is_err()
+                            {
+                                // If the notice_tx returns an error, it's because
+                                // the source has been dropped. Just exit the
+                                // thread.
+                                return;
+                            }
+                            // We have no method for recovering from this error
+                            // Close this thread and log an error message (which duplicates the err above)
+                            error!(
+                                "file source: closing stream due to read errors (path: {})",
+                                _path.display()
+                            );
+                            return;
+                        };
+                        if notice_tx.send(Ok(())).is_err() {
+                            // If the notice_tx returns an error, it's because
+                            // the source has been dropped. Just exit the
+                            // thread.
+                            return;
+                        }
                     }
                 });
-                (timer_rx, ())
             };
 
-            #[cfg(not(target_os = "macos"))]
-            let (file_events_stream, handle) = {
-                let (notice_tx, notice_rx) = std::sync::mpsc::channel();
-                let mut w = match notify::RecommendedWatcher::new_raw(notice_tx) {
-                    Ok(w) => w,
-                    Err(err) => {
-                        error!(
-                            "file source: failed to create notify watcher: {:#} (path: {})",
-                            err,
-                            path.display()
-                        );
-                        return;
-                    }
-                };
-                if let Err(err) = w.watch(&path, RecursiveMode::NonRecursive) {
-                    error!(
-                        "file source: failed to add watch for file: {:#} (path: {})",
-                        err,
-                        path.display()
-                    );
-                    return;
-                }
-                (notice_rx, w)
-            };
-
-            let file = ForeverTailedFile {
-                rx: file_events_stream,
+            Ok(Box::new(ForeverTailedFile {
+                rx: notice_rx,
                 inner: file,
-                _h: handle,
-            };
-
-            iter_ctor(Box::new(file))
+            }))
         }
-    };
-
-    match iter.map_err(Into::into).with_context(|| {
-        format!(
-            "Failed to obtain records from file at path {}",
-            path.to_string_lossy(),
-        )
-    }) {
-        Ok(i) => send_records(i, tx, activator),
-        Err(e) => {
-            let _ = tx.send(Err(e));
-        }
-    };
+    }
 }
 
 /// Strategies for streaming content from a file.
@@ -405,21 +361,18 @@ pub enum FileReadStyle {
 ///
 /// This involves silently swallowing EOFs,
 /// and waiting on a Notify handle for more data to be written.
-struct ForeverTailedFile<Ev, Handle> {
+struct ForeverTailedFile<Ev> {
     rx: std::sync::mpsc::Receiver<Ev>,
     inner: std::fs::File,
-    // This field only exists to keep the file watcher or timer
-    // alive
-    _h: Handle,
 }
 
-impl<Ev, H> Skip for ForeverTailedFile<Ev, H> {
+impl<Ev> Skip for ForeverTailedFile<Ev> {
     fn skip(&mut self, len: usize) -> Result<(), io::Error> {
         self.inner.skip(len)
     }
 }
 
-impl<Ev, H> Read for ForeverTailedFile<Ev, H> {
+impl<Ev> Read for ForeverTailedFile<Ev> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         loop {
             // First drain the buffer of pending events from notify.
@@ -451,7 +404,9 @@ fn send_records<I, Out, Err>(
     I: IntoIterator<Item = Result<Out, Err>>,
     Err: Into<anyhow::Error>,
 {
+    let mut records = 0;
     for record in iter {
+        records += 1;
         let record = record.map_err(Into::into);
         // TODO: each call to `send` allocates and performs some
         // atomic work; we could aim to batch up transmissions.
@@ -466,4 +421,5 @@ fn send_records<I, Out, Err>(
             activator.activate().expect("activation failed");
         }
     }
+    log::trace!("sent {} records to reader", records);
 }

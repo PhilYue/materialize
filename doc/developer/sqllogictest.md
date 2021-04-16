@@ -54,6 +54,25 @@ and declare the test as passing.
 
 `statement error` will run any type of statement.
 
+### Primary keys
+
+While you can't create tables with primary keys in Materialize yet, you
+can create tables with primary keys in sqllogictest, and the optimizer will take
+the primary keys into account.
+
+The syntax is either:
+`CREATE TABLE foo (a INT PRIMARY KEY, b INT)`
+or
+```
+CREATE TABLE bar (
+    a smallint,
+    b integer,
+    c char(10),
+    d char(20),
+    PRIMARY KEY (a, b)
+)
+```
+
 ### Useful tips
 
 * If you use Visual Studio Code, @benesch has made a syntax highlighter for
@@ -70,6 +89,22 @@ and declare the test as passing.
   messages and then freeze.
 
 ## Materialize-specific behavior in sqllogictest
+
+### `simple` extension
+
+In addition to `statement` and `query`, we have added our own directive
+`simple`. It is followed by multiple lines until `----` and executes
+these lines as a simple query over pgwire. This is needed because the
+other directives use the extended protocol, and we needed a way to test
+multi-statement queries and implicit transactions.
+
+An optional `conn=<name>` can be added to execute the message on a
+named connection. It will be created on first use. This can be used to
+test transaction isolation or otherwise do things that require multiple
+connections.
+
+The output is one line per row, one "COMPLETE X" (where X is the
+number of affected rows) per statement, or an error message.
 
 ### modes
 
@@ -259,7 +294,7 @@ You can look for sqllogictest-related code in the following directories:
       [test/sqllogictest/dates-times.slt](/test/sqllogictest/dates-times.slt),
       we are selecting date and time types, but the expected result type is T
       (text).
-* [src/symbosis](/src/symbosis): Contains code for the Materialize symbosis
+* [src/symbiosis](/src/symbiosis): Contains code for the Materialize symbosis
   mode. Specifically, this code takes sqllogictest commands such as `CREATE
   TABLE ...`, `INSERT INTO ... VALUES ...`, or `UPDATE`, runs them in PostgreSQL
   and passes the changelog to Materialize. Look here if you want to change what

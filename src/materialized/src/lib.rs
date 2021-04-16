@@ -13,30 +13,29 @@
 //! [differential dataflow]: ../differential_dataflow/index.html
 //! [timely dataflow]: ../timely/index.html
 
-use std::any::Any;
+use std::convert::TryInto;
 use std::env;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::anyhow;
 use compile_time_run::run_command_str;
-use futures::channel::mpsc;
 use futures::StreamExt;
-use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
-use tokio::io;
+use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod, SslVerifyMode};
 use tokio::net::TcpListener;
+use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
+use tokio_stream::wrappers::TcpListenerStream;
 
-use comm::Switchboard;
-use coord::{CacheConfig, LoggingConfig};
-use ore::thread::{JoinHandleExt, JoinOnDropHandle};
-use ore::tokio::net::TcpStreamExt;
+use build_info::BuildInfo;
+use coord::{CacheConfig, LoggingConfig, PersistenceConfig};
 
 use crate::mux::Mux;
 
 mod http;
 mod mux;
+mod server_metrics;
 mod version_check;
 
 // Disable jemalloc on macOS, as it is not well supported [0][1][2].
@@ -51,50 +50,38 @@ mod version_check;
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
-/// The version of the crate.
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// The SHA identifying the Git commit at which the crate was built.
-pub const BUILD_SHA: &str = run_command_str!(
-    "sh",
-    "-c",
-    r#"if [ -n "$MZ_DEV_BUILD_SHA" ]; then
-        echo "$MZ_DEV_BUILD_SHA"
-    else
-        # Unfortunately we need to suppress error messages from `git`, as
-        # run_command_str will display no error message at all if we print
-        # more than one line of output to stderr.
-        git rev-parse --verify HEAD 2>/dev/null || {
-            printf "error: unable to determine Git SHA; " >&2
-            printf "either build from working Git clone " >&2
-            printf "(see https://materialize.com/docs/install/#build-from-source), " >&2
-            printf "or specify SHA manually by setting MZ_DEV_BUILD_SHA environment variable" >&2
-            exit 1
-        }
-    fi"#
-);
-
-/// The time in UTC at which the crate was built as an ISO 8601-compliant
-/// string.
-pub const BUILD_TIME: &str = run_command_str!("date", "-u", "+%Y-%m-%dT%H:%M:%SZ");
-
-/// Returns a human-readable version string.
-pub fn version() -> String {
-    format!("v{} ({})", VERSION, &BUILD_SHA[..9])
-}
+pub const BUILD_INFO: BuildInfo = BuildInfo {
+    version: env!("CARGO_PKG_VERSION"),
+    sha: run_command_str!(
+        "sh",
+        "-c",
+        r#"if [ -n "$MZ_DEV_BUILD_SHA" ]; then
+            echo "$MZ_DEV_BUILD_SHA"
+        else
+            # Unfortunately we need to suppress error messages from `git`, as
+            # run_command_str will display no error message at all if we print
+            # more than one line of output to stderr.
+            git rev-parse --verify HEAD 2>/dev/null || {
+                printf "error: unable to determine Git SHA; " >&2
+                printf "either build from working Git clone " >&2
+                printf "(see https://materialize.com/docs/install/#build-from-source), " >&2
+                printf "or specify SHA manually by setting MZ_DEV_BUILD_SHA environment variable" >&2
+                exit 1
+            }
+        fi"#
+    ),
+    time: run_command_str!("date", "-u", "+%Y-%m-%dT%H:%M:%SZ"),
+    target_triple: env!("TARGET_TRIPLE"),
+};
 
 /// Configuration for a `materialized` server.
 #[derive(Debug, Clone)]
 pub struct Config {
     // === Timely and Differential worker options. ===
     /// The number of Timely worker threads that this process should host.
-    pub threads: usize,
-    /// The ID of this process in the cluster. IDs must be contiguously
-    /// allocated, starting at zero.
-    pub process: usize,
-    /// The addresses of each process in the cluster, including this node,
-    /// in order of process ID.
-    pub addresses: Vec<SocketAddr>,
+    pub workers: usize,
+    /// The Timely worker configuration.
+    pub timely_worker: timely::WorkerConfig,
 
     // === Performance tuning options. ===
     pub logging: Option<LoggingConfig>,
@@ -114,185 +101,181 @@ pub struct Config {
     pub timestamp_frequency: Duration,
 
     // === Connection options. ===
-    /// The IP address and port to listen on -- defaults to 0.0.0.0:<addr_port>,
-    /// where <addr_port> is the address of this process's entry in `addresses`.
-    pub listen_addr: Option<SocketAddr>,
+    /// The IP address and port to listen on.
+    pub listen_addr: SocketAddr,
     /// TLS encryption configuration.
     pub tls: Option<TlsConfig>,
 
     // === Storage options. ===
     /// The directory in which `materialized` should store its own metadata.
-    pub data_directory: Option<PathBuf>,
+    pub data_directory: PathBuf,
+    pub persistence: Option<PersistenceConfig>,
     pub cache: Option<CacheConfig>,
     /// An optional symbiosis endpoint. See the
     /// [`symbiosis`](../symbiosis/index.html) crate for details.
     pub symbiosis_url: Option<String>,
     /// Whether to permit usage of experimental features.
     pub experimental_mode: bool,
+    /// Whether to run in safe mode.
+    pub safe_mode: bool,
     /// An optional telemetry endpoint. Use None to disable telemetry.
     pub telemetry_url: Option<String>,
-}
-
-impl Config {
-    /// The total number of timely workers, across all processes, described the
-    /// by the configuration.
-    pub fn num_timely_workers(&self) -> usize {
-        self.threads * self.addresses.len()
-    }
 }
 
 /// Configures TLS encryption for connections.
 #[derive(Debug, Clone)]
 pub struct TlsConfig {
+    /// The TLS mode to use.
+    pub mode: TlsMode,
     /// The path to the TLS certificate.
     pub cert: PathBuf,
     /// The path to the TLS key.
     pub key: PathBuf,
 }
 
-impl TlsConfig {
-    fn acceptor(&self) -> Result<SslAcceptor, anyhow::Error> {
-        let mut builder = SslAcceptor::mozilla_modern_v5(SslMethod::tls())?;
-        builder.set_certificate_file(&self.cert, SslFiletype::PEM)?;
-        builder.set_private_key_file(&self.key, SslFiletype::PEM)?;
-        Ok(builder.build())
-    }
+/// Configures how strictly to enforce TLS encryption and authentication.
+#[derive(Debug, Clone)]
+pub enum TlsMode {
+    /// Require that all clients connect with TLS, but do not require that they
+    /// present a client certificate.
+    Require,
+    /// Require that clients connect with TLS and present a certificate that
+    /// is signed by the specified CA.
+    VerifyCa {
+        /// The path to a TLS certificate authority.
+        ca: PathBuf,
+    },
+    /// Like [`TlsMode::VerifyCa`], but the `cn` (Common Name) field of the
+    /// certificate must additionally match the user named in the connection
+    /// request.
+    VerifyFull {
+        /// The path to a TLS certificate authority.
+        ca: PathBuf,
+    },
 }
 
 /// Start a `materialized` server.
-pub async fn serve(mut config: Config) -> Result<Server, anyhow::Error> {
-    let start_time = Instant::now();
-
-    // Construct shared channels for SQL command and result exchange, and
-    // dataflow command and result exchange.
-    let (cmdq_tx, cmd_rx) = mpsc::unbounded();
-    let coord_client = coord::Client::new(cmdq_tx);
-
-    // Extract timely dataflow parameters.
-    let is_primary = config.process == 0;
-    let num_timely_workers = config.num_timely_workers();
+pub async fn serve(
+    config: Config,
+    // TODO(benesch): Don't pass runtime explicitly when
+    // `Handle::current().block_in_place()` lands. See:
+    // https://github.com/tokio-rs/tokio/pull/3097.
+    runtime: Arc<Runtime>,
+) -> Result<Server, anyhow::Error> {
+    let workers = config.workers;
 
     // Validate TLS configuration, if present.
-    let tls = match &config.tls {
-        None => None,
-        Some(tls_config) => Some(tls_config.acceptor()?),
+    let (pgwire_tls, http_tls) = match &config.tls {
+        None => (None, None),
+        Some(tls_config) => {
+            let context = {
+                // Mozilla publishes three presets: old, intermediate, and modern. They
+                // recommend the intermediate preset for general purpose servers, which
+                // is what we use, as it is compatible with nearly every client released
+                // in the last five years but does not include any known-problematic
+                // ciphers. We once tried to use the modern preset, but it was
+                // incompatible with Fivetran, and presumably other JDBC-based tools.
+                let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())?;
+                if let TlsMode::VerifyCa { ca } | TlsMode::VerifyFull { ca } = &tls_config.mode {
+                    builder.set_ca_file(ca)?;
+                    builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+                }
+                builder.set_certificate_file(&tls_config.cert, SslFiletype::PEM)?;
+                builder.set_private_key_file(&tls_config.key, SslFiletype::PEM)?;
+                builder.build().into_context()
+            };
+            let pgwire_tls = pgwire::TlsConfig {
+                context: context.clone(),
+                mode: match tls_config.mode {
+                    TlsMode::Require | TlsMode::VerifyCa { .. } => pgwire::TlsMode::Require,
+                    TlsMode::VerifyFull { .. } => pgwire::TlsMode::VerifyUser,
+                },
+            };
+            let http_tls = http::TlsConfig {
+                context,
+                mode: match tls_config.mode {
+                    TlsMode::Require | TlsMode::VerifyCa { .. } => http::TlsMode::Require,
+                    TlsMode::VerifyFull { .. } => http::TlsMode::AssumeUser,
+                },
+            };
+            (Some(pgwire_tls), Some(http_tls))
+        }
     };
 
-    // Initialize network listener.
-    let listen_addr = config.listen_addr.unwrap_or_else(|| {
-        SocketAddr::new(
-            match config.addresses[config.process].ip() {
-                IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-            },
-            config.addresses[config.process].port(),
-        )
-    });
-    let mut listener = TcpListener::bind(&listen_addr).await?;
-    let local_addr = listener.local_addr()?;
-    config.addresses[config.process].set_port(local_addr.port());
+    // Set this metric once so that it shows up in the metric export.
+    crate::server_metrics::WORKER_COUNT
+        .with_label_values(&[&workers.to_string()])
+        .set(workers.try_into().unwrap());
 
-    let switchboard = Switchboard::new(config.addresses, config.process);
+    // Initialize network listener.
+    let listener = TcpListener::bind(&config.listen_addr).await?;
+    let local_addr = listener.local_addr()?;
+
+    // Initialize coordinator.
+    let (coord_handle, coord_client) = coord::serve(
+        coord::Config {
+            workers,
+            timely_worker: config.timely_worker,
+            symbiosis_url: config.symbiosis_url.as_deref(),
+            logging: config.logging,
+            data_directory: &config.data_directory,
+            timestamp_frequency: config.timestamp_frequency,
+            cache: config.cache,
+            persistence: config.persistence,
+            logical_compaction_window: config.logical_compaction_window,
+            experimental_mode: config.experimental_mode,
+            safe_mode: config.safe_mode,
+            build_info: &BUILD_INFO,
+        },
+        runtime,
+    )
+    .await?;
 
     // Launch task to serve connections.
     //
-    // The lifetime of this task is controlled by two triggers that activate on
+    // The lifetime of this task is controlled by a trigger that activates on
     // drop. Draining marks the beginning of the server shutdown process and
     // indicates that new user connections (i.e., pgwire and HTTP connections)
-    // should be rejected. Gracefully handling existing user connections
-    // requires that new system (i.e., switchboard) connections continue to be
-    // routed whiles draining. The shutdown trigger indicates that draining is
-    // complete, so switchboard traffic can cease and the task can exit.
+    // should be rejected. Once all existing user connections have gracefully
+    // terminated, this task exits.
     let (drain_trigger, drain_tripwire) = oneshot::channel();
-    let (shutdown_trigger, shutdown_tripwire) = oneshot::channel();
     tokio::spawn({
-        let switchboard = switchboard.clone();
+        let start_time = coord_handle.start_instant();
         async move {
-            let incoming = &mut listener.incoming();
+            // TODO(benesch): replace with `listener.incoming()` if that is
+            // restored when the `Stream` trait stabilizes.
+            let mut incoming = TcpListenerStream::new(listener);
 
-            // The primary is responsible for pgwire and HTTP traffic in
-            // addition to switchboard traffic until draining starts.
-            if is_primary {
-                let mut mux = Mux::new();
-                mux.add_handler(switchboard.clone());
-                mux.add_handler(pgwire::Server::new(tls.clone(), coord_client.clone()));
-                mux.add_handler(http::Server::new(
-                    tls,
-                    coord_client,
-                    start_time,
-                    &num_timely_workers.to_string(),
-                ));
-                mux.serve(incoming.take_until(drain_tripwire)).await;
-            }
-
-            // Draining primaries and non-primary servers are only responsible
-            // for switchboard traffic.
             let mut mux = Mux::new();
-            mux.add_handler(switchboard.clone());
-            mux.serve(incoming.take_until(shutdown_tripwire)).await
+            mux.add_handler(pgwire::Server::new(pgwire::Config {
+                tls: pgwire_tls,
+                coord_client: coord_client.clone(),
+            }));
+            mux.add_handler(http::Server::new(http::Config {
+                tls: http_tls,
+                coord_client,
+                start_time,
+            }));
+            mux.serve(incoming.by_ref().take_until(drain_tripwire))
+                .await;
         }
     });
 
-    let dataflow_conns = switchboard
-        .rendezvous(Duration::from_secs(30))
-        .await?
-        .into_iter()
-        .map(|conn| match conn {
-            None => Ok(None),
-            Some(conn) => Ok(Some(conn.into_inner().into_std()?)),
-        })
-        .collect::<Result<_, io::Error>>()?;
-
-    // Launch dataflow workers.
-    let dataflow_guard = dataflow::serve(
-        dataflow_conns,
-        config.threads,
-        config.process,
-        switchboard.clone(),
-    )
-    .map_err(|s| anyhow!("{}", s))?;
-
-    // Initialize coordinator, but only on the primary.
-    //
-    // Note that the coordinator must be initialized *after* launching the
-    // dataflow workers, as booting the coordinator can involve sending enough
-    // data to workers to fill up a `comm` channel buffer (#3280).
-    let coord_thread = if is_primary {
-        let (handle, cluster_id) = coord::serve(coord::Config {
-            switchboard,
-            cmd_rx,
-            num_timely_workers,
-            symbiosis_url: config.symbiosis_url.as_deref(),
-            logging: config.logging,
-            data_directory: config.data_directory.as_deref(),
-            timestamp: coord::TimestampConfig {
-                frequency: config.timestamp_frequency,
-            },
-            cache: config.cache,
-            logical_compaction_window: config.logical_compaction_window,
-            experimental_mode: config.experimental_mode,
-        })
-        .await?;
-
-        // Start a task that checks for the latest version and prints a warning if it
-        // finds a different version than currently running.
-        if let Some(telemetry_url) = config.telemetry_url {
-            tokio::spawn(version_check::check_version_loop(
-                telemetry_url,
-                cluster_id.to_string(),
-            ));
-        }
-        Some(handle.join_on_drop())
-    } else {
-        None
-    };
+    // Start a task that checks for the latest version and prints a warning if
+    // it finds a different version than currently running.
+    if let Some(telemetry_url) = config.telemetry_url {
+        tokio::spawn(version_check::check_version_loop(
+            telemetry_url,
+            coord_handle.cluster_id(),
+            coord_handle.session_id(),
+            coord_handle.start_instant(),
+        ));
+    }
 
     Ok(Server {
         local_addr,
         _drain_trigger: drain_trigger,
-        _dataflow_guard: Box::new(dataflow_guard),
-        _coord_thread: coord_thread,
-        _shutdown_trigger: shutdown_trigger,
+        _coord_handle: coord_handle,
     })
 }
 
@@ -301,9 +284,7 @@ pub struct Server {
     local_addr: SocketAddr,
     // Drop order matters for these fields.
     _drain_trigger: oneshot::Sender<()>,
-    _dataflow_guard: Box<dyn Any>,
-    _coord_thread: Option<JoinOnDropHandle<()>>,
-    _shutdown_trigger: oneshot::Sender<()>,
+    _coord_handle: coord::Handle,
 }
 
 impl Server {

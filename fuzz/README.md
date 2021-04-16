@@ -1,51 +1,35 @@
 # fuzz
 
-WIP [fuzz testing]. Not super useful yet.
-
-## Installing `cargo-fuzz`
+## Installing `honggfuzz`
 
 ```
-cargo install cargo-fuzz
+cargo install honggfuzz
 ```
 
-## Fuzzing sqllogictest
+Install [dependencies](https://github.com/rust-fuzz/honggfuzz-rs#dependencies) for your system.
 
-Before first use:
+## Fuzzing
+
+Choose a target.
+These are `[[bin]]` entries in `Cargo.toml`.
+List them with `cargo read-manifest | jq '.targets[].name'` from the `fuzz` directory.
+
+Run the fuzzer:
 
 ```shell
 cd fuzz
-cargo run --bin=build_corpus
+cargo hfuzz run <target>
 ```
 
-To fuzz stuff:
+After a panic is found, get a stack trace with:
 
 ```shell
-RUSTFLAGS='-C codegen-units=1' cargo +nightly fuzz run --release fuzz_sqllogictest -- -dict=fuzz/sql.dict
+cargo hfuzz run-debug <target> hfuzz_workspace/<target>/*.fuzz
 ```
 
-Failing tests are added to `./fuzz/artifacts/fuzz_sqllogictest` and can be rerun
-with `cargo test -p sqllogictest`.
-
-TODO(jamii): figure out why sqllogictest::test::fuzz_artifacts can't be run by
-name.
-
-## Fuzzing testdrive
-
-Before first use:
+For example, with the `fuzz_parse_time` target:
 
 ```shell
-mkdir -p fuzz/corpus/fuzz_testdrive
-cp -R test/* fuzz/corpus/fuzz_testdrive
+cargo hfuzz run fuzz_parse_time
+cargo hfuzz run-debug fuzz_parse_time hfuzz_workspace/fuzz_parse_time/*.fuzz
 ```
-
-To fuzz stuff:
-
-```shell
-RUSTFLAGS='-C codegen-units=1' cargo +nightly fuzz run --release fuzz_testdrive
-```
-
-Failing tests are added to `./fuzz/artifacts/fuzz_testdrive` and can be rerun
-with `cargo run --bin testdrive ./fuzz/artificats/fuzz_testdrive/<FAILING_TEST>`.
-
-[fuzz testing]: https://en.wikipedia.org/wiki/Fuzzing
-[rust-fuzz/cargo-fuzz#176]: https://github.com/rust-fuzz/cargo-fuzz/pull/176

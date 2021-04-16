@@ -15,8 +15,8 @@
 //! agree to use this representation at their boundaries.
 //!
 //! * The core value type is the [`Datum`] enum, which represents a literal value.
-//! * [`Row`] extends a `Datum` horizontally, and has features for efficiently doing so,
-//!   and can be built via a [`RowPacker`].
+//! * [`Row`] extends a `Datum` horizontally, and has features for efficiently
+//!   doing so.
 //! * [`RelationDesc`] describes what it takes to extend a `Row` vertically, and
 //!   corresponds most closely to what is returned from querying our dataflows
 
@@ -32,8 +32,10 @@ pub mod strconv;
 
 pub use cache::{CachedRecord, CachedRecordIter};
 pub use relation::{ColumnName, ColumnType, RelationDesc, RelationType};
-pub use row::{datum_size, DatumDict, DatumList, Row, RowArena, RowPacker};
-pub use scalar::{Datum, ScalarType};
+pub use row::{
+    datum_list_size, datum_size, datums_size, DatumList, DatumMap, Row, RowArena, RowRef,
+};
+pub use scalar::{Datum, ScalarBaseType, ScalarType};
 
 // Concrete types used throughout Materialize for the generic parameters in Timely/Differential Dataflow.
 /// System-wide timestamp type.

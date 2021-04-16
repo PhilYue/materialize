@@ -11,39 +11,53 @@ aliases:
   - /sql/types/int8
 ---
 
-`integer` and `bigint` data express signed integers.
+## `integer` info
 
-Type      | Aliases       | Size          | Minimum value              | Maximum value
-----------|---------------|---------------|----------------------------|--------------------------
-`integer` | `int`, `int4` | 4 bytes       | -2,147,483,648             | 2,147,483,647
-`bigint`  | `int8`        | 8 bytes       | -9,223,372,036,854,775,808 | 9,223,372,036,854,775,807
+Detail | Info
+-------|------
+**Size** | 4 bytes
+**Aliases** | `int`, `int4`
+**Catalog name** | `pg_catalog.int4`
+**OID** | 23
+**Range** | [-2,147,483,648, 2,147,483,647]
 
-The SQL standard specifies only the `integer`, `int` and `bigint` type names.
-Materialize additionally permits the `int4` and `int8` aliases, for
-compatibility with other SQL database systems.
+## `bigint` info
+
+Detail | Info
+-------|------
+**Size** | 8 bytes
+**Aliases** | `int8`
+**Catalog name** | `pg_catalog.int8`
+**OID** | 20
+**Range** | [-9,223,372,036,854,775,808, 9,223,372,036,854,775,807]
 
 ## Details
 
 ### Valid casts
 
 In addition to the casts listed below, all integer types can be cast to and from
-all other integer types.
+all other integer types. `bigint`/`int8` to `int`/`int4` is a cast by assignment and
+`int`/`int4` to `bigint`/`int8` is an implicit cast.
 
-#### From `int`
+#### From `integer` or `bigint`
 
 You can [cast](../../functions/cast) `integer` or `bigint` to:
 
-- [`bool`](../boolean)
-- [`numeric`](../numeric)
-- [`real`/`double`](../float)
-- [`text`](../text)
+- [`boolean`](../boolean) (explicitly)
+- [`numeric`](../numeric) (implicitly)
+- [`real`/`double precision`](../float) (implicitly)
+- [`text`](../text) (by assignment)
 
-#### To `int`
+#### To `integer` or `bigint`
 
 You can [cast](../../functions/cast) the following types to `integer` or `bigint`:
 
-- [`numeric`](../numeric)
-- [`real`/`double`](../float)
+- [`bool`](../boolean) (implicitly)
+- [`jsonb`](../jsonb)(explicitly)
+- [`oid`](../oid) (by assignment)
+- [`numeric`](../numeric) (by assignment)
+- [`real`/`double precision`](../float) (by assignment)
+- [`text`](../text) (explicitly)
 
 ## Examples
 

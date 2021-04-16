@@ -12,6 +12,8 @@ Detail | Info
 -------|------
 **Quick Syntax** | `TIME '01:23:45'`
 **Size** | 4 bytes
+**Catalog name** | `pg_catalog.time`
+**OID** | 1083
 **Min value** | `TIME '00:00:00'`
 **Max value** | `TIME '23:59:59.999999'`
 
@@ -31,15 +33,15 @@ _time&lowbar;str_ | A string representing a time of day in `H:M:S.NS` format.
 
 You can [cast](../../functions/cast) `time` to:
 
-- [`interval`](../interval)
-- [`text`](../text)
+- [`interval`](../interval) (implicitly)
+- [`text`](../text) (by assignment)
 
 #### To `time`
 
-You can [cast](../../functions/cast) the following types to `time`:
+You can [cast](../../functions/cast) from the following types to `time`:
 
-- [`interval`](../interval)
-- [`text`](../text)
+- [`interval`](../interval) (by assignment)
+- [`text`](../text) (explicitly)
 
 ### Valid operations
 

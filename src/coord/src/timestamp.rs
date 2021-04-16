@@ -8,9 +8,8 @@
 // by the Apache License, Version 2.0.
 
 use std::cmp;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::convert::TryInto;
-use std::io::BufRead;
 use std::ops::Deref;
 use std::panic;
 use std::path::PathBuf;
@@ -22,7 +21,6 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::bail;
-use futures::executor::block_on;
 use itertools::Itertools;
 use lazy_static::lazy_static;
 use log::{debug, error, info, log_enabled, warn};
@@ -32,48 +30,33 @@ use prometheus::{register_int_gauge_vec, IntGaugeVec};
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::message::Message;
 use rdkafka::ClientConfig;
-use rusoto_kinesis::KinesisClient;
+use tokio::sync::mpsc;
 
 use dataflow::source::read_file_task;
 use dataflow::source::FileReadStyle;
 use dataflow_types::{
-    AvroOcfEncoding, Consistency, DataEncoding, Envelope, ExternalSourceConnector,
-    FileSourceConnector, KafkaSourceConnector, KinesisSourceConnector, MzOffset, SourceConnector,
-    TimestampSourceUpdate,
+    AvroOcfEncoding, Consistency, DataEncoding, DebeziumMode, ExternalSourceConnector,
+    FileSourceConnector, KafkaSourceConnector, KinesisSourceConnector, MzOffset, S3SourceConnector,
+    SourceConnector, SourceEnvelope, TimestampSourceUpdate,
 };
-use expr::{PartitionId, SourceInstanceId};
+use expr::{GlobalId, PartitionId};
 use ore::collections::CollectionExt;
 
 use crate::coord;
 
 lazy_static! {
-    /// Value schema for Avro-formatted BYO consistency sources.
-    static ref BYO_CONSISTENCY_SCHEMA: Schema = {
-        Schema::parse_str(r#"{
-          "name": "materialize.byo.consistency",
-          "type": "record",
-          "fields": [
-            {"name": "source", "type": "string"},
-            {"name": "partition_count", "type": "int"},
-            {"name": "partition_id", "type": ["int", "string"]},
-            {"name": "timestamp", "type": "long"},
-            {"name": "offset", "type": "long"}
-          ]
-        }"#).unwrap()
-    };
-
     /// Key schema for Debezium consistency sources.
     static ref DEBEZIUM_TRX_SCHEMA_KEY: Schema = {
-        Schema::parse_str(r#"{
+        r#"{
           "name": "io.debezium.connector.common.TransactionMetadataKey",
           "type": "record",
           "fields": [{"name": "id", "type": "string"}]
-        }"#).unwrap()
+        }"#.parse().unwrap()
     };
 
     /// Value schema for Debezium consistency sources.
     static ref DEBEZIUM_TRX_SCHEMA_VALUE: Schema = {
-        Schema::parse_str(r#"{
+        r#"{
           "type": "record",
           "name": "TransactionMetadataValue",
           "namespace": "io.debezium.connector.common",
@@ -102,7 +85,7 @@ lazy_static! {
             }
           ],
           "connect.name": "io.debezium.connector.common.TransactionMetadataValue"
-        }"#).unwrap()
+        }"#.parse().unwrap()
     };
 
     static ref MAX_AVAILABLE_OFFSET: IntGaugeVec = register_int_gauge_vec!(
@@ -112,14 +95,10 @@ lazy_static! {
     ).unwrap();
 }
 
-pub struct TimestampConfig {
-    pub frequency: Duration,
-}
-
 #[derive(Debug)]
 pub enum TimestampMessage {
-    Add(SourceInstanceId, SourceConnector),
-    DropInstance(SourceInstanceId),
+    Add(GlobalId, SourceConnector),
+    Drop(GlobalId),
     Shutdown,
 }
 
@@ -134,13 +113,13 @@ enum RtTimestampConnector {
     File(RtFileConnector),
     Ocf(RtFileConnector),
     Kinesis(RtKinesisConnector),
+    S3(RtS3Connector),
 }
 
 enum ByoTimestampConnector {
     Kafka(ByoKafkaConnector),
-    File(ByoFileConnector<Vec<u8>, anyhow::Error>),
     Ocf(ByoFileConnector<Value, anyhow::Error>),
-    Kinesis(ByoKinesisConnector),
+    // Kinesis and S3 are not supported
 }
 
 // List of possible encoding types
@@ -157,80 +136,18 @@ struct ByoTimestampConsumer {
     /// The name of the source with which this connector is associated
     ///
     /// * For kafka this is the topic
-    /// * For kinesis this is the stream name
     /// * For file types this is the file name
     source_name: String,
     /// The format of the connector
     envelope: ConsistencyFormatting,
-    /// The last timestamp assigned per partition
-    last_partition_ts: HashMap<PartitionId, u64>,
-    /// The max assigned timestamp. Should be max(last_partition_ts)
+    /// The max assigned timestamp.
     last_ts: u64,
     /// The max offset for which a timestamp has been assigned
     last_offset: MzOffset,
-    /// The total number of partitions for the data topic
-    current_partition_count: i32,
-}
-
-impl ByoTimestampConsumer {
-    fn update_and_send(
-        &mut self,
-        tx: &futures::channel::mpsc::UnboundedSender<coord::Message>,
-        sid: SourceInstanceId,
-        partition_count: i32,
-        partition: PartitionId,
-        timestamp: u64,
-        offset: MzOffset,
-    ) {
-        if self.current_partition_count < partition_count && self.last_ts > 0 {
-            // A new partition has been added. Partitions always gets added with
-            // newPartitionId = previousLastPartitionId + 1 and start from 0.
-            // So this new partition will have ID "partition_count - 1"
-            // We ensure that the first messages in this partition will always have
-            // timestamps > the last closed timestamp. We need to explicitly close
-            // out all prior timestamps. To achieve this, we send an additional
-            // timestamp message to the coord/worker
-
-            // This can only happen for Kafka sources
-            tx.unbounded_send(coord::Message::AdvanceSourceTimestamp {
-                id: sid,
-                update: TimestampSourceUpdate::BringYourOwn(
-                    partition_count,                         // The new partition count
-                    PartitionId::Kafka(partition_count - 1), // the ID of the new partition
-                    self.last_ts,
-                    MzOffset { offset: 0 }, // An offset of 0 will "fast-forward" the stream, it denotes
-                                            // the empty interval
-                ),
-            })
-            .expect("Failed to send update to coordinator");
-        }
-        self.current_partition_count = partition_count;
-        self.last_ts = timestamp;
-        self.last_partition_ts.insert(partition.clone(), timestamp);
-        tx.unbounded_send(coord::Message::AdvanceSourceTimestamp {
-            id: sid,
-            update: TimestampSourceUpdate::BringYourOwn(
-                partition_count,
-                partition,
-                timestamp,
-                offset,
-            ),
-        })
-        .expect("Failed to send update to coordinator");
-    }
 }
 
 /// Supported format/envelope pairs for consistency topic decoding
 enum ConsistencyFormatting {
-    /// The formatting of this consistency source follows the
-    /// SourceName,PartitionCount,PartitionId,TS,Offset
-    ByoBytes,
-    /// The formatting of this consistency source follows
-    /// the Avro BYO consistency format
-    ByoAvro,
-    /// The formatting of this consistency source follows the
-    /// the AvroOCF BYO consistency format
-    ByoAvroOcf,
     /// The formatting of this consistency source follows the
     /// Debezium Avro format
     DebeziumAvro,
@@ -243,7 +160,7 @@ enum ConsistencyFormatting {
 #[derive(Clone)]
 struct RtKafkaConnector {
     coordination_state: Arc<TimestampingState>,
-    id: SourceInstanceId,
+    id: GlobalId,
     topic: String,
 }
 
@@ -252,7 +169,7 @@ struct TimestampingState {
     /// Flag is set when timestamping for this source has been dropped
     stop: AtomicBool,
     /// Channel through which messages can be sent to the coordinator
-    coordinator_channel: futures::channel::mpsc::UnboundedSender<coord::Message>,
+    coordinator_channel: mpsc::UnboundedSender<coord::Message>,
 }
 
 use std::fmt::Display;
@@ -268,20 +185,14 @@ impl ByoKafkaConnector {
     }
 }
 
-/// Data consumer for Kinesis source with RT consistency
-#[allow(dead_code)]
-struct RtKinesisConnector {
-    stream_name: String,
-    kinesis_client: Option<KinesisClient>,
-    cached_shard_ids: Option<HashSet<String>>,
-    timestamper_iteration_count: u64,
-}
-
-/// Data consumer stub for Kinesis source with BYO consistency
-struct ByoKinesisConnector {}
+/// Data consumer stub for Kinesis source with RT consistency
+struct RtKinesisConnector {}
 
 /// Data consumer stub for File source with RT consistency
 struct RtFileConnector {}
+
+/// Data consumer stub for S3 source with RT consistency
+struct RtS3Connector {}
 
 /// Data consumer stub for File source with BYO consistency
 struct ByoFileConnector<Out, Err> {
@@ -293,14 +204,6 @@ fn byo_query_source(consumer: &mut ByoTimestampConsumer) -> Vec<ValueEncoding> {
     match &mut consumer.connector {
         ByoTimestampConnector::Kafka(kafka_connector) => {
             while let Some(payload) = kafka_get_next_message(&mut kafka_connector.consumer) {
-                messages.push(ValueEncoding::Bytes(payload));
-            }
-        }
-        ByoTimestampConnector::Kinesis(_kinesis_consumer) => {
-            error!("Timestamping for Kinesis sources is unimplemented");
-        }
-        ByoTimestampConnector::File(file_consumer) => {
-            while let Some(payload) = file_get_next_message(file_consumer) {
                 messages.push(ValueEncoding::Bytes(payload));
             }
         }
@@ -327,75 +230,6 @@ where
         Err(TryRecvError::Empty) => None,
         Err(TryRecvError::Disconnected) => None,
     }
-}
-
-fn byo_extract_update_from_bytes(
-    consumer: &ByoTimestampConsumer,
-    messages: Vec<ValueEncoding>,
-) -> Vec<(i32, PartitionId, u64, MzOffset)> {
-    let mut updates = vec![];
-    for payload in messages {
-        let msg = if let ValueEncoding::Bytes(msg) = payload {
-            msg
-        } else {
-            panic!("The byte consistency type should always encode consistency msgs as bytes");
-        };
-        let st = str::from_utf8(&msg);
-        match st {
-            Ok(timestamp) => {
-                // Extract timestamp from payload
-                let split: Vec<&str> = timestamp.split(',').collect();
-                if split.len() != 5 {
-                    error!("incorrect payload format. Expected: SourceName,PartitionCount,PartitionId,TS,Offset. Got: {}", timestamp);
-                    continue;
-                }
-                let topic_name = String::from(split[0]);
-                let partition_count = match split[1].parse::<i32>() {
-                    Ok(i) => i,
-                    Err(err) => {
-                        error!("incorrect timestamp format {}", err);
-                        continue;
-                    }
-                };
-                let partition = match &consumer.connector {
-                    ByoTimestampConnector::Kinesis(_) => match split[2].parse::<String>() {
-                        Ok(s) => PartitionId::Kinesis(s),
-                        Err(err) => {
-                            error!("incorrect timestamp format {}", err);
-                            continue;
-                        }
-                    },
-                    ByoTimestampConnector::Kafka(_) => match split[2].parse::<i32>() {
-                        Ok(i) => PartitionId::Kafka(i),
-                        Err(err) => {
-                            error!("incorrect timestamp format {}", err);
-                            continue;
-                        }
-                    },
-                    _ => PartitionId::File,
-                };
-                let ts = match split[3].parse::<u64>() {
-                    Ok(i) => i,
-                    Err(err) => {
-                        error!("incorrect timestamp format {}", err);
-                        continue;
-                    }
-                };
-                let offset = match split[4].parse::<i64>() {
-                    Ok(i) => i,
-                    Err(err) => {
-                        error!("incorrect timestamp format {}", err);
-                        continue;
-                    }
-                };
-                if topic_name.trim() == consumer.source_name {
-                    updates.push((partition_count, partition, ts, MzOffset { offset }))
-                }
-            }
-            Err(err) => error!("incorrect payload format: {}", err),
-        }
-    }
-    updates
 }
 
 /// Polls a message from a Kafka Source
@@ -444,13 +278,13 @@ fn get_kafka_partitions(
 
 pub struct Timestamper {
     /// Current list of up to date sources that use a real time consistency model
-    rt_sources: HashMap<SourceInstanceId, RtTimestampConsumer>,
+    rt_sources: HashMap<GlobalId, RtTimestampConsumer>,
 
     /// Current list of up to date sources that use a BYO consistency model
-    byo_sources: HashMap<SourceInstanceId, ByoTimestampConsumer>,
+    byo_sources: HashMap<GlobalId, ByoTimestampConsumer>,
 
     /// Channel through which timestamp data updates are communicated through the coordinator
-    tx: futures::channel::mpsc::UnboundedSender<coord::Message>,
+    tx: mpsc::UnboundedSender<coord::Message>,
     /// Channel through which to timestamp metadata updates are received from the coordinator
     /// (to add or remove the timestamping of a source)
     rx: std::sync::mpsc::Receiver<TimestampMessage>,
@@ -459,66 +293,10 @@ pub struct Timestamper {
     timestamp_frequency: Duration,
 }
 
-/// A byo record contains a single timestamp update for a given source
-fn parse_byo(record: Vec<(String, Value)>) -> (String, i32, PartitionId, u64, MzOffset) {
-    let mut topic = String::new();
-    let mut partition_count = 0;
-    let mut partition_id = PartitionId::File;
-    let mut timestamp = 0;
-    let mut offset = 0;
-
-    for (key, value) in record {
-        if key == "source" {
-            if let Value::String(s) = value {
-                topic = s;
-            } else {
-                panic!("String expected");
-            }
-        } else if key == "partition_count" {
-            if let Value::Int(count) = value {
-                partition_count = count;
-            } else {
-                panic!("Int expected");
-            }
-        } else if key == "partition_id" {
-            if let Value::Union { inner: value, .. } = value {
-                if let Value::Int(pid) = *value {
-                    partition_id = PartitionId::Kafka(pid);
-                } else if let Value::String(s) = *value {
-                    partition_id = PartitionId::Kinesis(s);
-                } else {
-                    panic!("String or Int expected");
-                }
-            } else {
-                panic!("Union expected");
-            }
-        } else if key == "timestamp" {
-            if let Value::Long(ts) = value {
-                timestamp = ts as u64;
-            } else {
-                panic!("Long expected");
-            }
-        } else if key == "offset" {
-            if let Value::Long(off) = value {
-                offset = off;
-            } else {
-                panic!("Long expected");
-            }
-        }
-    }
-    (
-        topic,
-        partition_count,
-        partition_id,
-        timestamp,
-        MzOffset { offset },
-    )
-}
-
 /// Extracts Materialize timestamp updates from a Debezium consistency record.
 fn generate_ts_updates_from_debezium(
-    id: &SourceInstanceId,
-    tx: &futures::channel::mpsc::UnboundedSender<coord::Message>,
+    id: &GlobalId,
+    tx: &mpsc::UnboundedSender<coord::Message>,
     byo_consumer: &mut ByoTimestampConsumer,
     value: Value,
 ) {
@@ -532,29 +310,25 @@ fn generate_ts_updates_from_debezium(
                 // entries in data_collection do not contain server_name
                 // so we discard it before doing the comparison.
                 // We check for both here
-                //TODO(): possible performance issue here?
+                // TODO(): possible performance issue here?
                 let parsed_source_name = byo_consumer.source_name.split('.').skip(1).join(".");
                 if byo_consumer.source_name == topic.trim() || parsed_source_name == topic.trim() {
                     byo_consumer.last_offset.offset += count;
                     // Debezium consistency topic should only work for single-partition
                     // topics
-                    tx.unbounded_send(coord::Message::AdvanceSourceTimestamp {
-                        id: *id,
-                        update: TimestampSourceUpdate::BringYourOwn(
-                            1,
-                            match byo_consumer.connector {
-                                ByoTimestampConnector::File(_) | ByoTimestampConnector::Ocf(_) => {
-                                    PartitionId::File
-                                }
-                                ByoTimestampConnector::Kafka(_) => PartitionId::Kafka(0),
-                                ByoTimestampConnector::Kinesis(_) => {
-                                    PartitionId::Kinesis(String::new())
-                                }
-                            },
-                            byo_consumer.last_ts,
-                            byo_consumer.last_offset,
-                        ),
-                    })
+                    tx.send(coord::Message::AdvanceSourceTimestamp(
+                        coord::AdvanceSourceTimestamp {
+                            id: *id,
+                            update: TimestampSourceUpdate::BringYourOwn(
+                                match byo_consumer.connector {
+                                    ByoTimestampConnector::Ocf(_) => PartitionId::File,
+                                    ByoTimestampConnector::Kafka(_) => PartitionId::Kafka(0),
+                                },
+                                byo_consumer.last_ts,
+                                byo_consumer.last_offset,
+                            ),
+                        },
+                    ))
                     .expect("Failed to send update to coordinator");
                 }
             }
@@ -615,78 +389,6 @@ fn parse_debezium(record: Vec<(String, Value)>) -> Option<Vec<(String, i64)>> {
     Some(result)
 }
 
-/// This function determines the next maximum offset to timestamp.
-/// This offset should be no greater than max_increment_size
-/// entries since last_processed_offset
-/// Ex: last processed offset was 1 (we processed one record total). The current max kafka offset is 5
-/// For a batch size of 10, the function will return offset 5.
-/// For a batch size of 1, the function will return 2
-///
-/// Ex: last processed offset is 0 (ak, no records have been timestamped yet)
-/// The current max kafka offset is 0 (ak, the stream is empty). The function will return
-/// 0.
-#[allow(dead_code)]
-fn determine_next_offset(
-    // The last offset which we have assigned a timestamp for
-    last_processed_offset: MzOffset,
-    // The current max offset that exists
-    current_max_kafka_offset: MzOffset,
-    // The max size of the batch
-    max_increment_size: i64,
-) -> MzOffset {
-    // If bounding batches is activated (aka, max_increment_size > 0), then
-    // bound the next timestamp to be no more than max_increment_size in the future
-    if max_increment_size > 0
-        && ((current_max_kafka_offset.offset - last_processed_offset.offset) > max_increment_size)
-    {
-        MzOffset {
-            offset: (last_processed_offset.offset + max_increment_size),
-        }
-    } else {
-        // We take the max of the last offset which we have already timestamped
-        // and the highest offset for this Kafka topic
-        MzOffset {
-            offset: (std::cmp::max(
-                last_processed_offset.offset,
-                current_max_kafka_offset.offset,
-            )),
-        }
-    }
-}
-
-/// Determines whether the next proposed timestamp follows the timestamp
-/// assigning rules
-fn is_ts_valid(
-    byo_consumer: &ByoTimestampConsumer,
-    partition_count: i32,
-    partition: &PartitionId,
-    timestamp: u64,
-) -> bool {
-    let last_p_ts = match byo_consumer.last_partition_ts.get(&partition) {
-        Some(ts) => *ts,
-        None => 0,
-    };
-
-    if timestamp == 0
-        || timestamp == std::u64::MAX
-        || timestamp < byo_consumer.last_ts
-        || timestamp <= last_p_ts
-        || (partition_count > byo_consumer.current_partition_count
-            && timestamp == byo_consumer.last_ts)
-    {
-        error!("The timestamp assignment rules have been violated. The rules are as follows:\n\
-                     1) A timestamp should be greater than 0\n\
-                     2) The timestamp should be strictly smaller than u64::MAX\n\
-                     2) If no new partition is added, a new timestamp should be:\n \
-                        - strictly greater than the last timestamp in this partition\n \
-                        - greater or equal to all the timestamps that have been assigned across all partitions\n \
-                        If a new partition is added, a new timestamp should be:\n  \
-                        - strictly greater than the last timestamp\n");
-        return false;
-    }
-    true
-}
-
 /// This function determines the expected format of the consistency metadata as a function
 /// of the encoding and the envelope of the source.
 /// Specifically:
@@ -694,40 +396,27 @@ fn is_ts_valid(
 /// that follows the TRX_METADATA_SCHEMA Avro spec outlined above
 /// 2) any other file source with a Debezium envelope will expect an Avro consistency source
 /// that follows the TRX_METADATA_SCHEMA Avro spec outlined above
-/// 3) any source that uses the Text/Regex/Csv/Byte format will expect a consistency source that
-/// is formatted using the text
-/// 4) any source that uses the Protobuf format currently expects a consistency source that is formatted
-/// using the text format (SourceName,PartitionCount,Partition,Timestamp,Offset)
-/// 5) any source that uses the Avro format currently expects a consistency source that is formatted
-/// using the BYO_CONSISTENCY_SCHEMA Avro spec outlined above.
-///
-fn identify_consistency_format(enc: DataEncoding, env: Envelope) -> ConsistencyFormatting {
-    if let Envelope::Debezium(_) = env {
+fn identify_consistency_format(enc: DataEncoding, env: SourceEnvelope) -> ConsistencyFormatting {
+    if let SourceEnvelope::Debezium(_, DebeziumMode::Plain) = env {
         if let DataEncoding::AvroOcf(AvroOcfEncoding { reader_schema: _ }) = enc {
             ConsistencyFormatting::DebeziumOcf
         } else {
             ConsistencyFormatting::DebeziumAvro
         }
     } else {
-        match enc {
-            DataEncoding::AvroOcf(AvroOcfEncoding { reader_schema: _ }) => {
-                ConsistencyFormatting::ByoAvroOcf
-            }
-            DataEncoding::Avro(_) => ConsistencyFormatting::ByoAvro,
-            _ => ConsistencyFormatting::ByoBytes,
-        }
+        panic!("BYO timestamping for non-Debezium sources not supported!");
     }
 }
 
 impl Timestamper {
     pub fn new(
-        config: &TimestampConfig,
-        tx: futures::channel::mpsc::UnboundedSender<coord::Message>,
+        frequency: Duration,
+        tx: mpsc::UnboundedSender<coord::Message>,
         rx: std::sync::mpsc::Receiver<TimestampMessage>,
     ) -> Self {
         info!(
             "Starting Timestamping Thread. Frequency: {} ms.",
-            config.frequency.as_millis()
+            frequency.as_millis()
         );
 
         Self {
@@ -735,7 +424,7 @@ impl Timestamper {
             byo_sources: HashMap::new(),
             tx,
             rx,
-            timestamp_frequency: config.frequency,
+            timestamp_frequency: frequency,
         }
     }
 
@@ -764,7 +453,7 @@ impl Timestamper {
         // start checking
         while let Ok(update) = self.rx.try_recv() {
             match update {
-                TimestampMessage::Add(id, sc) => {
+                TimestampMessage::Add(source_id, sc) => {
                     let (sc, enc, env, cons) = if let SourceConnector::External {
                         connector,
                         encoding,
@@ -775,30 +464,42 @@ impl Timestamper {
                     {
                         (connector, encoding, envelope, consistency)
                     } else {
-                        panic!("A Local Source should never be timestamped");
+                        log::debug!("Local source {} cannot be timestamped. Ignoring", source_id);
+                        continue;
                     };
-                    if !self.rt_sources.contains_key(&id) && !self.byo_sources.contains_key(&id) {
+
+                    if !self.rt_sources.contains_key(&source_id)
+                        && !self.byo_sources.contains_key(&source_id)
+                    {
                         // Did not know about source, must update
                         match cons {
                             Consistency::RealTime => {
-                                info!("Timestamping Source {} with Real Time Consistency.", id);
-                                let consumer = self.create_rt_connector(id, sc);
+                                info!(
+                                    "Timestamping Source {} with Real Time Consistency.",
+                                    source_id
+                                );
+                                let consumer = self.create_rt_connector(source_id, sc);
                                 if let Some(consumer) = consumer {
-                                    self.rt_sources.insert(id, consumer);
+                                    self.rt_sources.insert(source_id, consumer);
                                 }
                             }
                             Consistency::BringYourOwn(consistency_topic) => {
-                                info!("Timestamping Source {} with BYO Consistency. Consistency Source: {}.", id, consistency_topic);
-                                let consumer =
-                                    self.create_byo_connector(id, sc, enc, env, consistency_topic);
+                                info!("Timestamping Source {} with BYO Consistency. Consistency Source: {}.", source_id, consistency_topic);
+                                let consumer = self.create_byo_connector(
+                                    source_id,
+                                    sc,
+                                    enc,
+                                    env,
+                                    consistency_topic,
+                                );
                                 if let Some(consumer) = consumer {
-                                    self.byo_sources.insert(id, consumer);
+                                    self.byo_sources.insert(source_id, consumer);
                                 }
                             }
                         }
                     }
                 }
-                TimestampMessage::DropInstance(id) => {
+                TimestampMessage::Drop(id) => {
                     info!("Dropping Timestamping for Source {}.", id);
                     if let Some(RtTimestampConsumer {
                         connector:
@@ -812,7 +513,21 @@ impl Timestamper {
                     }
                     self.byo_sources.remove(&id);
                 }
-                TimestampMessage::Shutdown => return true,
+                TimestampMessage::Shutdown => {
+                    // First, let's remove all of the threads consuming metadata
+                    // from realtime Kafka sources
+                    for (_, src) in self.rt_sources.iter_mut() {
+                        if let RtTimestampConnector::Kafka(RtKafkaConnector {
+                            coordination_state,
+                            ..
+                        }) = &src.connector
+                        {
+                            coordination_state.stop.store(true, Ordering::SeqCst);
+                        }
+                    }
+
+                    return true;
+                }
             }
         }
         false
@@ -835,68 +550,6 @@ impl Timestamper {
             // Get the next set of messages from the Consistency topic
             let messages = byo_query_source(byo_consumer);
             match byo_consumer.envelope {
-                ConsistencyFormatting::ByoBytes => {
-                    for (partition_count, partition, timestamp, offset) in
-                        byo_extract_update_from_bytes(byo_consumer, messages)
-                    {
-                        if is_ts_valid(&byo_consumer, partition_count, &partition, timestamp) {
-                            match byo_consumer.connector {
-                                ByoTimestampConnector::Kafka(_)
-                                | ByoTimestampConnector::File(_)
-                                | ByoTimestampConnector::Ocf(_) => {
-                                    if byo_consumer.current_partition_count < partition_count {
-                                        // A new partition has been added. Partitions always gets added with
-                                        // newPartitionId = previousLastPartitionId + 1 and start from 0.
-                                        // So this new partition will have ID "partition_count - 1"
-                                        // We ensure that the first messages in this partition will always have
-                                        // timestamps > the last closed timestamp. We need to explicitly close
-                                        // out all prior timestamps. To achieve this, we send an additional
-                                        // timestamp message to the coord/worker
-
-                                        // This can currently only happen in Kafka streams as File/OCF sources
-                                        // do not support partitions
-                                        self.tx
-                                            .unbounded_send(
-                                                coord::Message::AdvanceSourceTimestamp {
-                                                    id: *id,
-                                                    update: TimestampSourceUpdate::BringYourOwn(
-                                                        partition_count,                         // The new partition count
-                                                        PartitionId::Kafka(partition_count - 1), // the ID of the new partition
-                                                        byo_consumer.last_ts,
-                                                        MzOffset { offset: 0 }, // An offset of 0 will "fast-forward" the stream, it denotes
-                                                                                // the empty interval
-                                                    ),
-                                                },
-                                            )
-                                            .expect("Failed to send update to coordinator");
-                                    }
-                                    byo_consumer.current_partition_count = partition_count;
-                                    byo_consumer.last_ts = timestamp;
-                                    byo_consumer
-                                        .last_partition_ts
-                                        .insert(partition.clone(), timestamp);
-                                    self.tx
-                                        .unbounded_send(coord::Message::AdvanceSourceTimestamp {
-                                            id: *id,
-                                            update: TimestampSourceUpdate::BringYourOwn(
-                                                partition_count,
-                                                partition,
-                                                timestamp,
-                                                offset,
-                                            ),
-                                        })
-                                        .expect("Failed to send update to coordinator");
-                                }
-                                _ => {
-                                    error!(
-                                        "BYO consistency is not supported for this source type."
-                                    );
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
                 ConsistencyFormatting::DebeziumAvro => {
                     for msg in messages {
                         let msg = if let ValueEncoding::Bytes(msg) = msg {
@@ -933,102 +586,15 @@ impl Timestamper {
                         generate_ts_updates_from_debezium(&id, &self.tx, byo_consumer, value);
                     }
                 }
-                ConsistencyFormatting::ByoAvro => {
-                    for msg in messages {
-                        let msg = if let ValueEncoding::Bytes(msg) = msg {
-                            msg
-                        } else {
-                            panic!("Byo Avro consistency should only encode byte messages");
-                        };
-                        // The first 5 bytes are reserved for the schema id/schema registry information
-                        let mut bytes = &msg[5..];
-                        let res = mz_avro::from_avro_datum(&BYO_CONSISTENCY_SCHEMA, &mut bytes);
-                        let (topic, partition_count, partition, timestamp, offset) = match res {
-                            Ok(record) => {
-                                if let Value::Record(record) = record {
-                                    parse_byo(record)
-                                } else {
-                                    error!("Incorrect Avro format. Expected Record");
-                                    continue;
-                                }
-                            }
-                            Err(e) => {
-                                error!("Incorrect Avro Format. Error: {}", e);
-                                continue;
-                            }
-                        };
-                        if topic == byo_consumer.source_name {
-                            if is_ts_valid(byo_consumer, partition_count, &partition, timestamp) {
-                                match byo_consumer.connector {
-                                    ByoTimestampConnector::Kafka(_)
-                                    | ByoTimestampConnector::File(_) => {
-                                        byo_consumer.update_and_send(
-                                            &self.tx,
-                                            *id,
-                                            partition_count,
-                                            partition.clone(),
-                                            timestamp,
-                                            offset,
-                                        );
-                                    }
-                                    _ => {
-                                        error!(
-                                            "BYO consistency is not supported for this source type."
-                                        );
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                ConsistencyFormatting::ByoAvroOcf => {
-                    for msg in messages {
-                        let msg = if let ValueEncoding::Avro(value) = msg {
-                            value
-                        } else {
-                            panic!("Byo Avro consistency should only encode byte messages");
-                        };
-                        let partition_count = 1;
-                        let partition = PartitionId::File;
-                        let (topic, _, _, timestamp, offset) = if let Value::Record(record) = msg {
-                            parse_byo(record)
-                        } else {
-                            error!("Incorrect Avro format. Expected Record");
-                            continue;
-                        };
-                        if topic == byo_consumer.source_name {
-                            if is_ts_valid(byo_consumer, partition_count, &partition, timestamp) {
-                                match byo_consumer.connector {
-                                    ByoTimestampConnector::Ocf(_) => {
-                                        byo_consumer.update_and_send(
-                                            &self.tx,
-                                            *id,
-                                            partition_count,
-                                            partition.clone(),
-                                            timestamp,
-                                            offset,
-                                        );
-                                    }
-                                    _ => {
-                                        error!(
-                                            "BYO OCF consistency is not supported for this source type."
-                                        );
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
             }
         }
     }
 
     /// Creates a RT connector
+    /// TODO(rkhaitan): this function burns my eyes
     fn create_rt_connector(
         &self,
-        id: SourceInstanceId,
+        id: GlobalId,
         sc: ExternalSourceConnector,
     ) -> Option<RtTimestampConsumer> {
         match sc {
@@ -1055,79 +621,33 @@ impl Timestamper {
                 .map(|connector| RtTimestampConsumer {
                     connector: RtTimestampConnector::Kinesis(connector),
                 }),
+            ExternalSourceConnector::S3(s3c) => {
+                self.create_rt_s3_connector(id, s3c)
+                    .map(|connector| RtTimestampConsumer {
+                        connector: RtTimestampConnector::S3(connector),
+                    })
+            }
+            ExternalSourceConnector::Postgres(_) => None,
+            ExternalSourceConnector::PubNub(_) => None,
         }
-    }
-
-    fn create_byo_file_connector(
-        &self,
-        _id: SourceInstanceId,
-        fc: &FileSourceConnector,
-        timestamp_topic: String,
-    ) -> Option<ByoFileConnector<std::vec::Vec<u8>, anyhow::Error>> {
-        let ctor = |fi| Ok(std::io::BufReader::new(fi).split(b'\n'));
-        let (tx, rx) = std::sync::mpsc::sync_channel(10000);
-        let tail = if fc.tail {
-            FileReadStyle::TailFollowFd
-        } else {
-            FileReadStyle::ReadOnce
-        };
-        std::thread::spawn(move || {
-            read_file_task(PathBuf::from(timestamp_topic), tx, None, tail, ctor);
-        });
-
-        Some(ByoFileConnector { stream: rx })
     }
 
     fn create_rt_kinesis_connector(
         &self,
-        _id: SourceInstanceId,
-        kinc: KinesisSourceConnector,
+        _id: GlobalId,
+        _kinc: KinesisSourceConnector,
     ) -> Option<RtKinesisConnector> {
-        let (kinesis_client, cached_shard_ids) = match block_on(aws_util::kinesis::kinesis_client(
-            kinc.region.clone(),
-            kinc.access_key_id.clone(),
-            kinc.secret_access_key.clone(),
-            kinc.token.clone(),
-        )) {
-            Ok(kinesis_client) => {
-                let cached_shard_ids = match block_on(aws_util::kinesis::get_shard_ids(
-                    &kinesis_client,
-                    &kinc.stream_name,
-                )) {
-                    Ok(shard_ids) => shard_ids,
-                    Err(e) => {
-                        error!(
-                            "Initializing KinesisSourceConnector with empty shard list: {}",
-                            e
-                        );
-                        HashSet::new()
-                    }
-                };
-
-                (Some(kinesis_client), Some(cached_shard_ids))
-            }
-            Err(e) => {
-                error!("Hit error trying to create KinesisClient for Timestamper. Timestamps will not update for source based on Kinesis stream {}. {:#?}", kinc.stream_name, e);
-                (None, None)
-            }
-        };
-
-        // TODO(ncrooks): add option to create a separate metadata thread for updating
-        // metadata such as metrics or total number of records
-
-        Some(RtKinesisConnector {
-            stream_name: kinc.stream_name,
-            kinesis_client,
-            cached_shard_ids,
-            timestamper_iteration_count: 0,
-        })
+        Some(RtKinesisConnector {})
     }
 
     fn create_rt_kafka_connector(
         &self,
-        id: SourceInstanceId,
+        id: GlobalId,
         kc: KafkaSourceConnector,
     ) -> Option<RtKafkaConnector> {
+        // These keys do not make sense for the timestamping connector, and will
+        // be filtered out (fixes #6313)
+        const CONF_DENYLIST: &'static [&'static str] = &["statistics.interval.ms"];
         let mut config = ClientConfig::new();
         config.set("bootstrap.servers", &kc.addrs.to_string());
 
@@ -1136,7 +656,9 @@ impl Timestamper {
         }
 
         for (k, v) in &kc.config_options {
-            config.set(k, v);
+            if !CONF_DENYLIST.contains(&k.as_str()) {
+                config.set(k, v);
+            }
         }
 
         let consumer = match config.create::<BaseConsumer>() {
@@ -1178,7 +700,7 @@ impl Timestamper {
 
     fn create_rt_ocf_connector(
         &self,
-        _id: SourceInstanceId,
+        _id: GlobalId,
         _fc: FileSourceConnector,
     ) -> Option<RtFileConnector> {
         Some(RtFileConnector {})
@@ -1186,15 +708,23 @@ impl Timestamper {
 
     fn create_rt_file_connector(
         &self,
-        _id: SourceInstanceId,
+        _id: GlobalId,
         _fc: FileSourceConnector,
     ) -> Option<RtFileConnector> {
         Some(RtFileConnector {})
     }
 
+    fn create_rt_s3_connector(
+        &self,
+        _id: GlobalId,
+        _fc: S3SourceConnector,
+    ) -> Option<RtS3Connector> {
+        Some(RtS3Connector {})
+    }
+
     fn create_byo_ocf_connector(
         &self,
-        _id: SourceInstanceId,
+        _id: GlobalId,
         fc: &FileSourceConnector,
         timestamp_topic: String,
     ) -> Option<ByoFileConnector<mz_avro::types::Value, anyhow::Error>> {
@@ -1204,9 +734,17 @@ impl Timestamper {
         } else {
             FileReadStyle::ReadOnce
         };
-        let (tx, rx) = std::sync::mpsc::sync_channel(10000 as usize);
+        let (tx, rx) = std::sync::mpsc::sync_channel(10000_usize);
+        let compression = fc.compression.clone();
         std::thread::spawn(move || {
-            read_file_task(PathBuf::from(timestamp_topic), tx, None, tail, ctor);
+            read_file_task(
+                PathBuf::from(timestamp_topic),
+                tx,
+                None,
+                tail,
+                compression,
+                ctor,
+            );
         });
 
         Some(ByoFileConnector { stream: rx })
@@ -1215,10 +753,10 @@ impl Timestamper {
     /// Creates a BYO connector
     fn create_byo_connector(
         &self,
-        id: SourceInstanceId,
+        id: GlobalId,
         sc: ExternalSourceConnector,
         enc: DataEncoding,
-        env: Envelope,
+        env: SourceEnvelope,
         timestamp_topic: String,
     ) -> Option<ByoTimestampConsumer> {
         match sc {
@@ -1229,23 +767,7 @@ impl Timestamper {
                         source_name: topic,
                         connector: ByoTimestampConnector::Kafka(connector),
                         envelope: identify_consistency_format(enc, env),
-                        last_partition_ts: HashMap::new(),
                         last_ts: 0,
-                        current_partition_count: 1,
-                        last_offset: MzOffset { offset: 0 },
-                    }),
-                    None => None,
-                }
-            }
-            ExternalSourceConnector::File(fc) => {
-                match self.create_byo_file_connector(id, &fc, timestamp_topic) {
-                    Some(consumer) => Some(ByoTimestampConsumer {
-                        source_name: fc.path.to_string_lossy().into_owned(),
-                        connector: ByoTimestampConnector::File(consumer),
-                        envelope: identify_consistency_format(enc, env),
-                        last_partition_ts: HashMap::new(),
-                        last_ts: 0,
-                        current_partition_count: 1,
                         last_offset: MzOffset { offset: 0 },
                     }),
                     None => None,
@@ -1257,43 +779,23 @@ impl Timestamper {
                         source_name: fc.path.to_string_lossy().into_owned(),
                         connector: ByoTimestampConnector::Ocf(consumer),
                         envelope: identify_consistency_format(enc, env),
-                        last_partition_ts: HashMap::new(),
                         last_ts: 0,
-                        current_partition_count: 1,
                         last_offset: MzOffset { offset: 0 },
                     }),
                     None => None,
                 }
             }
-            ExternalSourceConnector::Kinesis(kinc) => {
-                match self.create_byo_kinesis_connector(id, &kinc, timestamp_topic) {
-                    Some(consumer) => Some(ByoTimestampConsumer {
-                        source_name: kinc.stream_name,
-                        connector: ByoTimestampConnector::Kinesis(consumer),
-                        envelope: identify_consistency_format(enc, env),
-                        last_partition_ts: HashMap::new(),
-                        last_ts: 0,
-                        current_partition_count: 1,
-                        last_offset: MzOffset { offset: 0 },
-                    }),
-                    None => None,
-                }
-            }
+            ExternalSourceConnector::File(_) => None, // BYO is not supported for plain file sources
+            ExternalSourceConnector::Kinesis(_) => None, // BYO is not supported for Kinesis sources
+            ExternalSourceConnector::S3(_) => None,   // BYO is not supported for s3 sources
+            ExternalSourceConnector::Postgres(_) => None, // BYO is not supported for postgres sources
+            ExternalSourceConnector::PubNub(_) => None,   // BYO is not supported for pubnub sources
         }
-    }
-
-    fn create_byo_kinesis_connector(
-        &self,
-        _id: SourceInstanceId,
-        _kinc: &KinesisSourceConnector,
-        _timestamp_topic: String,
-    ) -> Option<ByoKinesisConnector> {
-        unimplemented!();
     }
 
     fn create_byo_kafka_connector(
         &self,
-        id: SourceInstanceId,
+        id: GlobalId,
         kc: &KafkaSourceConnector,
         timestamp_topic: String,
     ) -> Option<ByoKafkaConnector> {
@@ -1306,6 +808,8 @@ impl Timestamper {
             .set("max.poll.interval.ms", "300000") // 5 minutes
             .set("fetch.message.max.bytes", "134217728")
             .set("enable.sparse.connections", "true")
+            // should match the isolation level of the source; for now that's always read_committed
+            .set("isolation.level", "read_committed")
             .set("bootstrap.servers", &kc.addrs.to_string());
 
         let group_id_prefix = kc.group_id_prefix.clone().unwrap_or_else(String::new);
@@ -1329,7 +833,7 @@ impl Timestamper {
                 match get_kafka_partitions(
                     &consumer.consumer,
                     &timestamp_topic,
-                    Duration::from_secs(1),
+                    Duration::from_secs(5),
                 )
                 .as_ref()
                 .map(Deref::deref)
@@ -1350,7 +854,7 @@ impl Timestamper {
                         None
                     }
                     Err(e) => {
-                        error!(
+                        warn!(
                             "Unable to fetch metadata about consistency topic {}; \
                              assuming it exists with one partition (error: {})",
                             timestamp_topic, e
@@ -1387,19 +891,28 @@ fn rt_kafka_metadata_fetch_loop(c: RtKafkaConnector, consumer: BaseConsumer, wai
                             "Discovered {} new ({} total) kafka partitions for topic {} (source {})",
                             diff, new_partition_count, c.topic, c.id,
                         );
+
+                        for partition in current_partition_count..new_partition_count {
+                            c.coordination_state
+                                .coordinator_channel
+                                .send(coord::Message::AdvanceSourceTimestamp(
+                                    coord::AdvanceSourceTimestamp {
+                                        id: c.id,
+                                        update: TimestampSourceUpdate::RealTime(
+                                            PartitionId::Kafka(partition),
+                                        ),
+                                    },
+                                ))
+                                .expect(
+                                    "Failed to send update to coordinator. This should not happen",
+                                );
+                        }
                         current_partition_count = new_partition_count;
-                        c.coordination_state
-                            .coordinator_channel
-                            .unbounded_send(coord::Message::AdvanceSourceTimestamp {
-                                id: c.id,
-                                update: TimestampSourceUpdate::RealTime(current_partition_count),
-                            })
-                            .expect("Failed to send update to coordinator. This should not happen");
                     }
                     cmp::Ordering::Less => {
-                        error!(
+                        info!(
                             "Ignoring decrease in partitions (from {} to {}) for topic {} (source {})",
-                             new_partition_count, current_partition_count, c.topic, c.id,
+                            current_partition_count, new_partition_count, c.topic, c.id,
                         );
                     }
                     cmp::Ordering::Equal => (),
@@ -1436,6 +949,9 @@ fn rt_kafka_metadata_fetch_loop(c: RtKafkaConnector, consumer: BaseConsumer, wai
                 }
             }
         }
+
+        // Poll once to clear any extraneous messages on this queue.
+        consumer.poll(Duration::from_secs(0));
 
         if current_partition_count > 0 {
             thread::sleep(wait);

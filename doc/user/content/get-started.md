@@ -11,7 +11,7 @@ To help you get started with Materialize, we'll:
 - Explore its API
 - Set up a real-time stream to perform aggregations on Wikipedia user edits.
 
-{{< cta href="/katacoda?intro-wikipedia" target="_blank" >}}
+{{< cta href="/katacoda/?intro-wikipedia" target="_blank" >}}
 Try the demo in your browser →
 {{</ cta >}}
 
@@ -39,7 +39,7 @@ We also highly recommend checking out [What is Materialize?](/overview/what-is-m
 1. Connect to `materialized` through your Materialize CLI, e.g.:
 
     ```shell
-    psql -h localhost -p 6875 materialize
+    psql -U materialize -h localhost -p 6875 materialize
     ```
 
 ## Explore Materialize's API
@@ -117,7 +117,7 @@ To get started, though, we'll begin with a simple version that doesn't require c
     GROUP BY lhs.key;
     ```
 
-Of course, these are trivial examples, but hope begin to illustrate some of Materialize's potential.
+Of course, these are trivial examples, but hopefully begin to illustrate some of Materialize's potential.
 
 ## Create a real-time stream
 

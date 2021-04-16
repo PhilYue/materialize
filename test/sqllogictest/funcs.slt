@@ -9,6 +9,12 @@
 
 mode cockroach
 
+query error DISTINCT specified, but now is not an aggregate function
+SELECT now(DISTINCT)
+
+query error DISTINCT specified, but round is not an aggregate function
+SELECT round(DISTINCT 1)
+
 # Test date_trunc()
 
 # TODO: PostgreSQL truncates trailing zeros from seconds, we do not.
@@ -82,11 +88,46 @@ SELECT date_trunc('century', TIMESTAMP '2019-11-26 15:56:46.241150')
 ----
 2001-01-01 00:00:00
 
+# Round down century correctly, meaning 2000 is rounded to 1901.
+query T
+SELECT date_trunc('century', TIMESTAMP '2000-11-26 15:56:46.241150')
+----
+1901-01-01 00:00:00
+
 # Expects the first year of the millennium, meaning 2001 instead of 2000.
 query T
 SELECT date_trunc('millennium', TIMESTAMP '2019-11-26 15:56:46.241150')
 ----
 2001-01-01 00:00:00
+
+# Round down millennium correctly, meaning 2000 is rounded to 1001.
+query T
+SELECT date_trunc('millennium', TIMESTAMP '2000-11-26 15:56:46.241150')
+----
+1001-01-01 00:00:00
+
+# TODO: PostgreSQL displays timestamps with 0 or negative year as (1 - year) BC, while we do not.
+# TODO: Currently we do not parse BC/AD and it's erroneously considered a named time zone, so INTERVAL is used.
+# This test should return:  0011-01-01 00:00:00 BC
+# Expects the decade to be rounded down for BC.
+query T
+SELECT date_trunc('decade', TIMESTAMP '0001-01-01 00:00:00.000000' - INTERVAL '2'YEAR)
+----
+-0010-01-01 00:00:00
+
+# This test should return:  0100-01-01 00:00:00 BC
+# Expects the century to be rounded down for BC.
+query T
+SELECT date_trunc('century', TIMESTAMP '0001-01-01 00:00:00.000000' - INTERVAL '1'SECOND)
+----
+-0099-01-01 00:00:00
+
+# This test should return:  1000-01-01 00:00:00 BC
+# Expects the millennium to be rounded down for BC.
+query T
+SELECT date_trunc('millennium', TIMESTAMP '0001-01-01 00:00:00.000000' - INTERVAL '1'SECOND)
+----
+-0999-01-01 00:00:00
 
 query error unknown units 'bad'
 SELECT date_trunc('bad', TIMESTAMP '2019-11-26 15:56:46.241150')
@@ -177,7 +218,7 @@ SELECT floor(CAST (1.1 AS float))
 query RRRRR
 SELECT floor(1.1), floor(1.111), floor(100.1), floor(100.11), floor(-4.1)
 ----
-1.0 1.000 100.0 100.00 -5.0
+1  1  100  100  -5
 
 
 query R
@@ -193,7 +234,7 @@ SELECT ceil(CAST (1.1 AS float))
 query RRRRR
 SELECT ceil(1.1), ceil(1.111), ceil(100.1), ceil(100.11), ceil(-4.1)
 ----
-2.0 2.000 101.0 101.00 -4.0
+2  2  101  101  -4
 
 # postgres converts ints to floats on floor/ceil
 query R
@@ -238,20 +279,20 @@ INSERT INTO null_test VALUES (5.06, -1.59), (-12.58, NULL), (2.96, 2.2), (NULL, 
 query RR rowsort
 SELECT floor(decimal_col), floor(float_col) FROM null_test
 ----
--10.00  -49
--13.00  NULL
-2.00    2
-5.00    -2
-NULL    23
+-10  -49
+-13  NULL
+2  2
+5  -2
+NULL  23
 
 query RR rowsort
 SELECT ceil(decimal_col), ceil(float_col) FROM null_test
 ----
--12.00  NULL
--9.00  -48
-3.00    3
-6.00    -1
-NULL    24
+-12  NULL
+-9  -48
+3  3
+6  -1
+NULL  24
 
 # Tests for the sqrt function.
 #
@@ -281,6 +322,37 @@ query R
 SELECT sqrt(1.23783::decimal(15, 5))
 ----
 1.11257
+
+# Test cbrt.
+query R
+SELECT cbrt(NULL)
+----
+NULL
+
+query R
+SELECT cbrt(1.23783::float)
+----
+1.0737100084353584
+
+query R
+SELECT cbrt(1.23783::double)
+----
+1.0737100084353584
+
+query R
+SELECT cbrt(1.23783::decimal(15,5))
+----
+1.0737100084353584
+
+query R
+SELECT cbrt(-8::double)
+----
+-2
+
+query R
+SELECT cbrt(3::int)
+----
+1.4422495703074083
 
 # Test coalesce.
 query I
@@ -438,6 +510,8 @@ EXPLAIN PLAN FOR SELECT (a::bool AND b::bool) IS NULL FROM t
 
 EOF
 
+mode cockroach
+
 # Test qualified function names.
 
 query I
@@ -455,7 +529,7 @@ SELECT materialize.pg_catalog.abs(1)
 ----
 1
 
-query error function "mz_catalog.abs" does not exist
+query error function mz_catalog.abs\(integer\) does not exist
 SELECT mz_catalog.abs(1)
 
 query error unknown database 'noexist'
@@ -474,7 +548,7 @@ SELECT pg_catalog.mod(7, 4)
 ----
 3
 
-query error function "mz_catalog.mod" does not exist
+query error function mz_catalog.mod\(integer, integer\) does not exist
 SELECT mz_catalog.mod(7, 4)
 
 query error unknown database 'noexist'
@@ -584,5 +658,401 @@ SELECT array_upper(NULL::text[], 1)
 ----
 NULL
 
-query error Cannot call function array_upper\(unknown, i32\): arguments cannot be implicitly cast to any implementation's parameters; try providing explicit casts
+query error Cannot call function array_upper\(unknown, integer\): arguments cannot be implicitly cast to any implementation's parameters; try providing explicit casts
 SELECT array_upper(NULL, 1)
+
+query I
+SELECT array_length(ARRAY['a', 'b'], 1)
+----
+2
+
+query I
+SELECT array_length(ARRAY['a'], 1)
+----
+1
+
+query I
+SELECT array_length(ARRAY['a'], 0)
+----
+NULL
+
+query I
+SELECT array_length(ARRAY['a'], 2)
+----
+NULL
+
+query I
+SELECT array_length(ARRAY[ARRAY[1, 2]], 2)
+----
+2
+
+query I
+SELECT array_length(ARRAY[]::int[], 1)
+----
+NULL
+
+# Test strange collapsing behavior of nested empty arrays. See #5545.
+
+query TIII
+SELECT arr, array_lower(arr, 1), array_upper(arr, 1), array_length(arr, 1) FROM
+    (VALUES
+        (ARRAY[]::int[]),
+        (ARRAY[ARRAY[]]::int[]),
+        (ARRAY[ARRAY[], ARRAY[], ARRAY[]]::int[]),
+        (ARRAY[ARRAY[ARRAY[ARRAY[]]]]::int[])
+    ) AS _ (arr)
+----
+{}  NULL  NULL  NULL
+{}  NULL  NULL  NULL
+{}  NULL  NULL  NULL
+{}  NULL  NULL  NULL
+
+query T
+SELECT upper('a1Bd')
+----
+A1BD
+
+query T
+SELECT upper('ALREADYUP')
+----
+ALREADYUP
+
+query error Cannot call function upper\(numeric\(38,1\)\): arguments cannot be implicitly cast to any implementation's parameters; try providing explicit casts
+SELECT upper(2.2)
+
+query T
+SELECT lower('a1Bd')
+----
+a1bd
+
+query T
+SELECT lower('alreadylow')
+----
+alreadylow
+
+query error Cannot call function lower\(interval\): arguments cannot be implicitly cast to any implementation's parameters; try providing explicit casts
+SELECT lower('1ms'::interval)
+
+# Test trigonometric functions.
+
+# Use standard mode to round floats to three digits of precision. This makes
+# tests more reliable across platforms, as platforms have different
+# implementations of the trigonometric functions that result in slight
+# variance in the least significant digits.
+mode standard
+
+query R
+SELECT sin(NULL)
+----
+NULL
+
+query R
+SELECT sinh(NULL)
+----
+NULL
+
+query R
+SELECT cos(NULL)
+----
+NULL
+
+query R
+SELECT cosh(NULL)
+----
+NULL
+
+query R
+SELECT tan(NULL)
+----
+NULL
+
+query R
+SELECT tanh(NULL)
+----
+NULL
+
+query R
+SELECT cot(NULL)
+----
+NULL
+
+query R
+SELECT sin('NaN'::double)
+----
+NaN
+
+query R
+SELECT sinh('NaN'::double)
+----
+NaN
+
+query R
+SELECT cos('NaN'::double)
+----
+NaN
+
+query R
+SELECT cosh('NaN'::double)
+----
+NaN
+
+query R
+SELECT tan('NaN'::double)
+----
+NaN
+
+query R
+SELECT tanh('NaN'::double)
+----
+NaN
+
+query R
+SELECT cot('NaN'::double)
+----
+NaN
+
+query R
+SELECT sin(0::double)
+----
+0.000
+
+query R
+SELECT sinh(0::double)
+----
+0.000
+
+query R
+SELECT cos(0::double)
+----
+1.000
+
+query R
+SELECT cosh(0::double)
+----
+1.000
+
+query R
+SELECT tan(0::double)
+----
+0.000
+
+query R
+SELECT tanh(0::double)
+----
+0.000
+
+query R
+SELECT cot(0::double)
+----
+inf
+
+query R
+SELECT cot(-0::double)
+----
+-inf
+
+query R
+SELECT sin(1::double)
+----
+0.841
+
+query R
+SELECT sinh(1::double)
+----
+1.175
+
+query R
+SELECT cos(1::double)
+----
+0.540
+
+query R
+SELECT cosh(1::double)
+----
+1.543
+
+query R
+SELECT tan(1.01::double)
+----
+1.592
+
+query R
+SELECT tanh(1::double)
+----
+0.762
+
+query R
+SELECT cot(1.01::double)
+----
+0.628
+
+query error function sin is only defined for finite arguments
+SELECT sin('inf'::double)
+
+query R
+SELECT sinh('inf'::double)
+----
+inf
+
+query error function cos is only defined for finite arguments
+SELECT cos('inf'::double)
+
+query R
+SELECT cosh('inf'::double)
+----
+inf
+
+query error function tan is only defined for finite arguments
+SELECT tan('inf'::double)
+
+query R
+SELECT tanh('inf'::double)
+----
+1.000
+
+query error function cot is only defined for finite arguments
+SELECT cot('inf'::double)
+
+query error function sin is only defined for finite arguments
+SELECT sin('-inf'::double)
+
+query R
+SELECT sinh('-inf'::double)
+----
+-inf
+
+query error function cos is only defined for finite arguments
+SELECT cos('-inf'::double)
+
+query R
+SELECT cosh('-inf'::double)
+----
+inf
+
+query error function tan is only defined for finite arguments
+SELECT tan('-inf'::double)
+
+query R
+SELECT tanh('-inf'::double)
+----
+-1.000
+
+# Use the more reasonable number representation, as the standard mode
+# causes all sorts of weird representation issues with exp and log:
+mode cockroach
+
+query error function cot is only defined for finite arguments
+SELECT cot('-inf'::double)
+
+query error function log10 is not defined for zero
+SELECT log10(0.0::double)
+
+query error function log10 is not defined for zero
+SELECT log10(+0.0::double)
+
+query error function log10 is not defined for negative numbers
+SELECT log10(-1.0::double)
+
+query R
+SELECT log10(10.0::double)
+----
+1
+
+query R
+SELECT log(10.0::decimal(15, 5))
+----
+1
+
+query error function log is not defined for zero
+SELECT log(0.0, 10)
+
+query error function log is not defined for zero
+SELECT log(+0.0, 10)
+
+query error function log is not defined for negative numbers
+SELECT log(-10, 10)
+
+query error function log is not defined for zero
+SELECT log(10, 0.0)
+
+query error function log is not defined for zero
+SELECT log(10, +0.0)
+
+query error function log is not defined for negative numbers
+SELECT log(10.0, -10)
+
+query R
+SELECT log(10, 10)
+----
+1
+
+query R
+SELECT log(400, 20)
+----
+2
+
+query R
+SELECT log10(10::decimal(15, 5))
+----
+1
+
+query R
+SELECT round(ln(13::float)::decimal(15, 5), 3)
+----
+2.5650
+
+query error function ln is not defined for negative numbers
+SELECT ln(-1)
+
+query error function ln is not defined for zero
+SELECT ln(0)
+
+query R
+SELECT ln(13.0000::decimal(15, 5))
+----
+2.56494
+
+query R
+SELECT round(exp(2)::decimal(15, 5), 3)
+----
+7.3890
+
+query R
+SELECT exp(ln(2))
+----
+2
+
+query T
+SELECT exp(ln(2::decimal(15, 5)))
+----
+2
+
+query R
+SELECT power(382, 5);
+----
+8134236862432
+
+query T
+SELECT power(9::float, 0.5);
+----
+3.000
+
+query T
+SELECT power(9::decimal(15, 5), 0.5::decimal(15, 5));
+----
+3
+
+query R
+SELECT pow(382, 5);
+----
+8134236862432
+
+query T
+SELECT pow(9::float, 0.5);
+----
+3.000
+
+query T
+SELECT pow(9::decimal(15, 5), 0.5::decimal(15, 5));
+----
+3

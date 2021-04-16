@@ -115,7 +115,7 @@ pub enum Record<'a> {
     Statement {
         location: Location,
         expected_error: Option<&'a str>,
-        rows_affected: Option<usize>,
+        rows_affected: Option<u64>,
         sql: &'a str,
     },
     /// A `query` directive.
@@ -123,6 +123,14 @@ pub enum Record<'a> {
         location: Location,
         sql: &'a str,
         output: Result<QueryOutput<'a>, &'a str>,
+    },
+    /// A `simple` directive.
+    Simple {
+        location: Location,
+        conn: Option<&'a str>,
+        sql: &'a str,
+        output: Output,
+        output_str: &'a str,
     },
     /// A `hash-threshold` directive.
     HashThreshold { threshold: u64 },

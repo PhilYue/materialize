@@ -40,6 +40,9 @@ land, and then browsed as reference material as you skill up on the codebase.
     higher-level things to look for and think about if something is not working
     as expected.
 
+* [fast-compiles.md](fast-compiles.md) describes various tricks for speeding
+  up Rust compilation.
+
 * [guide.md](guide.md) walks you through hacking on this codebase and our
   development philosophy.
 
@@ -50,9 +53,6 @@ land, and then browsed as reference material as you skill up on the codebase.
     committing and reviewing code.
   * [guide-testing.md](guide-testing.md) describes our various test suites and
     our testing philosophy.
-
-* [metabase-demo.md](metabase-demo.md) contains instructions for setting up and
-  viewing Metabase dashboards with Materialize.
 
 * [mzbuild.md](mzbuild.md) describes the custom build system we use to manage
   our Docker images and Docker Compose configurations.

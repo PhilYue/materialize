@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::fmt;
 use std::rc::Rc;
+use std::str::FromStr;
 
 use digest::Digest;
 use itertools::Itertools;
@@ -316,6 +317,13 @@ pub struct Schema {
     pub(crate) named: Vec<NamedSchemaPiece>,
     pub(crate) indices: HashMap<FullName, usize>,
     pub top: SchemaPieceOrNamed,
+}
+
+impl ToString for Schema {
+    fn to_string(&self) -> String {
+        let json = serde_json::to_value(self).unwrap();
+        json.to_string()
+    }
 }
 
 impl std::fmt::Debug for Schema {
@@ -866,7 +874,7 @@ impl SchemaParser {
                 "bytes" => SchemaPieceOrNamed::Piece(Self::parse_bytes(complex)?),
                 "int" => SchemaPieceOrNamed::Piece(Self::parse_int(complex)?),
                 "long" => SchemaPieceOrNamed::Piece(Self::parse_long(complex)?),
-                "string" => SchemaPieceOrNamed::Piece(Self::parse_string(complex)),
+                "string" => SchemaPieceOrNamed::Piece(Self::from_string(complex)),
                 other => {
                     let name = FullName {
                         name: other.into(),
@@ -951,7 +959,7 @@ impl SchemaParser {
                 "ignore" => Some(RecordFieldOrder::Ignore),
                 _ => None,
             })
-            .unwrap_or_else(|| RecordFieldOrder::Ascending);
+            .unwrap_or(RecordFieldOrder::Ascending);
 
         Ok(RecordField {
             name,
@@ -1184,7 +1192,7 @@ impl SchemaParser {
         Ok(SchemaPiece::Long)
     }
 
-    fn parse_string(complex: &Map<String, Value>) -> SchemaPiece {
+    fn from_string(complex: &Map<String, Value>) -> SchemaPiece {
         const CONNECT_JSON: &str = "io.debezium.data.Json";
 
         if let Some(serde_json::Value::String(name)) = complex.get("connect.name") {
@@ -1252,13 +1260,6 @@ impl SchemaParser {
 }
 
 impl Schema {
-    /// Create a `Schema` from a string representing a JSON Avro schema.
-    pub fn parse_str(input: &str) -> Result<Self, AvroError> {
-        let value = serde_json::from_str(input)
-            .map_err(|e| ParseSchemaError::new(format!("Error parsing JSON: {}", e)))?;
-        Self::parse(&value)
-    }
-
     /// Create a `Schema` from a `serde_json::Value` representing a JSON Avro
     /// schema.
     pub fn parse(value: &Value) -> Result<Self, AvroError> {
@@ -1306,6 +1307,17 @@ impl Schema {
             "string" => Ok(SchemaPiece::String),
             other => Err(ParseSchemaError::new(format!("Unknown type: {}", other)).into()),
         }
+    }
+}
+
+impl FromStr for Schema {
+    type Err = AvroError;
+
+    /// Create a `Schema` from a string representing a JSON Avro schema.
+    fn from_str(input: &str) -> Result<Self, AvroError> {
+        let value = serde_json::from_str(input)
+            .map_err(|e| ParseSchemaError::new(format!("Error parsing JSON: {}", e)))?;
+        Self::parse(&value)
     }
 }
 
@@ -2063,15 +2075,18 @@ fn field_ordering_position(field: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    use types::Record;
+    use types::ToAvro;
+
     use super::*;
 
     fn check_schema(schema: &str, expected: SchemaPiece) {
-        let schema = Schema::parse_str(schema).unwrap();
+        let schema = Schema::from_str(schema).unwrap();
         assert_eq!(&expected, schema.top_node().inner);
 
         // Test serialization round trip
         let schema = serde_json::to_string(&schema).unwrap();
-        let schema = Schema::parse_str(&schema).unwrap();
+        let schema = Schema::from_str(&schema).unwrap();
         assert_eq!(&expected, schema.top_node().inner);
     }
 
@@ -2114,7 +2129,7 @@ mod tests {
 
     #[test]
     fn test_multi_union_schema() {
-        let schema = Schema::parse_str(r#"["null", "int", "float", "string", "bytes"]"#);
+        let schema = Schema::from_str(r#"["null", "int", "float", "string", "bytes"]"#);
         assert!(schema.is_ok());
         let schema = schema.unwrap();
         let node = schema.top_node();
@@ -2209,7 +2224,7 @@ mod tests {
 
         check_schema(schema, expected);
 
-        let bad_schema = Schema::parse_str(
+        let bad_schema = Schema::from_str(
             r#"{"type": "enum", "name": "Suit", "symbols": ["diamonds", "spades", "jokers", "clubs", "hearts"], "default": "blah"}"#,
         );
 
@@ -2247,12 +2262,83 @@ mod tests {
         for kind in kinds {
             check_schema(*kind, SchemaPiece::Date);
 
-            let schema = Schema::parse_str(*kind).unwrap();
+            let schema = Schema::from_str(*kind).unwrap();
             assert_eq!(
                 serde_json::to_string(&schema).unwrap(),
                 r#"{"type":"int","logicalType":"date"}"#
             );
         }
+    }
+
+    #[test]
+    fn new_field_in_middle() {
+        let reader = r#"{
+            "type": "record",
+            "name": "MyRecord",
+            "fields": [{"name": "f1", "type": "int"}, {"name": "f2", "type": "int"}]
+        }"#;
+        let writer = r#"{
+            "type": "record",
+            "name": "MyRecord",
+            "fields": [{"name": "f1", "type": "int"}, {"name": "f_interposed", "type": "int"}, {"name": "f2", "type": "int"}]
+        }"#;
+        let reader = Schema::from_str(reader).unwrap();
+        let writer = Schema::from_str(writer).unwrap();
+
+        let mut record = Record::new(writer.top_node()).unwrap();
+        record.put("f1", 1);
+        record.put("f2", 2);
+        record.put("f_interposed", 42);
+
+        let value = record.avro();
+
+        let mut buf = vec![];
+        crate::encode::encode(&value, &writer, &mut buf);
+
+        let resolved = resolve_schemas(&writer, &reader).unwrap();
+
+        let reader = &mut &buf[..];
+        let reader_value = crate::decode::decode(resolved.top_node(), reader).unwrap();
+        let expected = crate::types::Value::Record(vec![
+            ("f1".to_string(), crate::types::Value::Int(1)),
+            ("f2".to_string(), crate::types::Value::Int(2)),
+        ]);
+        assert_eq!(reader_value, expected);
+        assert!(reader.is_empty()); // all bytes should have been consumed
+    }
+
+    #[test]
+    fn new_field_at_end() {
+        let reader = r#"{
+            "type": "record",
+            "name": "MyRecord",
+            "fields": [{"name": "f1", "type": "int"}]
+        }"#;
+        let writer = r#"{
+            "type": "record",
+            "name": "MyRecord",
+            "fields": [{"name": "f1", "type": "int"}, {"name": "f2", "type": "int"}]
+        }"#;
+        let reader = Schema::from_str(reader).unwrap();
+        let writer = Schema::from_str(writer).unwrap();
+
+        let mut record = Record::new(writer.top_node()).unwrap();
+        record.put("f1", 1);
+        record.put("f2", 2);
+
+        let value = record.avro();
+
+        let mut buf = vec![];
+        crate::encode::encode(&value, &writer, &mut buf);
+
+        let resolved = resolve_schemas(&writer, &reader).unwrap();
+
+        let reader = &mut &buf[..];
+        let reader_value = crate::decode::decode(resolved.top_node(), reader).unwrap();
+        let expected =
+            crate::types::Value::Record(vec![("f1".to_string(), crate::types::Value::Int(1))]);
+        assert_eq!(reader_value, expected);
+        assert!(reader.is_empty()); // all bytes should have been consumed
     }
 
     #[test]
@@ -2285,7 +2371,7 @@ mod tests {
         };
         check_schema(schema, expected);
 
-        let res = Schema::parse_str(
+        let res = Schema::from_str(
             r#"["bytes", {
                 "type": "bytes",
                 "logicalType": "decimal",
@@ -2298,13 +2384,13 @@ mod tests {
             "Schema parse error: Unions cannot contain duplicate types"
         );
 
-        let writer_schema = Schema::parse_str(
+        let writer_schema = Schema::from_str(
             r#"["null", {
                 "type": "bytes"
             }]"#,
         )
         .unwrap();
-        let reader_schema = Schema::parse_str(
+        let reader_schema = Schema::from_str(
             r#"["null", {
                 "type": "bytes",
                 "logicalType": "decimal",
@@ -2336,7 +2422,7 @@ mod tests {
     #[test]
     fn test_no_documentation() {
         let schema =
-            Schema::parse_str(r#"{"type": "enum", "name": "Coin", "symbols": ["heads", "tails"]}"#)
+            Schema::from_str(r#"{"type": "enum", "name": "Coin", "symbols": ["heads", "tails"]}"#)
                 .unwrap();
 
         let doc = match schema.top_node().inner {
@@ -2349,7 +2435,7 @@ mod tests {
 
     #[test]
     fn test_documentation() {
-        let schema = Schema::parse_str(
+        let schema = Schema::from_str(
                 r#"{"type": "enum", "name": "Coin", "doc": "Some documentation", "symbols": ["heads", "tails"]}"#
             ).unwrap();
 
@@ -2364,7 +2450,7 @@ mod tests {
     #[test]
     fn test_namespaces_and_names() {
         // When name and namespace specified, full name should contain both.
-        let schema = Schema::parse_str(
+        let schema = Schema::from_str(
             r#"{"type": "fixed", "namespace": "namespace", "name": "name", "size": 1}"#,
         )
         .unwrap();
@@ -2378,10 +2464,9 @@ mod tests {
         );
 
         // When name contains dots, parse the dot-separated name as the namespace.
-        let schema = Schema::parse_str(
-            r#"{"type": "enum", "name": "name.has.dots", "symbols": ["A", "B"]}"#,
-        )
-        .unwrap();
+        let schema =
+            Schema::from_str(r#"{"type": "enum", "name": "name.has.dots", "symbols": ["A", "B"]}"#)
+                .unwrap();
         assert_eq!(schema.named.len(), 1);
         assert_eq!(
             schema.named[0].name,
@@ -2392,7 +2477,7 @@ mod tests {
         );
 
         // Same as above, ignore any provided namespace.
-        let schema = Schema::parse_str(
+        let schema = Schema::from_str(
             r#"{"type": "enum", "namespace": "namespace",
             "name": "name.has.dots", "symbols": ["A", "B"]}"#,
         )
@@ -2408,7 +2493,7 @@ mod tests {
 
         // Use default namespace when namespace is not provided.
         // Materialize uses "" as the default namespace.
-        let schema = Schema::parse_str(
+        let schema = Schema::from_str(
             r#"{"type": "record", "name": "TestDoc", "doc": "Doc string",
             "fields": [{"name": "name", "type": "string"}]}"#,
         )
@@ -2423,7 +2508,7 @@ mod tests {
         );
 
         // Empty namespace strings should be allowed.
-        let schema = Schema::parse_str(
+        let schema = Schema::from_str(
             r#"{"type": "record", "namespace": "", "name": "TestDoc", "doc": "Doc string",
             "fields": [{"name": "name", "type": "string"}]}"#,
         )
@@ -2438,36 +2523,36 @@ mod tests {
         );
 
         // Equality of names is defined on the FullName and is case-sensitive.
-        let first = Schema::parse_str(
+        let first = Schema::from_str(
             r#"{"type": "fixed", "namespace": "namespace",
             "name": "name", "size": 1}"#,
         )
         .unwrap();
-        let second = Schema::parse_str(
+        let second = Schema::from_str(
             r#"{"type": "fixed", "name": "namespace.name",
             "size": 1}"#,
         )
         .unwrap();
         assert_eq!(first.named[0].name, second.named[0].name);
 
-        let first = Schema::parse_str(
+        let first = Schema::from_str(
             r#"{"type": "fixed", "namespace": "namespace",
             "name": "name", "size": 1}"#,
         )
         .unwrap();
-        let second = Schema::parse_str(
+        let second = Schema::from_str(
             r#"{"type": "fixed", "name": "namespace.Name",
             "size": 1}"#,
         )
         .unwrap();
         assert_ne!(first.named[0].name, second.named[0].name);
 
-        let first = Schema::parse_str(
+        let first = Schema::from_str(
             r#"{"type": "fixed", "namespace": "Namespace",
             "name": "name", "size": 1}"#,
         )
         .unwrap();
-        let second = Schema::parse_str(
+        let second = Schema::from_str(
             r#"{"type": "fixed", "namespace": "namespace",
             "name": "name", "size": 1}"#,
         )
@@ -2476,26 +2561,26 @@ mod tests {
 
         // The name portion of a fullname, record field names, and enum symbols must:
         // start with [A-Za-z_] and subsequently contain only [A-Za-z0-9_]
-        assert!(Schema::parse_str(
+        assert!(Schema::from_str(
             r#"{"type": "record", "name": "99 problems but a name aint one",
             "fields": [{"name": "name", "type": "string"}]}"#
         )
         .is_err());
 
-        assert!(Schema::parse_str(
+        assert!(Schema::from_str(
             r#"{"type": "record", "name": "!!!",
             "fields": [{"name": "name", "type": "string"}]}"#
         )
         .is_err());
 
-        assert!(Schema::parse_str(
+        assert!(Schema::from_str(
             r#"{"type": "record", "name": "_valid_until_©",
             "fields": [{"name": "name", "type": "string"}]}"#
         )
         .is_err());
 
         // Use previously defined names and namespaces as type.
-        let schema = Schema::parse_str(r#"{"type": "record", "name": "org.apache.avro.tests.Hello", "fields": [
+        let schema = Schema::from_str(r#"{"type": "record", "name": "org.apache.avro.tests.Hello", "fields": [
               {"name": "f1", "type": {"type": "enum", "name": "MyEnum", "symbols": ["Foo", "Bar", "Baz"]}},
               {"name": "f2", "type": "org.apache.avro.tests.MyEnum"},
               {"name": "f3", "type": "MyEnum"},
@@ -2518,7 +2603,7 @@ mod tests {
             panic!("Expected SchemaPiece::Record, found something else");
         }
 
-        let schema = Schema::parse_str(
+        let schema = Schema::from_str(
             r#"{"type": "record", "name": "x.Y", "fields": [
               {"name": "e", "type":
                 {"type": "record", "name": "Z", "fields": [
@@ -2544,7 +2629,7 @@ mod tests {
             panic!("Expected SchemaPiece::Record, found something else");
         }
 
-        let schema = Schema::parse_str(
+        let schema = Schema::from_str(
             r#"{"type": "record", "name": "R", "fields": [
               {"name": "s", "type": {"type": "record", "namespace": "x", "name": "Y", "fields": [
                 {"name": "e", "type": {"type": "enum", "namespace": "", "name": "Z",
@@ -2608,7 +2693,7 @@ mod tests {
         }
     "#;
 
-        let schema = Schema::parse_str(raw_schema).unwrap();
+        let schema = Schema::from_str(raw_schema).unwrap();
         assert_eq!(
             "5ecb2d1f0eaa647d409e6adbd5d70cd274d85802aa9167f5fe3b73ba70b32c76",
             format!("{}", schema.fingerprint::<Sha256>())

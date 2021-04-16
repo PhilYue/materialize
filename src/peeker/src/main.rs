@@ -25,7 +25,7 @@ use postgres::Client;
 use prometheus::{register_histogram_vec, register_int_counter_vec};
 use prometheus::{Encoder, HistogramVec, IntCounterVec};
 
-use crate::args::{Args, QueryGroup, Source};
+use crate::args::{Args, Config, QueryGroup, Source};
 
 mod args;
 
@@ -42,7 +42,22 @@ fn main() -> Result<()> {
         .target(Target::Stdout)
         .init();
 
-    let config = Args::from_cli()?;
+    mz_process_collector::register_default_process_collector()?;
+
+    let args: Args = ore::cli::parse_args();
+
+    if let Some(write_config) = args.write_config {
+        args::write_config_supplied(args.config_file.as_deref(), &write_config);
+        return Ok(());
+    }
+
+    let config = args::load_config(args.config_file.as_deref(), args.queries.as_deref())?;
+
+    if args.help_config {
+        args::print_config_supplied(config);
+        return Ok(());
+    }
+
     info!("startup {}", Utc::now());
 
     // Launch metrics server.
@@ -51,16 +66,16 @@ fn main() -> Result<()> {
 
     info!(
         "Allowing chbench to warm up for {} seconds at {}",
-        config.warmup_secs,
+        args.warmup_seconds,
         Utc::now()
     );
-    let warmup_dur = std::time::Duration::from_secs(config.warmup_secs.into());
+    let warmup_dur = std::time::Duration::from_secs(args.warmup_seconds.into());
     std::thread::sleep(warmup_dur);
     info!("Done warming up at {}", Utc::now());
 
-    let init_result = initialize(&config);
+    let init_result = initialize(&args, &config);
     // Start peek timing loop.
-    if config.only_initialize {
+    if args.only_initialize {
         match init_result {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -70,17 +85,17 @@ fn main() -> Result<()> {
         }
     } else {
         let _ = init_result;
-        measure_peek_times(&config);
+        measure_peek_times(&args, &config);
         Ok(())
     }
 }
 
-fn measure_peek_times(config: &Args) {
+fn measure_peek_times(args: &Args, config: &Config) {
     let mut peek_threads = vec![];
-    let run_dur = chrono::Duration::seconds(config.run_secs as i64);
-    for (group_id, group) in config.config.groups.iter().enumerate() {
+    let run_dur = chrono::Duration::seconds(args.run_seconds as i64);
+    for (group_id, group) in config.groups.iter().enumerate() {
         peek_threads.extend(spawn_query_thread(
-            config.materialized_url.clone(),
+            args.materialized_url.clone(),
             group.clone(),
             group_id,
             run_dur.clone(),
@@ -90,7 +105,7 @@ fn measure_peek_times(config: &Args) {
     info!(
         "started {} peek threads for {} queries",
         peek_threads.len(),
-        config.config.query_count()
+        config.query_count()
     );
     for pthread in peek_threads {
         pthread.join().unwrap();
@@ -127,7 +142,11 @@ fn spawn_query_thread(
             let mut counter = 0u64;
             let mut err_count = 0u64;
             let mut last_log = Instant::now();
-            let end_at = Utc::now() + run_dur;
+            let end_at = if run_dur > chrono::Duration::seconds(0) {
+                Utc::now() + run_dur
+            } else {
+                chrono::MAX_DATETIME
+            };
             info!(
                 "Will terminate thread {}.{} at {:?}",
                 group_id, thread_id, end_at
@@ -192,31 +211,29 @@ fn create_postgres_client(mz_url: &str) -> Client {
     }
 }
 
-fn initialize(config: &Args) -> Result<()> {
-    let mut counter = 6;
-    let mut init_result = init_inner(&config);
+fn initialize(args: &Args, config: &Config) -> Result<()> {
+    let start = std::time::Instant::now();
+    let mut init_result = init_inner(args, config);
     while let Err(e) = init_result {
-        counter -= 1;
-        if counter <= 0 {
+        if start.elapsed() > args.init_timeout {
             return Err(format!("unable to initialize: {}", e).into());
         }
-        warn!("init error, retry in 10 seconds ({} remaining)", counter);
+        warn!(
+            "init error, retry in 10 seconds ({:?} remaining)",
+            args.init_timeout - start.elapsed()
+        );
         thread::sleep(Duration::from_secs(10));
-        init_result = init_inner(&config);
+        init_result = init_inner(args, config);
     }
     Ok(())
 }
 
-fn init_inner(config: &Args) -> Result<()> {
-    let mut postgres_client = create_postgres_client(&config.materialized_url);
-    initialize_sources(
-        &mut postgres_client,
-        &config.config.sources,
-        config.init_attempts,
-    )
-    .map_err(|e| format!("need to have sources for anything else to work: {}", e))?;
+fn init_inner(args: &Args, config: &Config) -> Result<()> {
+    let mut postgres_client = create_postgres_client(&args.materialized_url);
+    initialize_sources(&mut postgres_client, &config.sources)
+        .map_err(|e| format!("need to have sources for anything else to work: {}", e))?;
     let mut errors = 0;
-    for group in config.config.queries_in_declaration_order() {
+    for group in config.queries_in_declaration_order() {
         if !try_initialize(&mut postgres_client, group) {
             errors += 1;
         }
@@ -228,7 +245,7 @@ fn init_inner(config: &Args) -> Result<()> {
     }
 }
 
-fn initialize_sources(client: &mut Client, sources: &[Source], attempts: u16) -> Result<()> {
+fn initialize_sources(client: &mut Client, sources: &[Source]) -> Result<()> {
     let mut failed = false;
     for source in sources {
         let mut still_to_try = source.names.clone();
@@ -238,48 +255,46 @@ fn initialize_sources(client: &mut Client, sources: &[Source], attempts: u16) ->
         } else {
             ""
         };
-        for _ in 0..attempts {
-            let this_time = still_to_try.clone();
-            still_to_try.clear();
-            for name in this_time {
-                let delete_source = format!(r#" DROP SOURCE {name} CASCADE"#, name = name);
-                match client.batch_execute(&delete_source) {
-                    Ok(_) => info!("Deleted source in preparation for creation {}", name),
-                    Err(err) => {
-                        debug!("error trying to delete source {}: {}", name, err);
-                    }
+        let this_time = still_to_try.clone();
+        still_to_try.clear();
+        for name in this_time {
+            let delete_source = format!(r#" DROP SOURCE {name} CASCADE"#, name = name);
+            match client.batch_execute(&delete_source) {
+                Ok(_) => info!("Deleted source in preparation for creation {}", name),
+                Err(err) => {
+                    debug!("error trying to delete source {}: {}", name, err);
                 }
-                let create_source = format!(
-                    r#"CREATE {materialized} SOURCE IF NOT EXISTS "{name}"
+            }
+            let create_source = format!(
+                r#"CREATE {materialized} SOURCE IF NOT EXISTS "{name}"
                      FROM KAFKA BROKER '{broker}' TOPIC '{prefix}{name}'
                      FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '{registry}'
                      ENVELOPE DEBEZIUM"#,
-                    name = name,
-                    broker = source.kafka_broker,
-                    prefix = source.topic_namespace,
-                    registry = source.schema_registry,
-                    materialized = materialized,
-                );
-                match client.batch_execute(&create_source) {
-                    Ok(_) => {
-                        info!(
-                            "installed source {} for topic {}{}",
-                            name, source.topic_namespace, name
-                        );
-                        succeeded.push(name)
-                    }
-                    Err(err) => {
-                        warn!("error trying to create source {}: {}", name, err);
-                        debug!("For query:\n                     {}", create_source);
-                        still_to_try.push(name)
-                    }
+                name = name,
+                broker = source.kafka_broker,
+                prefix = source.topic_namespace,
+                registry = source.schema_registry,
+                materialized = materialized,
+            );
+            match client.batch_execute(&create_source) {
+                Ok(_) => {
+                    info!(
+                        "installed source {} for topic {}{}",
+                        name, source.topic_namespace, name
+                    );
+                    succeeded.push(name)
+                }
+                Err(err) => {
+                    warn!("error trying to create source {}: {}", name, err);
+                    debug!("For query:\n                     {}", create_source);
+                    still_to_try.push(name)
                 }
             }
-            if still_to_try.is_empty() {
-                return Ok(());
-            } else {
-                thread::sleep(Duration::from_secs(3));
-            }
+        }
+        if still_to_try.is_empty() {
+            return Ok(());
+        } else {
+            thread::sleep(Duration::from_secs(3));
         }
         if !still_to_try.is_empty() {
             warn!(

@@ -16,26 +16,28 @@ use timely::dataflow::channels::pact::Pipeline;
 use timely::dataflow::operators::Operator;
 use timely::dataflow::{Scope, Stream};
 
-use futures::executor::block_on;
-use futures::sink::SinkExt;
-
-use dataflow_types::TailSinkConnector;
+use dataflow_types::{SinkAsOf, TailSinkConnector};
 use expr::GlobalId;
-use ore::cast::CastFrom;
 use repr::adt::decimal::Significand;
-use repr::{Datum, Diff, Row, RowPacker, Timestamp};
+use repr::{Datum, Diff, Row, Timestamp};
 
 pub fn tail<G>(
     stream: Stream<G, Rc<OrdValBatch<GlobalId, Row, Timestamp, Diff>>>,
     id: GlobalId,
     connector: TailSinkConnector,
+    as_of: SinkAsOf,
 ) where
     G: Scope<Timestamp = Timestamp>,
 {
-    let mut tx = block_on(connector.tx.connect()).expect("tail transmitter failed");
-    let mut packer = RowPacker::new();
+    let mut errored = false;
+    let mut packer = Row::default();
     stream.sink(Pipeline, &format!("tail-{}", id), move |input| {
         input.for_each(|_, batches| {
+            if errored {
+                // TODO(benesch): we should actually drop the sink if the
+                // receiver has gone away.
+                return;
+            }
             let mut results = vec![];
             for batch in batches.iter() {
                 let mut cursor = batch.cursor();
@@ -43,20 +45,18 @@ pub fn tail<G>(
                     while cursor.val_valid(&batch) {
                         let row = cursor.val(&batch);
                         cursor.map_times(&batch, |time, diff| {
-                            let should_emit = if connector.strict {
-                                connector.frontier.less_than(time)
+                            assert!(*diff >= 0, "negative multiplicities sinked in tail");
+                            let diff = *diff as usize;
+                            let should_emit = if as_of.strict {
+                                as_of.frontier.less_than(time)
                             } else {
-                                connector.frontier.less_equal(time)
+                                as_of.frontier.less_equal(time)
                             };
                             if should_emit {
-                                packer.push(Datum::Decimal(Significand::new(i128::from(*time))));
-                                if connector.emit_progress {
-                                    packer.push(Datum::False);
+                                for _ in 0..diff {
+                                    // Add the unpacked timestamp so we can sort by them later.
+                                    results.push((*time, row.clone()));
                                 }
-                                packer.push(Datum::Int64(i64::cast_from(*diff)));
-                                packer.extend_by_row(row);
-                                // Add the unpacked timestamp so we can sort by them later.
-                                results.push((*time, packer.finish_and_reuse()));
                             }
                         });
                         cursor.step_val(&batch);
@@ -87,11 +87,12 @@ pub fn tail<G>(
                 }
             }
 
-            // TODO(benesch): this blocks the Timely thread until the send
-            // completes. Hopefully it's just a quick write to a kernel buffer,
-            // but perhaps not if the batch gets too large? We may need to do
-            // something smarter, like offloading to a networking thread.
-            block_on(tx.send(results)).expect("tail send failed");
+            // TODO(benesch): the lack of backpressure here can result in
+            // unbounded memory usage.
+            if connector.tx.send(results).is_err() {
+                errored = true;
+                return;
+            }
         });
     })
 }

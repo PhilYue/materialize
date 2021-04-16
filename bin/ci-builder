@@ -73,12 +73,13 @@ build() {
         "$@" ci/builder
 }
 
+tag=$rust_version-$(date +%Y%m%d-%H%M%S)
 case "$cmd" in
     build)
-        build
+        build --tag materialize/ci-builder:"$tag"
+        echo "$tag" > "$tag_file"
         ;;
     push)
-        tag=$rust_version-$(date +%Y%m%d-%H%M%S)
         build --tag materialize/ci-builder:"$tag"
         docker push materialize/ci-builder:"$tag"
         echo "$tag" > "$tag_file"
@@ -90,6 +91,7 @@ case "$cmd" in
             --volume "$(pwd):$(pwd)"
             --workdir "$(pwd)"
             --env AWS_ACCESS_KEY_ID
+            --env AWS_DEFAULT_REGION
             --env AWS_SECRET_ACCESS_KEY
             --env BINTRAY_API_KEY
             --env BUILDKITE
@@ -116,9 +118,10 @@ case "$cmd" in
             )
 
             # Forward Docker configuration too, if available.
-            if [[ -d ~/.docker ]]; then
+            docker_dir=${DOCKER_CONFIG:-$HOME/.docker}
+            if [[ -d "$docker_dir" ]]; then
                 args+=(
-                    --volume "$HOME/.docker:/docker"
+                    --volume "$docker_dir:/docker"
                     --env "DOCKER_CONFIG=/docker"
                 )
             fi

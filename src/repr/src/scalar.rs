@@ -11,6 +11,8 @@ use std::fmt::{self, Write};
 use std::hash::{Hash, Hasher};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use dec::{Decimal128, OrderedDecimal};
+use enum_kinds::EnumKind;
 use itertools::Itertools;
 use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
@@ -19,7 +21,7 @@ use uuid::Uuid;
 use crate::adt::array::Array;
 use crate::adt::decimal::Significand;
 use crate::adt::interval::Interval;
-use crate::{ColumnName, ColumnType, DatumDict, DatumList};
+use crate::{ColumnName, ColumnType, DatumList, DatumMap};
 
 /// A single value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
@@ -65,7 +67,10 @@ pub enum Datum<'a> {
     /// Unlike [`Datum::Array`], lists are permitted to be ragged.
     List(DatumList<'a>),
     /// A mapping from string keys to `Datum`s.
-    Dict(DatumDict<'a>),
+    Map(DatumMap<'a>),
+    /// A refactor of `Decimal` using `rust-dec`; allows up to 34 digits of
+    /// precision.
+    Numeric(OrderedDecimal<Decimal128>),
     /// An unknown value within a JSON-typed `Datum`.
     ///
     /// This variant is distinct from [`Datum::Null`] as a null datum is
@@ -323,16 +328,29 @@ impl<'a> Datum<'a> {
         }
     }
 
-    /// Unwraps the dict value within this datum.
+    /// Unwraps the map value within this datum.
     ///
     /// # Panics
     ///
-    /// Panics if the datum is not [`Datum::Dict`].
+    /// Panics if the datum is not [`Datum::Map`].
     #[track_caller]
-    pub fn unwrap_dict(&self) -> DatumDict<'a> {
+    pub fn unwrap_map(&self) -> DatumMap<'a> {
         match self {
-            Datum::Dict(dict) => *dict,
+            Datum::Map(dict) => *dict,
             _ => panic!("Datum::unwrap_dict called on {:?}", self),
+        }
+    }
+
+    /// Unwraps the numeric value within this datum.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the datum is not [`Datum::Numeric`].
+    #[track_caller]
+    pub fn unwrap_numeric(&self) -> OrderedDecimal<Decimal128> {
+        match self {
+            Datum::Numeric(n) => *n,
+            _ => panic!("Datum::unwrap_numeric called on {:?}", self),
         }
     }
 
@@ -345,12 +363,13 @@ impl<'a> Datum<'a> {
                     Datum::JsonNull
                     | Datum::False
                     | Datum::True
+                    | Datum::Int64(_)
                     | Datum::Float64(_)
                     | Datum::String(_) => true,
                     Datum::List(list) => list
                         .iter()
                         .all(|elem| is_instance_of_scalar(elem, scalar_type)),
-                    Datum::Dict(dict) => dict
+                    Datum::Map(dict) => dict
                         .iter()
                         .all(|(_key, val)| is_instance_of_scalar(val, scalar_type)),
                     _ => false,
@@ -399,16 +418,22 @@ impl<'a> Datum<'a> {
                         })
                     }
                     (Datum::Array(_), _) => false,
-                    (Datum::List(list), ScalarType::List(t)) => list
+                    (Datum::List(list), ScalarType::List { element_type, .. }) => list
                         .iter()
-                        .all(|e| e.is_null() || is_instance_of_scalar(e, t)),
-                    (Datum::List(list), ScalarType::Record { fields }) => list
-                        .iter()
-                        .zip_eq(fields)
-                        .all(|(e, (_, t))| e.is_null() || is_instance_of_scalar(e, t)),
+                        .all(|e| e.is_null() || is_instance_of_scalar(e, element_type)),
+                    (Datum::List(list), ScalarType::Record { fields, .. }) => {
+                        list.iter().zip_eq(fields).all(|(e, (_, t))| {
+                            (e.is_null() && t.nullable) || is_instance_of_scalar(e, &t.scalar_type)
+                        })
+                    }
                     (Datum::List(_), _) => false,
-                    (Datum::Dict(_), _) => false,
+                    (Datum::Map(map), ScalarType::Map { value_type, .. }) => map
+                        .iter()
+                        .all(|(_k, v)| v.is_null() || is_instance_of_scalar(v, value_type)),
+                    (Datum::Map(_), _) => false,
                     (Datum::JsonNull, _) => false,
+                    (Datum::Numeric(_), ScalarType::Numeric { .. }) => true,
+                    (Datum::Numeric(_), _) => false,
                 }
             }
         }
@@ -516,6 +541,12 @@ impl<'a> From<NaiveDate> for Datum<'a> {
     }
 }
 
+impl<'a> From<NaiveTime> for Datum<'a> {
+    fn from(t: NaiveTime) -> Datum<'a> {
+        Datum::Time(t)
+    }
+}
+
 impl<'a> From<NaiveDateTime> for Datum<'a> {
     fn from(dt: NaiveDateTime) -> Datum<'a> {
         Datum::Timestamp(dt)
@@ -531,6 +562,18 @@ impl<'a> From<DateTime<Utc>> for Datum<'a> {
 impl From<Uuid> for Datum<'static> {
     fn from(uuid: Uuid) -> Datum<'static> {
         Datum::Uuid(uuid)
+    }
+}
+
+impl From<Decimal128> for Datum<'static> {
+    fn from(d: Decimal128) -> Datum<'static> {
+        Datum::Numeric(OrderedDecimal(d))
+    }
+}
+
+impl From<OrderedDecimal<Decimal128>> for Datum<'static> {
+    fn from(d: OrderedDecimal<Decimal128>) -> Datum<'static> {
+        Datum::Numeric(d)
     }
 }
 
@@ -612,11 +655,12 @@ impl fmt::Display for Datum<'_> {
                 write_delimited(f, ", ", list, |f, e| write!(f, "{}", e))?;
                 f.write_str("]")
             }
-            Datum::Dict(dict) => {
+            Datum::Map(dict) => {
                 f.write_str("{")?;
                 write_delimited(f, ", ", dict, |f, (k, v)| write!(f, "{}: {}", k, v))?;
                 f.write_str("}")
             }
+            Datum::Numeric(n) => write!(f, "{}", n.0.to_standard_notation_string()),
             Datum::JsonNull => f.write_str("json_null"),
             Datum::Dummy => f.write_str("dummy"),
         }
@@ -627,7 +671,8 @@ impl fmt::Display for Datum<'_> {
 ///
 /// There is a direct correspondence between `Datum` variants and `ScalarType`
 /// variants.
-#[derive(Clone, Debug, Eq, Serialize, Deserialize, Ord, PartialOrd)]
+#[derive(Clone, Debug, Eq, Serialize, Deserialize, Ord, PartialOrd, EnumKind)]
+#[enum_kind(ScalarBaseType, derive(Hash))]
 pub enum ScalarType {
     /// The type of [`Datum::True`] and [`Datum::False`].
     Bool,
@@ -673,7 +718,7 @@ pub enum ScalarType {
     ///   * [`Datum::String`]
     ///   * [`Datum::Float64`]
     ///   * [`Datum::List`]
-    ///   * [`Datum::Dict`]
+    ///   * [`Datum::Map`]
     Jsonb,
     /// The type of [`Datum::Uuid`].
     Uuid,
@@ -687,15 +732,32 @@ pub enum ScalarType {
     ///
     /// Elements within the list are of the specified type. List elements may
     /// always be [`Datum::Null`].
-    List(Box<ScalarType>),
+    List {
+        element_type: Box<ScalarType>,
+        custom_oid: Option<u32>,
+    },
     /// An ordered and named sequence of datums.
     Record {
         /// The names and types of the fields of the record, in order from left
         /// to right.
-        fields: Vec<(ColumnName, ScalarType)>,
+        fields: Vec<(ColumnName, ColumnType)>,
+        custom_oid: Option<u32>,
+        custom_name: Option<String>,
     },
     /// A PostgreSQL object identifier.
     Oid,
+    /// The type of [`Datum::Map`]
+    ///
+    /// Keys within the map are always of type [`ScalarType::String`].
+    /// Values within the map are of the specified type. Values may always
+    /// be [`Datum::Null`].
+    Map {
+        value_type: Box<ScalarType>,
+        custom_oid: Option<u32>,
+    },
+    Numeric {
+        scale: Option<u8>,
+    },
 }
 
 impl<'a> ScalarType {
@@ -710,6 +772,19 @@ impl<'a> ScalarType {
             _ => panic!("ScalarType::unwrap_decimal_parts called on {:?}", self),
         }
     }
+
+    /// Returns the contained decimal precision and scale.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the scalar type is not [`ScalarType::Numeric`].
+    pub fn unwrap_numeric_scale(&self) -> Option<u8> {
+        match self {
+            ScalarType::Numeric { scale } => *scale,
+            _ => panic!("ScalarType::unwrap_numeric_scale called on {:?}", self),
+        }
+    }
+
     /// Returns the [`ScalarType`] of elements in a [`ScalarType::List`].
     ///
     /// # Panics
@@ -717,7 +792,7 @@ impl<'a> ScalarType {
     /// Panics if called on anything other than a [`ScalarType::List`].
     pub fn unwrap_list_element_type(&self) -> &ScalarType {
         match self {
-            ScalarType::List(s) => s,
+            ScalarType::List { element_type, .. } => element_type,
             _ => panic!("ScalarType::unwrap_list_element_type called on {:?}", self),
         }
     }
@@ -732,9 +807,9 @@ impl<'a> ScalarType {
         let mut descender = self.unwrap_list_element_type();
         let mut dims = 1;
 
-        while let ScalarType::List(s) = descender {
+        while let ScalarType::List { element_type, .. } = descender {
             dims += 1;
-            descender = s;
+            descender = element_type;
         }
 
         dims
@@ -752,16 +827,15 @@ impl<'a> ScalarType {
         }
     }
 
-    /// Returns a copy of `Self` with any embedded fields "zeroed" out. Meant to
-    /// make comparisons easier, allowing you to mimic `std::mem::discriminant`
-    /// equality.
-    pub fn desaturate(&self) -> ScalarType {
+    /// Returns the [`ScalarType`] of values in a [`ScalarType::Map`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on anything other than a [`ScalarType::Map`].
+    pub fn unwrap_map_value_type(&self) -> &ScalarType {
         match self {
-            ScalarType::Array(..) => ScalarType::Array(Box::new(ScalarType::String)),
-            ScalarType::Decimal(..) => ScalarType::Decimal(0, 0),
-            ScalarType::List(..) => ScalarType::List(Box::new(ScalarType::String)),
-            ScalarType::Record { .. } => ScalarType::Record { fields: vec![] },
-            _ => self.clone(),
+            ScalarType::Map { value_type, .. } => &**value_type,
+            _ => panic!("ScalarType::unwrap_map_value_type called on {:?}", self),
         }
     }
 
@@ -778,7 +852,22 @@ impl<'a> ScalarType {
     /// [`ScalarType::List`] or [`ScalarType::Array`], irrespective of its
     /// element type.
     pub fn is_vec(&self) -> bool {
-        matches!(self, ScalarType::List(_) | ScalarType::Array(_))
+        matches!(self, ScalarType::List { .. } | ScalarType::Array(_))
+    }
+
+    pub fn is_custom_type(&self) -> bool {
+        use ScalarType::*;
+        match self {
+            List {
+                element_type: t,
+                custom_oid,
+            }
+            | Map {
+                value_type: t,
+                custom_oid,
+            } => custom_oid.is_some() || t.is_custom_type(),
+            _ => false,
+        }
     }
 }
 
@@ -805,10 +894,42 @@ impl PartialEq for ScalarType {
             | (String, String)
             | (Uuid, Uuid)
             | (Jsonb, Jsonb)
-            | (Oid, Oid) => true,
+            | (Oid, Oid)
+            | (Numeric { .. }, Numeric { .. }) => true,
+            (
+                List {
+                    element_type: element_l,
+                    custom_oid: oid_l,
+                },
+                List {
+                    element_type: element_r,
+                    custom_oid: oid_r,
+                },
+            ) => element_l.eq(element_r) && oid_l == oid_r,
 
-            (List(a), List(b)) | (Array(a), Array(b)) => a.eq(b),
-            (Record { fields: fields_a }, Record { fields: fields_b }) => fields_a.eq(fields_b),
+            (Array(a), Array(b)) => a.eq(b),
+            (
+                Record {
+                    fields: fields_a,
+                    custom_oid: oid_a,
+                    custom_name: name_a,
+                },
+                Record {
+                    fields: fields_b,
+                    custom_oid: oid_b,
+                    custom_name: name_b,
+                },
+            ) => fields_a.eq(fields_b) && oid_a == oid_b && name_a == name_b,
+            (
+                Map {
+                    value_type: value_l,
+                    custom_oid: oid_l,
+                },
+                Map {
+                    value_type: value_r,
+                    custom_oid: oid_r,
+                },
+            ) => value_l.eq(value_r) && oid_l == oid_r,
 
             (Bool, _)
             | (Int32, _)
@@ -826,9 +947,11 @@ impl PartialEq for ScalarType {
             | (Jsonb, _)
             | (Uuid, _)
             | (Array(_), _)
-            | (List(_), _)
+            | (List { .. }, _)
             | (Record { .. }, _)
-            | (Oid, _) => false,
+            | (Oid, _)
+            | (Map { .. }, _)
+            | (Numeric { .. }, _) => false,
         }
     }
 }
@@ -860,52 +983,35 @@ impl Hash for ScalarType {
                 state.write_u8(14);
                 t.hash(state);
             }
-            List(t) => {
+            List {
+                element_type,
+                custom_oid,
+            } => {
                 state.write_u8(15);
-                t.hash(state);
+                element_type.hash(state);
+                custom_oid.hash(state);
             }
-            Record { fields } => {
+            Record {
+                fields,
+                custom_oid,
+                custom_name,
+            } => {
                 state.write_u8(16);
                 fields.hash(state);
+                custom_oid.hash(state);
+                custom_name.hash(state);
             }
             Uuid => state.write_u8(16),
             Oid => state.write_u8(17),
-        }
-    }
-}
-
-impl fmt::Display for ScalarType {
-    /// Arbitrary display name for scalars
-    ///
-    /// Right now the names correspond most closely to Rust names (e.g. i32).
-    /// There are other functions in other packages that construct a mapping
-    /// between `ScalarType`s and type names in other systems, like PostgreSQL.
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use ScalarType::*;
-        match self {
-            Bool => f.write_str("bool"),
-            Int32 => f.write_str("i32"),
-            Int64 => f.write_str("i64"),
-            Float32 => f.write_str("f32"),
-            Float64 => f.write_str("f64"),
-            Decimal(p, s) => write!(f, "decimal({}, {})", p, s),
-            Date => f.write_str("date"),
-            Time => f.write_str("time"),
-            Timestamp => f.write_str("timestamp"),
-            TimestampTz => f.write_str("timestamptz"),
-            Interval => f.write_str("interval"),
-            Bytes => f.write_str("bytes"),
-            String => f.write_str("string"),
-            Jsonb => f.write_str("jsonb"),
-            Uuid => f.write_str("uuid"),
-            Array(t) => write!(f, "{}[]", t),
-            List(t) => write!(f, "{} list", t),
-            Record { fields } => {
-                f.write_str("record(")?;
-                write_delimited(f, ", ", fields, |f, (n, t)| write!(f, "{}: {}", n, t))?;
-                f.write_str(")")
+            Map {
+                value_type,
+                custom_oid,
+            } => {
+                state.write_u8(18);
+                value_type.hash(state);
+                custom_oid.hash(state);
             }
-            Oid => f.write_str("oid"),
+            Numeric { .. } => state.write_u8(19),
         }
     }
 }

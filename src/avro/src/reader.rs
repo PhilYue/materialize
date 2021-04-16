@@ -359,6 +359,9 @@ impl<'a> SchemaResolver<'a> {
                         }
                     }
                 }
+                while fields.len() < w_fields.len() {
+                    fields.push(None);
+                }
                 let mut n_present = 0;
                 let fields = fields
                     .into_iter()
@@ -712,6 +715,15 @@ impl<'a> SchemaResolver<'a> {
                     {
                         SchemaPieceOrNamed::Piece(SchemaPiece::Bytes)
                     }
+                    // TODO [btv] We probably want to rethink what we're doing here, rather than just add
+                    // a new branch for every possible "logical" type. Perhaps logical types with the
+                    // same underlying type should always be resolvable to the reader schema's type?
+                    (SchemaPiece::Json, SchemaPiece::Json) => {
+                        SchemaPieceOrNamed::Piece(SchemaPiece::Json)
+                    }
+                    (SchemaPiece::Uuid, SchemaPiece::Uuid) => {
+                        SchemaPieceOrNamed::Piece(SchemaPiece::Uuid)
+                    }
                     (
                         SchemaPiece::Bytes,
                         SchemaPiece::Decimal {
@@ -845,7 +857,7 @@ mod tests {
 
     #[test]
     fn test_from_avro_datum() {
-        let schema = Schema::parse_str(SCHEMA).unwrap();
+        let schema: Schema = SCHEMA.parse().unwrap();
         let mut encoded: &'static [u8] = &[54, 6, 102, 111, 111];
 
         let mut record = Record::new(schema.top_node()).unwrap();
@@ -858,7 +870,7 @@ mod tests {
 
     #[test]
     fn test_null_union() {
-        let schema = Schema::parse_str(UNION_SCHEMA).unwrap();
+        let schema: Schema = UNION_SCHEMA.parse().unwrap();
         let mut encoded: &'static [u8] = &[2, 0];
 
         assert_eq!(
@@ -874,7 +886,7 @@ mod tests {
 
     #[test]
     fn test_reader_stream() {
-        let schema = Schema::parse_str(SCHEMA).unwrap();
+        let schema: Schema = SCHEMA.parse().unwrap();
         let reader = Reader::with_schema(&schema, ENCODED).unwrap();
 
         let mut record1 = Record::new(schema.top_node()).unwrap();
@@ -894,14 +906,14 @@ mod tests {
 
     #[test]
     fn test_reader_invalid_header() {
-        let schema = Schema::parse_str(SCHEMA).unwrap();
+        let schema: Schema = SCHEMA.parse().unwrap();
         let invalid = ENCODED.to_owned().into_iter().skip(1).collect::<Vec<u8>>();
         assert!(Reader::with_schema(&schema, &invalid[..]).is_err());
     }
 
     #[test]
     fn test_reader_invalid_block() {
-        let schema = Schema::parse_str(SCHEMA).unwrap();
+        let schema: Schema = SCHEMA.parse().unwrap();
         let invalid = ENCODED
             .to_owned()
             .into_iter()

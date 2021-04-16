@@ -46,22 +46,420 @@ Use relative links (/path/to/doc), not absolute links
 Wrap your release notes at the 80 character mark.
 {{< /comment >}}
 
+{{% version-header v0.7.3 %}}
+
+- Add the [`pow`](/sql/functions/#numbers-func) function as an alias for the
+  [`power`](/sql/functions/#numbers-func) function.
+
+- Add a new metric, `mz_log_message_total` that counts the number of log
+  messages emitted per severity.
+
+- Add new system tables, `mz_metrics`, `mz_metric_histograms` and
+  `mz_metrics_meta`, which import metrics exposed via prometheus once per
+  second, retaining them for 5 minutes (governed by the new
+  [command-line option `--retain-prometheus-metrics`](/cli/#introspection-sources)).
+
+{{% version-header v0.7.2 %}}
+
+- Introduce the concept of [volatility](/overview/volatility) to describe
+  sources that do not provide reliability guarantees that
+  Materialize relies on. The new volatility information is surfaced via
+  [`SHOW SOURCES`](/sql/show-sources), [`SHOW VIEWS`](/sql/show-views),
+  and [`SHOW SINKS`](/sql/show-sinks).
+
+- Add [PubNub sources](/sql/create-source/text-pubnub).
+
+- Add [`S3` sources](/sql/create-source/text-s3).
+
+- Add a [`--log-filter` command-line option](/cli/#logging) and a
+  `MZ_LOG_FILTER` environment variable that control which log messages to emit.
+
+  This behavior was previously available via the undocumented `MZ_LOG`
+  environment variable, which will be removed in a future release.
+
+- Record Kafka Consumer metrics in the `mz_kafka_consumer_partitions` system
+  table. Enabled by default for all Kafka sources.
+
+- Add the [`jsonb_object_agg`](/sql/functions/jsonb_object_agg) function to
+  aggregate rows into a JSON object.
+
+- Permit the [`jsonb`](/sql/types/jsonb) type to store all 64-bit integers
+  {{% gh 5919 %}}.
+  Previously integers in the following ranges were rejected:
+
+    * [-2<sup>64</sup>, -(2^<sup>53</sup>-1)]
+    * [2<sup>53</sup> - 1, 2^<sup>64</sup>-1].
+
+- Add the [`pg_postmaster_start_time`](/sql/functions#postgresql-compatibility-func)
+  function, which reports the time at which the server started.
+
+- Add the [`mz_workers`](/sql/functions#postgresql-compatibility-func)
+  function, which reports the number of workers in use by the server.
+
+- Add the [`mz_uptime`](/sql/functions#system-information-func)
+  function, which reports the duration for which the server has been running.
+
+- Add the [`repeat`](/sql/functions#string-func) function, which repeats a
+  string N times.
+
+- Avoid panicking when planning SQL queries of the form
+  `SELECT DISTINCT ... ORDER BY <expr>` where `expr` is not a simple column
+  reference {{% gh 6021 %}}.
+
+- Support Kafka log compaction on Debezium topics via the [`DEBEZIUM
+  UPSERT`](/sql/create-source/avro-kafka/#debezium-envelope-details) source envelope.
+
+{{% version-header v0.7.1 %}}
+
+- **Breaking change.** Change the default
+  [`--logical-compaction-window`](/cli/#compaction-window) from 60 seconds to
+  1 millisecond.
+
+- **Breaking change.** Remove `CREATE SINK ... AS OF`, which did not have
+  sensible behavior after Materialize restarted. The intent is to reintroduce
+  this feature with a more formal model of `AS OF` timestamps. {{% gh 3467 %}}
+
+- Add the [`cbrt` function](/sql/functions/#numbers-func) for computing the
+  cube root of a [`double precision`](/sql/types/float).
+
+  Thanks to external contributor [@andrioni](https://github.com/andrioni).
+
+- Add the [`encode` and `decode` functions](/sql/functions/encode/) to convert
+  binary data to and from several textual representations.
+
+  Thanks to external contributor [@Posnet](https://github.com/Posnet).
+
+- Add many of the basic
+  [trigonometric functions](/sql/functions/#trigonometric-func).
+
+  Thanks again to external contributor [@andrioni](https://github.com/andrioni).
+
+- Add [`DROP TYPE`](/sql/drop-type) and [`SHOW TYPES`](/sql/show-types) commands.
+
+- Multipartition Kafka sinks with consistency enabled will create single-partition
+  consistency topics.
+
+- Kafka sinks are now written via an idempotent producer to avoid duplicate or out
+  of order messages.
+
+- **Breaking change.** Change the behavior of the
+  [`round` function](/sql/functions/#numbers-func) when applied to a `real` or
+  `double precision` argument to round ties to the nearest even number,
+  rather than away from zero. When applied to `numeric`, ties are rounded away
+  from zero, as before.
+
+  The new behavior matches PostgreSQL.
+
+- Restore the `-D` command-line option as the short form of the
+  [`--data-directory`](/cli/#data-directory) option.
+
+- Allow setting [index parameters](/sql/alter-index/#available-parameters) when
+  creating an index via the new `WITH` clause to [`CREATE INDEX`]. In older
+  versions, setting these parameters required a separate call to [`ALTER
+  INDEX`](/sql/alter-index).
+
+- Fix a bug that prevented upgrading v0.6.1 or earlier nodes to v0.7.0 if they
+  contained:
+  -  Views whose embdedded queries contain functions whose arguments are functions {{% gh 5802 %}}.
+  -  Sinks using `WITH SNAPSHOT AS OF` {{% gh 5808 %}}.
+
+- Reduce memory usage and increase processing speed in materialized views
+  involving sources with the "upsert" envelope. {{% gh 5509 %}}.
+
+  Users of the [memory usage visualization](/ops/monitoring#memory-usage-visualization)
+  will see that the operator "UpsertArrange" has changed to "Upsert", and that
+  the "Upsert" operator no longer shows any records. Actually, the "Upsert"
+  operator still has a memory footprint proportional to the number of unique
+  keys in the source.
+
+- Add the basic exponentiation, power and [logarithm functions](/sql/functions/#numbers-func).
+
+- Add `position` to the [string function](/sql/functions#string-func) suite.
+
+- Add `right` to the [string function](/sql/functions#string-func) suite.
+
+{{% version-header v0.7.0 %}}
+
+- **Known issue.** You cannot upgrade nodes created with versions v0.6.1 or
+  earlier to v0.7.0 if they contain:
+
+  -  Views whose embdedded queries contain functions whose arguments are functions {{% gh 5802 %}}.
+  -  Sinks using `WITH SNAPSHOT AS OF...` {{% gh 5808 %}}.
+
+  If you encounter this issue, you can:
+
+  - Use a previous version of Materialize to drop the view or sink before upgrading.
+  - Skip upgrading to v0.7.0, and instead upgrade to v0.7.1 which contains fixes
+    for these bugs.
+
+  The next release (v0.7.1) contains fixes for these bugs.
+
+- **Known issue.** The `-D` command-line option, shorthand for the
+  `--data-directory` option, was inadvertently removed.
+
+  It will be restored in the next release.
+
+- **Breaking change.** Require a valid user name when [connecting to
+  Materialize](/connect/cli#connection-details). Previously, Materialize did not
+  support the concept of [roles](/sql/create-role), so it accepted all user
+  names.
+
+  Materialize instances have a user named `materialize` installed, unless you
+  drop this user with [`DROP USER`](/sql/drop-user). You can add additional
+  users with [`CREATE ROLE`](/sql/create-role).
+
+- Allow setting most [command-line flags](/cli#command-line-flags) via
+  environment variables.
+
+- Fix a bug that would cause `DROP` statements targeting multiple objects to fail
+  when those objects had dependent objects in common {{% gh 5316 %}}.
+
+- Prevent a bug that would allow `CREATE OR REPLACE` statements to create dependencies
+  on objects that were about to be dropped {{% gh 5272 %}}.
+
+- Remove deprecated `MZ_THREADS` alias for `MZ_WORKERS`.
+
+- Support equality operations on `uuid` data, which enables joins on `uuid`
+  columns {{% gh 5540 %}}.
+- Add the [`current_user`](/sql/functions/#system-information-func) system
+  information function.
+
+- Add the [`CREATE ROLE`](/sql/create-role),
+  [`CREATE USER`](/sql/create-user), [`DROP ROLE`](/sql/drop-role), and
+  [`DROP USER`](/sql/drop-user) statements to manage roles in a Materialize
+  instance. These roles do not yet serve any purpose, but they will enable
+  authentication in a later release.
+
+- Functions can now be resolved as schema-qualified objects, e.g. `SELECT pg_catalog.abs(-1);`.
+
+- Support [multi-partition](/sql/create-sink/#with-options) Kafka sinks {{% gh 5537 %}}.
+
+- Support [gzip-compressed](/sql/create-source/text-file/#compression) file sources {{% gh 5392 %}}.
+
+{{% version-header v0.6.1 %}}
+
+- **Backwards-incompatible change.** Validate `WITH` clauses in [`CREATE
+  SOURCE`](/sql/create-source) and [`CREATE SINK`](/sql/create-sink) statements.
+  Previously Materialize would ignore any invalid options in these statement's
+  `WITH` clauses.
+
+  Upgrading to v0.6.1 will therefore fail if any of the sources or sinks within
+  have invalid `WITH` options. If this occurs, drop these invalid sources or
+  sinks using v0.6.0 and recreate them with valid `WITH` options.
+
+- **Backwards-incompatible change.** Change the default value of the `timeout`
+  option to [`FETCH`](/sql/fetch) from `0s` to `None`. The old default caused
+  `FETCH` to return immediately even if no rows were available. The new default
+  causes `FETCH` to wait for at least one row to be available.
+
+  To maintain the old behavior, explicitly set the timeout to `0s`, as in:
+
+  ```sql
+  FETCH ... WITH (timeout = '0s')
+  ```
+
+- **Backwards-incompatible change.** Consider the following keywords to be fully
+  reserved in SQL statements: `WITH`, `SELECT`, `WHERE`, `GROUP`, `HAVING`,
+  `ORDER`, `LIMIT`, `OFFSET`, `FETCH`, `OPTION`, `UNION`, `EXCEPT`, `INTERSECT`.
+  Previously only the `FROM` keyword was considered fully reserved.
+
+  You can no longer use these keywords as bare identifiers anywhere in a SQL
+  statement, except following an `AS` keyword in a table or column alias. They
+  can continue to be used as identifiers if escaped. See the [Keyword
+  collision](/sql/identifiers#keyword-collision) documentation for details.
+
+- **Backwards-incompatible change.** Change the return type of
+  [`sum`](/sql/functions/#aggregate-func) over [`bigint`](/sql/types/integer)s
+  from `bigint` to [`numeric`](/sql/types/numeric). This avoids the possibility
+  of overflow when summing many large numbers {{% gh 5218 %}}.
+
+  We expect the breakage from this change to be minimal, as the semantics
+  of `bigint` and `numeric` are nearly identical.
+
+- Speed up parsing of [`real`](/sql/types/float) and
+  [`numeric`](/sql/types/numeric) values by approximately 2x and 100x,
+  respectively {{% gh 5341 5343 %}}.
+
+- Ensure the first batch of updates in a [source](/sql/create-source) without
+  consistency information is stamped with the current wall clock time, rather
+  than timestamp `1` {{% gh 5201 %}}.
+
+- When Materialize consumes a message from a [Kafka source](/sql/create-source/avro-kafka),
+  commit that message's offset back to Kafka {{% gh 5324 %}}. This allows
+  Kafka-related tools to monitor Materialize's consumer lag.
+
+- Add the [`SHOW OBJECTS`](/sql/show-objects) SQL statement to display all
+  objects in a database, regardless of their type.
+
+- Improve the PostgreSQL compatibility of several date and time-related
+  features:
+
+  - Correct `date_trunc`'s rounding behavior when truncating by
+    decade, century, or millenium {{% gh 5056 %}}.
+
+    Thanks to external contributor [@zRedShift](https://github.com/zRedShift).
+
+  - Allow specifying units of `microseconds`, `milliseconds`, `month`,
+    `quarter`, `decade`, `century`, or `millenium` when applying the `EXTRACT`
+    function to an [`interval`](/sql/types/interval) {{% gh 5107 %}}. Previously
+    these units were only supported with the [`timestamp`](/sql/types/timestamp)
+    and [`timestamptz`](/sql/types/timestamptz) types.
+
+    Thanks again to external contributor
+    [@zRedShift](https://github.com/zRedShift).
+
+  - Support multiplying and dividing [`interval`](/sql/types/interval)s by
+    numbers {{% gh 5107 %}}.
+
+    Thanks once more to external contributor
+    [@zRedShift](https://github.com/zRedShift).
+
+  - Handle parsing [`timestamp`](/sql/types/timestamp) and [`timestamptz`](/sql/types/timestamptz)
+    from additional compact formats like `700203` {{% gh 4889 %}}.
+
+  - Support conversion of [`timestamp`](/sql/types/timestamp) and [`timestamptz`](/sql/types/timestamptz) to other time zones with [`AT TIME ZONE`](/sql/functions/#date-and-time-func) and [`timezone`](/sql/functions/#date-and-time-func) functions.
+
+- Add the `upper` and `lower` [string functions](/sql/functions#string-func),
+  which convert any alphabetic characters in a string to uppercase and
+  lowercase, respectively.
+
+- Permit specifying `ALL` as a row count to [`FETCH`](/sql/fetch) to indicate
+  that there is no limit on the number of rows you wish to fetch.
+
+- Support the `ISNULL` operator as an alias for the `IS NULL` operator, which
+  tests whether its argument is `NULL` {{% gh 5048 %}}.
+
+- Support the [`ILIKE` operator](/sql/functions#boolean), which is the
+  case-insensitive version of the [`LIKE` operator](/sql/functions#boolean) for
+  pattern matching on a string.
+
+- Permit the `USING` clause of a [join](/sql/join) to reference columns with
+  different types on the left and right-hand side of the join if there is
+  an [implicit cast](/sql/types#casts) between the types {{% gh 5276 %}}.
+
+- Use SQL standard type names in error messages, rather than Materialize's
+  internal type names {{% gh 5175 %}}.
+
+- Fix two bugs involving [common-table expressions (CTEs)](/sql/select#common-table-expressions-ctes):
+
+  - Allow CTEs in `CREATE VIEW` {{% gh 5111 %}}.
+
+  - Allow reuse of CTE names in nested subqueries {{% gh 5222 %}}. Reuse of
+    CTE names within a given query is still prohibited.
+
+- Fix a bug that caused incorrect results when multiple aggregations of a
+  certain type appeared in the same `SELECT` query {{% gh 5304 %}}.
+
+- Add the advanced [`--timely-progress-mode` and `--differential-idle-merge-effort` command-line arguments](/cli/#dataflow-tuning) to tune dataflow performance. These arguments replace existing undocumented environment variables.
+
+{{% version-header v0.6.0 %}}
+
+- Support specifying default values for table columns via the new
+  [`DEFAULT` column option](/sql/create-table#syntax) in `CREATE TABLE`.
+  Thanks to external contributor [@petrosagg](https://github.com/petrosagg).
+
+- Add a `timeout` option to [`FETCH`](/sql/fetch/) to facilitate using `FETCH`
+  to poll a [`TAIL`](/sql/tail) operation for new records.
+
+- Add several new SQL functions:
+
+  - The [`digest`](/sql/functions#cryptography-func) and
+    [`hmac`](/sql/functions#cryptography-func) cryptography functions
+    compute message digests and authentication codes, respectively. These
+    functions are based on the [`pgcrypto`] PostgreSQL extension.
+
+  - The [`version`](/sql/functions#postgresql-compatibility-func) and
+    [`mz_version`](/sql/functions/#system-information-func) functions report
+    PostgreSQL-specific and Materialize-specific version information,
+    respectively.
+
+  - The [`current_schema`](/sql/functions#postgresql-compatibility-func)
+    function reports the name of the SQL schema that appears first in the
+    search path.
+
+- Fix a bug that would cause invalid data to be returned when requesting
+  binary-formatted values with [`FETCH`](/sql/fetch/) {{% gh 4976 %}}.
+
+- Fix a bug when using `COPY` with `TAIL` that could cause some drivers to
+  fail if the `TAIL` was idle for at least one second {{% gh 4976 %}}.
+
+- Avoid panicking if a record in a regex-formatted source fails to decode
+  as UTF-8 {{% gh 5008 %}}.
+
+- Allow [query hints](/sql/select#query-hints) in `SELECT` statements.
+
+{{% version-header v0.5.3 %}}
+
+- Add support for SQL cursors via the new [`DECLARE`](/sql/declare),
+  [`FETCH`](/sql/fetch), and [`CLOSE`](/sql/close) statements. Cursors
+  facilitate fetching partial results from a query and are therefore
+  particularly useful in conjuction with [`TAIL`](/sql/tail#tailing-with-fetch).
+
+  **Known issue.** Requesting binary-formatted values with [`FETCH`](/sql/fetch)
+  does not work correctly. This bug will be fixed in the next release.
+
+- Support [common-table expressions (CTEs)](/sql/select#common-table-expressions-ctes)
+  in `SELECT` statements.
+
+- Add a [`map`](/sql/types/map) type to represent unordered key-value pairs.
+  Avro map values in [Avro-formatted sources](/sql/create-source/avro-kafka)
+  will be decoded into the new `map` type.
+
+- Fix a regression in the SQL parser, introduced in v0.5.2, in which nested
+  field accesses, e.g.
+
+  ```sql
+  SELECT ((col).field1).field2
+  ```
+
+  would fail to parse {{% gh 4827 %}}.
+
+- Fix a bug that caused the [`real`]/[`real`] types to be incorrectly
+  interpreted as [`double precision`] {{% gh 4918 %}}.
+
 {{% version-header v0.5.2 %}}
 
-- Support the [`pg_typeof` function](/sql/functions#postgresql-compatibility-func).
-- [`COPY TO`](/sql/copy-to) now supports `FORMAT binary`.
-- [`TAIL`](/sql/tail) is now guaranteed to produce output ordered by timestamp.
-- Syntax for [`TAIL`](/sql/tail) has changed. `WITH SNAPSHOT` is now
-  `WITH (SNAPSHOT)`. `WITHOUT SNAPSHOT` is now `WITH (SNAPSHOT = false)`.
-- Report an error without crashing when a query contains unexpected UTF-8
-  characters, e.g., `SELECT ’1’` {{% gh 4755 %}}.
-- [`TAIL`](/sql/tail) now supports timestamp progress.
-- Log messages are no longer emitted to stderr if an explicit `--log-file` is
-  supplied at startup. {{% gh 4777 %}}
-- The systemd package configured by our apt package now writes all logs to
-  the systemd journal, instead of a file in the mzdata directory. {{% gh 4781 %}}
+- Provide the [`list`](/sql/types/list/) type, which is an ordered sequences of
+  homogenously typed elements; they're nestable, too! The type was previously
+  available in v0.5.1, but this release lets you create [`list`s from
+  `text`](/sql/types/list/#text-to-list-casts), making their creation more
+  accessible.
+
+- Support the [`pg_typeof`
+  function](/sql/functions#postgresql-compatibility-func).
+
+- Teach [`COPY TO`](/sql/copy-to) to support `FORMAT binary`.
+
 - Support the [`DISCARD`](/sql/discard) SQL statement.
 
+- Change [`TAIL`](/sql/tail) to:
+
+  - Produce output ordered by timestamp.
+
+  - Support timestamp progress with the `PROGRESSED` option.
+
+  - **Backwards-incompatible change.** Use Materialize's standard `WITH` option
+    syntax, meaning:
+
+    - `WITH SNAPSHOT` is now `WITH (SNAPSHOT)`.
+
+    - `WITHOUT SNAPSHOT` is now `WITH (SNAPSHOT = false)`.
+
+- Report an error without crashing when a query contains unexpected UTF-8
+  characters, e.g., `SELECT ’1’`. {{% gh 4755 %}}
+
+- Suppress logging of warnings and errors to stderr when users supply the
+  [`--log-file` command line flag](/cli/#command-line-flags) {{% gh 4777 %}}.
+
+- When using the systemd service distributed in the APT package, write log
+  messages to the systemd journal instead of a file in the `mzdata` directory
+  {{% gh 4781 %}}.
+
+- Ingest SQL Server-style Debezium data {{% gh 4762 %}}.
+
+- Allow slightly more complicated [`INSERT`](/sql/insert) bodies, e.g. inserting
+  `SELECT`ed literals {{% gh 4748 %}}.
+  characters, e.g., `SELECT ’1’` {{% gh 4755 %}}.
 
 {{% version-header v0.5.1 %}}
 
@@ -77,12 +475,12 @@ Wrap your release notes at the 80 character mark.
   or let you choose which protocol to use. If you are using one of these
   clients, you can safely issue `COPY TO` statements in v0.5.1.
 
-- Send the rows returned by the [`TAIL`](/sql/tail) statement to the client
-  normally (i.e., as if the rows were returned by a [`SELECT`](/sql/select)
-  statement) rather than via the PostgreSQL [`COPY` protocol][pg-copy]. The new
-  format additionally moves the timestamp and diff information to dedicated
-  `timestamp` and `diff` columns at the beginning of each row.
-  **Backwards-incompatible change.**
+- **Backwards-incompatible change.** Send the rows returned by the
+  [`TAIL`](/sql/tail) statement to the client normally (i.e., as if the rows
+  were returned by a [`SELECT`](/sql/select) statement) rather than via the
+  PostgreSQL [`COPY` protocol][pg-copy]. The new format additionally moves the
+  timestamp and diff information to dedicated `timestamp` and `diff` columns at
+  the beginning of each row.
 
   To replicate the old behavior of sending `TAIL` results via the `COPY`
   protocol, explicitly wrap the `TAIL` statement in a [`COPY TO`](/sql/copy-to)
@@ -301,8 +699,7 @@ Wrap your release notes at the 80 character mark.
     `~*`, `!~`, and `!~*`, which report whether a string does or does not match
     a regular expression.
 
-  - Support casts from [`boolean`](/sql/types/boolean) to
-    [`int`](/sql/types/int).
+  - Support casts from [`boolean`](/sql/types/boolean) to [`int`](/sql/types/int).
 
   - Add the [`split_part`](/sql/functions/#string-func) function, which splits a
     string on a delimiter and returns one of the resulting chunks.
@@ -323,7 +720,7 @@ Wrap your release notes at the 80 character mark.
 
 - Fix two PostgreSQL compatibility issues:
 
-  - Change the text format of the [`timestamptz`](/sql/types/timestamptz)
+  - Change the text format of the [`timestamp with time zone`](/sql/types/timestamptz)
     type to match PostgreSQL {{% gh 3798 %}}.
 
   - Respect client-provided parameter types in prepared statements
@@ -344,7 +741,7 @@ Wrap your release notes at the 80 character mark.
   features that require experimental mode will be marked as such in their
   documentation.
 
-- Support [SASL PLAIN authentication for Kafka sources](/sql/create-source/avro-kafka/#connecting-to-a-kafka-broker-using-sasl-plain-authentication).
+- Support [SASL PLAIN authentication for Kafka sources](/sql/create-source/avro-kafka/#connecting-to-a-kafka-broker-using-sasl-authentication).
   Notably, this allows Materialize to connect to Kafka clusters hosted by
   Confluent Cloud.
 
@@ -358,7 +755,7 @@ Wrap your release notes at the 80 character mark.
   alongside the data topic; the combination of these two topics is considered
   the Materialize change data capture (CDC) format.
 
-- Introduce the [`AS OF`](/sql/create-sink/#as-of) and
+- Introduce the `AS OF` and
   [`WITH SNAPSHOT`](/sql/create-sink/#with-snapshot-or-without-snapshot) options
   for `CREATE SINK` to provide more control over what data the sink will
   produce.
@@ -379,7 +776,7 @@ Wrap your release notes at the 80 character mark.
 
 - Allow dropping databases with cross-schema dependencies {{% gh 3558 %}}.
 
-- Avoid crashing if [`date_trunc('week', ...)`](/sql/functions/#time-func) is
+- Avoid crashing if [`date_trunc('week', ...)`](/sql/functions/#date-and-time-func) is
   called on a date that is in the first week of a month {{% gh 3651 %}}.
 
 - Ensure the built-in `mz_avro_ocf_sinks`, `mz_catalog_names`, and
@@ -632,10 +1029,9 @@ Wrap your release notes at the 80 character mark.
   control the address and port that `materialized` binds to.
 
 - Make formatting and parsing for [`real`](/sql/types/float) and
-  [`double precision`](/sql/types/float) numbers more
-  consistent with PostgreSQL. The strings `NaN`, and `[+-]Infinity` are
-  accepted as input, to select the special not-a-number and infinity states,
-  respectively,  of floating-point numbers.
+  [`double precision`](/sql/types/float) numbers more consistent with PostgreSQL. The
+  strings `NaN`, and `[+-]Infinity` are accepted as input, to select the special
+  not-a-number and infinity states, respectively,  of floating-point numbers.
 
 - Allow [CSV-formatted sources](/sql/create-source/csv-file/#csv-format-details)
   to include a header row (`CREATE SOURCE ... FORMAT CSV WITH HEADER`).
@@ -690,7 +1086,7 @@ Wrap your release notes at the 80 character mark.
 - Raise the maximum SQL statement length from approximately 8KiB to
   approximately 64MiB.
 
-- Support casts from [`text`] to [`date`], [`timestamp`], [`timestamptz`], and
+- Support casts from [`text`] to [`date`], [`timestamp`], [`timestamp with time zone`], and
   [`interval`].
 
 - Support the `IF NOT EXISTS` clause in [`CREATE VIEW`] and
@@ -718,16 +1114,22 @@ Wrap your release notes at the 80 character mark.
 * [Architecture overview](/overview/architecture/)
 
 [`bytea`]: /sql/types/bytea
+[`ALTER INDEX`]: /sql/alter-index
+[`CREATE INDEX`]: /sql/create-index
 [`CREATE MATERIALIZED VIEW`]: /sql/create-materialized-view
 [`CREATE SOURCE`]: /sql/create-source
 [`CREATE VIEW`]: /sql/create-view
 [`date`]: /sql/types/date
+[`double precision`]: /sql/types/float8
 [`interval`]: /sql/types/interval
+[`real`]: /sql/types/float4
+[`pgcrypto`]: https://www.postgresql.org/docs/current/pgcrypto.html
+[`real`]: /sql/types/real
 [`SHOW CREATE SOURCE`]: /sql/show-create-source
 [`SHOW CREATE VIEW`]: /sql/show-create-view
 [`text`]: /sql/types/text
 [`timestamp`]: /sql/types/timestamp
-[`timestamptz`]: /sql/types/timestamptz
+[`timestamp with time zone`]: /sql/types/timestamptz
 [pg-copy]: https://www.postgresql.org/docs/current/sql-copy.html
 [pgwire-simple]: https://www.postgresql.org/docs/current/protocol-flow.html#id-1.10.5.7.4
 [pgwire-extended]: https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-FLOW-EXT-QUERY

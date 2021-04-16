@@ -65,8 +65,7 @@ def confirm(question: str) -> bool:
 def progress(
     msg: str = "", prefix: Optional[str] = None, *, finish: bool = False
 ) -> None:
-    """Print a progress message to stderr, using the same prefix format as speaker
-    """
+    """Print a progress message to stderr, using the same prefix format as speaker"""
     if prefix is not None:
         msg = f"{prefix}> {msg}"
     end = "" if not finish else "\n"
@@ -99,7 +98,7 @@ def timeout_loop(timeout: int, tick: int = 1) -> Generator[float, None, None]:
 def log_in_automation(msg: str) -> None:
     """Log to a file, if we're running in automation"""
     if env_is_truthy("MZ_IN_AUTOMATION"):
-        with open("/tmp/mzconduct.log", "a") as fh:
+        with open("/tmp/mzcompose.log", "a") as fh:
             now = datetime.datetime.now().isoformat()
             print(f"[{now}] {msg}", file=fh)
 
@@ -124,8 +123,7 @@ def env_is_truthy(env_var: str) -> bool:
 
 
 def warn_docker_resource_limits() -> None:
-    """Check docker for recommended resource limits
-    """
+    """Check docker for recommended resource limits"""
     warn = speaker("WARN:")
 
     limits = docker.resource_limits()

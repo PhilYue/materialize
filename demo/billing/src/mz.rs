@@ -8,11 +8,10 @@
 // by the Apache License, Version 2.0.
 
 use std::path::PathBuf;
-use std::time::Duration;
 
-use anyhow::{bail, Context, Error, Result};
+use anyhow::{bail, Context, Result};
 use csv::Writer;
-use ore::retry;
+use ore::retry::Retry;
 use rand::Rng;
 use tokio_postgres::Client;
 
@@ -99,8 +98,8 @@ pub async fn create_csv_source(
         writer
             .write_record(&[
                 i.to_string(),
-                rng.gen_range(1, 10).to_string(),
-                rng.gen_range(1, 10).to_string(),
+                rng.gen_range(1..10).to_string(),
+                rng.gen_range(1..10).to_string(),
             ])
             .with_context(|| format!("failed to write data to {}", path.display()))?;
     }
@@ -155,27 +154,28 @@ pub async fn validate_sink(
     let count_check_sink_query = format!("SELECT count(*) from {}", check_sink_view);
     let count_input_view_query = format!("SELECT count(*) from {}", input_view);
 
-    retry::retry_for::<_, _, _, Error>(Duration::from_secs(15), |_| async {
-        let count_check_sink: i64 = mz_client
-            .query_one(&*count_check_sink_query, &[])
-            .await?
-            .get(0);
-        let count_input_view: i64 = mz_client
-            .query_one(&*count_input_view_query, &[])
-            .await?
-            .get(0);
+    Retry::default()
+        .retry(|_| async {
+            let count_check_sink: i64 = mz_client
+                .query_one(&*count_check_sink_query, &[])
+                .await?
+                .get(0);
+            let count_input_view: i64 = mz_client
+                .query_one(&*count_input_view_query, &[])
+                .await?
+                .get(0);
 
-        if count_check_sink != count_input_view {
-            bail!(
-                "Expected check_sink view to have {} rows, found {}",
-                count_input_view,
-                count_check_sink
-            );
-        }
+            if count_check_sink != count_input_view {
+                bail!(
+                    "Expected check_sink view to have {} rows, found {}",
+                    count_input_view,
+                    count_check_sink
+                );
+            }
 
-        Ok(())
-    })
-    .await?;
+            Ok(())
+        })
+        .await?;
 
     let query = format!("SELECT * FROM {}", invalid_rows_view);
     log::debug!("validating sinks=> {}", query);
@@ -313,7 +313,7 @@ SELECT
 FROM
     {src}, billing_monthly_statement
 WHERE
-    to_timestamp(reingested_sink.month / 1000000) = billing_monthly_statement.month AND
+    {src}.month = billing_monthly_statement.month AND
     {src}.client_id = billing_monthly_statement.client_id AND
     {src}.cpu_num = billing_monthly_statement.cpu_num AND
     {src}.memory_gb = billing_monthly_statement.memory_gb",

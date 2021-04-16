@@ -14,11 +14,13 @@
 //! detail that is often overlooked and leads to bugs. However, it is
 //! important to coalesce these operators so that we can more easily
 //! move them around other operators together.
+//!
+//! Also removes empty `Map` operators.
 
 use std::mem;
 
 use crate::TransformArgs;
-use expr::RelationExpr;
+use expr::MirRelationExpr;
 
 /// Fuses a sequence of `Map` operators in to one `Map` operator.
 #[derive(Debug)]
@@ -27,7 +29,7 @@ pub struct Map;
 impl crate::Transform for Map {
     fn transform(
         &self,
-        relation: &mut RelationExpr,
+        relation: &mut MirRelationExpr,
         _: TransformArgs,
     ) -> Result<(), crate::TransformError> {
         relation.visit_mut_pre(&mut |e| {
@@ -39,9 +41,10 @@ impl crate::Transform for Map {
 
 impl Map {
     /// Fuses a sequence of `Map` operators in to one `Map` operator.
-    pub fn action(&self, relation: &mut RelationExpr) {
-        if let RelationExpr::Map { input, scalars } = relation {
-            while let RelationExpr::Map {
+    /// Remove the map operator if it is empty.
+    pub fn action(&self, relation: &mut MirRelationExpr) {
+        if let MirRelationExpr::Map { input, scalars } = relation {
+            while let MirRelationExpr::Map {
                 input: inner_input,
                 scalars: inner_scalars,
             } = &mut **input
@@ -49,6 +52,10 @@ impl Map {
                 inner_scalars.append(scalars);
                 mem::swap(scalars, inner_scalars);
                 **input = inner_input.take_dangerous();
+            }
+
+            if scalars.is_empty() {
+                *relation = input.take_dangerous();
             }
         }
     }

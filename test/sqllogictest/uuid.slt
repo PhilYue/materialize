@@ -24,8 +24,43 @@ SELECT '63616665-6630-3064-6465-616462656568'::text::uuid
 ----
 63616665-6630-3064-6465-616462656568
 
-query error invalid input syntax for uuid
+query error invalid input syntax for type uuid
 SELECT 'Z3616665-6630-3064-6465-616462656568'::uuid
 
-query error does not support casting from uuid to bytes
+query error does not support casting from uuid to bytea
 SELECT '63616665-6630-3064-6465-616462656568'::uuid::bytes
+
+query T
+SELECT '63616665-6630-3064-6465-616462656568'::uuid = '63616665-6630-3064-6465-616462656568'::uuid;
+----
+true
+
+query T
+SELECT '63616665-6630-3064-6465-616462656568'::uuid = '86565626-4616-5646-4603-036656661636'::uuid;
+----
+false
+
+query T
+SELECT '63616665-6630-3064-6465-616462656568'::uuid <> '86565626-4616-5646-4603-036656661636'::uuid;
+----
+true
+
+query T
+SELECT '63616665-6630-3064-6465-616462656568'::uuid < '86565626-4616-5646-4603-036656661636'::uuid;
+----
+true
+
+query T
+SELECT '63616665-6630-3064-6465-616462656568'::uuid > '86565626-4616-5646-4603-036656661636'::uuid;
+----
+false
+
+query T
+SELECT '63616665-6630-3064-6465-616462656568'::uuid <= '86565626-4616-5646-4603-036656661636'::uuid;
+----
+true
+
+query T
+SELECT '63616665-6630-3064-6465-616462656568'::uuid >= '86565626-4616-5646-4603-036656661636'::uuid;
+----
+false

@@ -17,7 +17,17 @@ name
 -------
 public
 mz_catalog
+mz_internal
 pg_catalog
+
+# What objects do we have by default?
+> SHOW OBJECTS
+name
+----
+
+> SHOW FULL OBJECTS
+name   type
+-----------
 
 # Creating a schema should be reflected in the output of SHOW SCHEMAS.
 > CREATE SCHEMA s
@@ -49,7 +59,7 @@ name
 ----
 materialize
 
-> SELECT id, name FROM mz_catalog.mz_databases
+> SELECT id, name FROM mz_databases
 id          name
 -----------------------
 1           materialize
@@ -62,11 +72,18 @@ name
 d
 materialize
 
-> SELECT id, name FROM mz_catalog.mz_databases
+> SELECT id, name FROM mz_databases
 id          name
 -----------------------
 1           materialize
 2           d
+
+# The same catalog information should be accessible with any amount of
+# database or schema qualification.
+> SELECT count(*) FROM materialize.mz_catalog.mz_databases
+2
+> SELECT count(*) FROM d.mz_catalog.mz_databases
+2
 
 # SHOW DATABASES should filter its output according to the provided LIKE or
 # WHERE clause.
@@ -81,7 +98,7 @@ d
 > SHOW DATABASES WHERE (name = (SELECT min(name) FROM mz_databases))
 d
 ! SHOW DATABASES WHERE 7
-WHERE clause must have type bool, not type i32
+WHERE clause must have type boolean, not type integer
 
 # Creating a database with a name that already exists should fail.
 ! CREATE DATABASE d
@@ -131,6 +148,55 @@ v2
 1
 2
 
+> SHOW OBJECTS
+name
+----
+v1
+v1_primary_idx
+v2
+v2_primary_idx
+
+# Test minimizing name qualification
+
+> CREATE TYPE int_list AS list (element_type=int4)
+
+> SELECT pg_typeof('{1}'::d.public.int_list)
+int_list
+
+> CREATE SCHEMA other
+> CREATE TYPE other.int_list AS list (element_type=int4)
+> SELECT pg_typeof('{1}'::d.other.int_list)
+other.int_list
+
+> CREATE DATABASE foo
+> CREATE SCHEMA foo.other
+> CREATE TYPE foo.other.int_list AS LIST (element_type=int4)
+> SELECT pg_typeof('{1}'::foo.other.int_list)
+foo.other.int_list
+
+> CREATE TYPE bool AS LIST (element_type=int4)
+! SELECT '{1}'::bool
+invalid input syntax for type boolean: "{1}"
+
+> SELECT pg_typeof('{1}'::public.bool);
+public.bool
+
+> SELECT pg_typeof('{1}'::d.public.bool);
+public.bool
+
+> DROP DATABASE foo
+
+! DROP OBJECT v1
+Expected DATABASE, INDEX, ROLE, SCHEMA, SINK, SOURCE, TABLE, TYPE, USER, VIEW after DROP, found identifier
+
+> SHOW FULL OBJECTS
+name            type
+--------------------------
+v1              user
+v1_primary_idx  user
+v2              user
+v2_primary_idx  user
+
 # DROP DATABASE should not support RESTRICT or CASCADE.
 ! DROP DATABASE d RESTRICT
 Expected end of statement, found RESTRICT
@@ -144,7 +210,8 @@ Expected end of statement, found RESTRICT
 name
 ----
 materialize
-> SELECT id, name FROM mz_catalog.mz_databases
+
+> SELECT id, name FROM mz_databases
 id          name
 -----------------------
 1           materialize
@@ -179,7 +246,7 @@ unacceptable schema name 'pg_bar'
 > SHOW search_path
 "mz_catalog, pg_catalog, public, mz_temp"
 ! SET search_path = foo
-parameter search_path is read only
+parameter "search_path" cannot be changed
 
 # Creating views in non-existent databases should fail.
 ! CREATE VIEW noexist.ignored AS SELECT 1
@@ -215,7 +282,7 @@ name
 d
 d2
 materialize
-> SELECT id, name FROM mz_catalog.mz_databases
+> SELECT id, name FROM mz_databases
 id          name
 -----------------------
 1           materialize
@@ -234,8 +301,11 @@ mz_arrangement_sizes
 mz_dataflow_channels
 mz_dataflow_operator_addresses
 mz_dataflow_operators
+mz_kafka_broker_rtt
+mz_kafka_consumer_partitions
 mz_materialization_dependencies
 mz_materializations
+mz_message_counts
 mz_peek_active
 mz_peek_durations
 mz_scheduling_elapsed
@@ -245,32 +315,43 @@ mz_source_info
 mz_worker_materialization_frontiers
 
 > SHOW FULL SOURCES FROM mz_catalog
-name                                 type   materialized
---------------------------------------------------------
-mz_arrangement_sharing               system true
-mz_arrangement_sizes                 system true
-mz_dataflow_channels                 system true
-mz_dataflow_operator_addresses       system true
-mz_dataflow_operators                system true
-mz_materialization_dependencies      system true
-mz_materializations                  system true
-mz_peek_active                       system true
-mz_peek_durations                    system true
-mz_scheduling_elapsed                system true
-mz_scheduling_histogram              system true
-mz_scheduling_parks                  system true
-mz_source_info                       system true
-mz_worker_materialization_frontiers  system true
+name                                 type   materialized  volatility
+--------------------------------------------------------------------
+mz_arrangement_sharing               system true          volatile
+mz_arrangement_sizes                 system true          volatile
+mz_dataflow_channels                 system true          volatile
+mz_dataflow_operator_addresses       system true          volatile
+mz_dataflow_operators                system true          volatile
+mz_kafka_broker_rtt                  system true          volatile
+mz_kafka_consumer_partitions         system true          volatile
+mz_materialization_dependencies      system true          volatile
+mz_materializations                  system true          volatile
+mz_message_counts                    system true          volatile
+mz_peek_active                       system true          volatile
+mz_peek_durations                    system true          volatile
+mz_scheduling_elapsed                system true          volatile
+mz_scheduling_histogram              system true          volatile
+mz_scheduling_parks                  system true          volatile
+mz_source_info                       system true          volatile
+mz_worker_materialization_frontiers  system true          volatile
 
 > SHOW TABLES FROM mz_catalog
+mz_array_types
 mz_avro_ocf_sinks
 mz_base_types
 mz_columns
 mz_databases
+mz_functions
 mz_index_columns
 mz_indexes
 mz_kafka_sinks
+mz_list_types
 mz_map_types
+mz_metric_histograms
+mz_metrics
+mz_metrics_meta
+mz_pseudo_types
+mz_roles
 mz_schemas
 mz_sinks
 mz_sources
@@ -283,14 +364,22 @@ mz_views
 > SHOW FULL TABLES FROM mz_catalog
 name                  type
 ----------------------------
+mz_array_types        system
 mz_avro_ocf_sinks     system
 mz_base_types         system
 mz_columns            system
 mz_databases          system
+mz_functions          system
 mz_index_columns      system
 mz_indexes            system
 mz_kafka_sinks        system
+mz_list_types         system
 mz_map_types          system
+mz_metric_histograms  system
+mz_metrics            system
+mz_metrics_meta       system
+mz_pseudo_types       system
+mz_roles              system
 mz_schemas            system
 mz_sinks              system
 mz_sources            system
@@ -300,16 +389,75 @@ mz_view_foreign_keys  system
 mz_view_keys          system
 mz_views              system
 
-! SHOW EXTENDED TABLES
-SHOW EXTENDED TABLES not yet supported
+> CREATE SCHEMA tester
+
+> SHOW TABLES FROM tester
+
+> SHOW EXTENDED tables FROM tester
+mz_array_types
+mz_avro_ocf_sinks
+mz_base_types
+mz_columns
+mz_databases
+mz_functions
+mz_index_columns
+mz_indexes
+mz_kafka_sinks
+mz_list_types
+mz_map_types
+mz_metric_histograms
+mz_metrics
+mz_metrics_meta
+mz_pseudo_types
+mz_roles
+mz_schemas
+mz_sinks
+mz_sources
+mz_tables
+mz_types
+mz_view_foreign_keys
+mz_view_keys
+mz_views
+
+> CREATE TABLE tester.test_table (a int)
+
+> SHOW TABLES FROM tester
+test_table
+
+> SHOW EXTENDED tables FROM tester
+mz_array_types
+mz_avro_ocf_sinks
+mz_base_types
+mz_columns
+mz_databases
+mz_functions
+mz_index_columns
+mz_indexes
+mz_kafka_sinks
+mz_list_types
+mz_map_types
+mz_metric_histograms
+mz_metrics
+mz_metrics_meta
+mz_pseudo_types
+mz_roles
+mz_schemas
+mz_sinks
+mz_sources
+mz_tables
+mz_types
+mz_view_foreign_keys
+mz_view_keys
+mz_views
+test_table
 
 # `SHOW TABLES` and `mz_tables` should agree.
 > SELECT COUNT(*) FROM mz_tables WHERE id LIKE 's%'
-16
+24
 
 # There is one entry in mz_indexes for each field_number/expression of the index.
 > SELECT COUNT(id) FROM mz_indexes WHERE id LIKE 's%'
-30
+41
 
 > SHOW VIEWS FROM mz_catalog
 mz_addresses_with_unit_length
@@ -329,23 +477,23 @@ mz_records_per_dataflow_operator
 mz_relations
 
 > SHOW FULL VIEWS FROM mz_catalog
-name                              type   materialized
--------------------------------------------------------
-mz_addresses_with_unit_length     system false
-mz_dataflow_names                 system false
-mz_dataflow_operator_dataflows    system false
-mz_materialization_frontiers      system false
-mz_objects                        system false
-mz_perf_arrangement_records       system false
-mz_perf_dependency_frontiers      system false
-mz_perf_peek_durations_aggregates system false
-mz_perf_peek_durations_bucket     system false
-mz_perf_peek_durations_core       system false
-mz_records_per_dataflow           system false
-mz_records_per_dataflow_global    system false
-mz_records_per_dataflow_operator  system false
-mz_relations                      system false
-mz_catalog_names                  system false
+name                              type   materialized  volatility
+-----------------------------------------------------------------
+mz_addresses_with_unit_length     system false         volatile
+mz_dataflow_names                 system false         volatile
+mz_dataflow_operator_dataflows    system false         volatile
+mz_materialization_frontiers      system false         volatile
+mz_objects                        system false         volatile
+mz_perf_arrangement_records       system false         volatile
+mz_perf_dependency_frontiers      system false         volatile
+mz_perf_peek_durations_aggregates system false         volatile
+mz_perf_peek_durations_bucket     system false         volatile
+mz_perf_peek_durations_core       system false         volatile
+mz_records_per_dataflow           system false         volatile
+mz_records_per_dataflow_global    system false         volatile
+mz_records_per_dataflow_operator  system false         volatile
+mz_relations                      system false         volatile
+mz_catalog_names                  system false         volatile
 
 > SHOW MATERIALIZED SOURCES FROM mz_catalog LIKE '%peek%';
 mz_peek_active

@@ -1,11 +1,6 @@
 // Copyright Materialize, Inc. All rights reserved.
 //
-// Use of this software is governed by the Business Source License
-// included in the LICENSE file.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0.
+// Use of this software is governed by the Apache license, Version 2.0
 
 //! Cast utilities.
 
@@ -42,14 +37,17 @@ macro_rules! cast_from {
 cast_from!(u32, usize);
 
 #[cfg(target_pointer_width = "64")]
-cast_from!(i32, usize);
-
-#[cfg(target_pointer_width = "64")]
 cast_from!(u64, usize);
 
 cast_from!(usize, u64);
+
+#[cfg(any(target_pointer_width = "32", target_pointer_width = "64"))]
+cast_from!(i32, isize);
 
 #[cfg(target_pointer_width = "64")]
 cast_from!(i64, isize);
 
 cast_from!(isize, i64);
+
+#[cfg(any(target_pointer_width = "32", target_pointer_width = "64"))]
+cast_from!(isize, i128);

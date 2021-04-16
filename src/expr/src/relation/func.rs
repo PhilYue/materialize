@@ -15,16 +15,15 @@ use std::iter;
 use std::path::PathBuf;
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use itertools::Itertools;
 use ordered_float::OrderedFloat;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use ore::cast::CastFrom;
-use repr::adt::decimal::Significand;
+use repr::adt::decimal::{Significand, MAX_DECIMAL_PRECISION};
 use repr::adt::regex::Regex as ReprRegex;
-use repr::{
-    CachedRecordIter, ColumnType, Datum, Diff, RelationType, Row, RowArena, RowPacker, ScalarType,
-};
+use repr::{CachedRecordIter, ColumnType, Datum, Diff, RelationType, Row, RowArena, ScalarType};
 
 use crate::id::GlobalId;
 use crate::scalar::func::jsonb_stringify;
@@ -297,7 +296,7 @@ where
     if datums.peek().is_none() {
         Datum::Null
     } else {
-        let x: i64 = datums.map(|d| d.unwrap_int64()).sum();
+        let x: i128 = datums.map(|d| i128::from(d.unwrap_int64())).sum();
         Datum::from(x)
     }
 }
@@ -379,10 +378,38 @@ fn jsonb_agg<'a, I>(datums: I, temp_storage: &'a RowArena) -> Datum<'a>
 where
     I: IntoIterator<Item = Datum<'a>>,
 {
-    let datum = temp_storage.make_datum(|packer| {
+    temp_storage.make_datum(|packer| {
         packer.push_list(datums.into_iter().filter(|d| !d.is_null()));
-    });
-    Datum::List(datum.unwrap_list())
+    })
+}
+
+fn jsonb_object_agg<'a, I>(datums: I, temp_storage: &'a RowArena) -> Datum<'a>
+where
+    I: IntoIterator<Item = Datum<'a>>,
+{
+    temp_storage.make_datum(|packer| {
+        packer.push_dict(
+            datums
+                .into_iter()
+                .filter_map(|d| {
+                    if d.is_null() {
+                        return None;
+                    }
+                    let mut list = d.unwrap_list().iter();
+                    let key = list.next().unwrap();
+                    let val = list.next().unwrap();
+                    if key.is_null() {
+                        // TODO(benesch): this should produce an error, but
+                        // aggregate functions cannot presently produce errors.
+                        None
+                    } else {
+                        Some((key.unwrap_str(), val))
+                    }
+                })
+                .sorted_by_key(|(k, _v)| *k)
+                .dedup_by(|(k1, _v1), (k2, _v2)| k1 == k2),
+        );
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash)]
@@ -421,6 +448,12 @@ pub enum AggregateFunc {
     /// layer, this function filters out `Datum::Null`, for consistency with
     /// the other aggregate functions.
     JsonbAgg,
+    /// Zips JSON-typed `Datum`s into a JSON map.
+    ///
+    /// WARNING: Unlike the `jsonb_object_agg` function that is exposed by the SQL
+    /// layer, this function filters out `Datum::Null`, for consistency with
+    /// the other aggregate functions.
+    JsonbObjectAgg,
     /// Accumulates any number of `Datum::Dummy`s into `Datum::Dummy`.
     ///
     /// Useful for removing an expensive aggregation while maintaining the shape
@@ -463,6 +496,7 @@ impl AggregateFunc {
             AggregateFunc::Any => any(datums),
             AggregateFunc::All => all(datums),
             AggregateFunc::JsonbAgg => jsonb_agg(datums, temp_storage),
+            AggregateFunc::JsonbObjectAgg => jsonb_object_agg(datums, temp_storage),
             AggregateFunc::Dummy => Datum::Dummy,
         }
     }
@@ -501,25 +535,30 @@ impl AggregateFunc {
             AggregateFunc::Any => ScalarType::Bool,
             AggregateFunc::All => ScalarType::Bool,
             AggregateFunc::JsonbAgg => ScalarType::Jsonb,
+            AggregateFunc::JsonbObjectAgg => ScalarType::Jsonb,
             AggregateFunc::SumInt32 => ScalarType::Int64,
+            AggregateFunc::SumInt64 => ScalarType::Decimal(MAX_DECIMAL_PRECISION, 0),
             _ => input_type.scalar_type,
         };
-        // max/min/sum return null on empty sets
-        let nullable = !matches!(self, AggregateFunc::Count);
+        // Count never produces null, and other aggregations only produce
+        // null in the presence of null inputs.
+        let nullable = match self {
+            AggregateFunc::Count => false,
+            _ => input_type.nullable,
+        };
         scalar_type.nullable(nullable)
     }
 }
 
 fn jsonb_each<'a>(a: Datum<'a>, temp_storage: &'a RowArena, stringify: bool) -> Vec<(Row, Diff)> {
-    let mut row_packer = RowPacker::new();
     match a {
-        Datum::Dict(dict) => dict
+        Datum::Map(dict) => dict
             .iter()
             .map(move |(k, mut v)| {
                 if stringify {
                     v = jsonb_stringify(v, temp_storage);
                 }
-                (row_packer.pack(&[Datum::String(k), v]), 1)
+                (Row::pack_slice(&[Datum::String(k), v]), 1)
             })
             .collect(),
         _ => vec![],
@@ -527,11 +566,10 @@ fn jsonb_each<'a>(a: Datum<'a>, temp_storage: &'a RowArena, stringify: bool) -> 
 }
 
 fn jsonb_object_keys<'a>(a: Datum<'a>) -> Vec<(Row, Diff)> {
-    let mut row_packer = RowPacker::new();
     match a {
-        Datum::Dict(dict) => dict
+        Datum::Map(dict) => dict
             .iter()
-            .map(move |(k, _)| (row_packer.pack(&[Datum::String(k)]), 1))
+            .map(move |(k, _)| (Row::pack_slice(&[Datum::String(k)]), 1))
             .collect(),
         _ => vec![],
     }
@@ -542,7 +580,6 @@ fn jsonb_array_elements<'a>(
     temp_storage: &'a RowArena,
     stringify: bool,
 ) -> Vec<(Row, Diff)> {
-    let mut row_packer = RowPacker::new();
     match a {
         Datum::List(list) => list
             .iter()
@@ -550,7 +587,7 @@ fn jsonb_array_elements<'a>(
                 if stringify {
                     e = jsonb_stringify(e, temp_storage);
                 }
-                (row_packer.pack(&[e]), 1)
+                (Row::pack_slice(&[e]), 1)
             })
             .collect(),
         _ => vec![],
@@ -569,29 +606,33 @@ fn regexp_extract(a: Datum, r: &AnalyzedRegex) -> Option<(Row, Diff)> {
 }
 
 fn generate_series_int32(start: Datum, stop: Datum) -> Vec<(Row, Diff)> {
-    let mut row_packer = RowPacker::new();
     let start = start.unwrap_int32();
     let stop = stop.unwrap_int32();
     (start..=stop)
-        .map(move |i| (row_packer.pack(&[Datum::Int32(i)]), 1))
+        .map(move |i| (Row::pack_slice(&[Datum::Int32(i)]), 1))
         .collect()
 }
 
 fn generate_series_int64(start: Datum, stop: Datum) -> Vec<(Row, Diff)> {
-    let mut row_packer = RowPacker::new();
     let start = start.unwrap_int64();
     let stop = stop.unwrap_int64();
     (start..=stop)
-        .map(move |i| (row_packer.pack(&[Datum::Int64(i)]), 1))
+        .map(move |i| (Row::pack_slice(&[Datum::Int64(i)]), 1))
+        .collect()
+}
+
+fn unnest_array(a: Datum) -> Vec<(Row, Diff)> {
+    a.unwrap_array()
+        .elements()
+        .iter()
+        .map(move |e| (Row::pack_slice(&[e]), 1))
         .collect()
 }
 
 fn unnest_list(a: Datum) -> Vec<(Row, Diff)> {
-    let mut row_packer = RowPacker::new();
-
     a.unwrap_list()
         .iter()
-        .map(move |e| (row_packer.pack(&[e]), 1))
+        .map(move |e| (Row::pack_slice(&[e]), 1))
         .collect()
 }
 
@@ -627,6 +668,7 @@ impl fmt::Display for AggregateFunc {
             AggregateFunc::Any => f.write_str("any"),
             AggregateFunc::All => f.write_str("all"),
             AggregateFunc::JsonbAgg => f.write_str("jsonb_agg"),
+            AggregateFunc::JsonbObjectAgg => f.write_str("jsonb_object_agg"),
             AggregateFunc::Dummy => f.write_str("dummy"),
         }
     }
@@ -676,7 +718,7 @@ impl AnalyzedRegex {
 
 pub fn csv_extract(a: Datum, n_cols: usize) -> Vec<(Row, Diff)> {
     let bytes = a.unwrap_str().as_bytes();
-    let mut row_packer = RowPacker::new();
+    let mut row = Row::default();
     let mut csv_reader = csv::ReaderBuilder::new()
         .has_headers(false)
         .from_reader(bytes);
@@ -684,7 +726,8 @@ pub fn csv_extract(a: Datum, n_cols: usize) -> Vec<(Row, Diff)> {
         .records()
         .filter_map(|res| match res {
             Ok(sr) if sr.len() == n_cols => {
-                Some((row_packer.pack(sr.iter().map(|s| Datum::String(s))), 1))
+                row.extend(sr.iter().map(|s| Datum::String(s)));
+                Some((row.finish_and_reuse(), 1))
             }
             _ => None,
         })
@@ -693,7 +736,7 @@ pub fn csv_extract(a: Datum, n_cols: usize) -> Vec<(Row, Diff)> {
 
 pub fn repeat(a: Datum) -> Vec<(Row, Diff)> {
     let n = Diff::cast_from(a.unwrap_int64());
-    vec![(repr::RowPacker::new().finish(), n)]
+    vec![(Row::default(), n)]
 }
 
 // TODO(justin): this should return an error.
@@ -728,6 +771,9 @@ pub enum TableFunc {
         source: GlobalId,
         cache_directory: PathBuf,
     },
+    UnnestArray {
+        el_typ: ScalarType,
+    },
     UnnestList {
         el_typ: ScalarType,
     },
@@ -758,26 +804,24 @@ impl TableFunc {
             TableFunc::ReadCachedData {
                 source,
                 cache_directory,
-            } => {
-                let mut row_packer = RowPacker::new();
-                files_for_source(*source, cache_directory)
-                    .iter()
-                    .flat_map(|e| {
-                        CachedRecordIter::new(fs::read(e).unwrap()).map(move |r| (e.clone(), r))
-                    })
-                    .map(|(e, r)| {
-                        (
-                            row_packer.pack(&[
-                                Datum::String(e.to_str().unwrap()),
-                                Datum::Int64(r.offset),
-                                Datum::Bytes(&r.key),
-                                Datum::Bytes(&r.value),
-                            ]),
-                            1,
-                        )
-                    })
-                    .collect::<Vec<(Row, Diff)>>()
-            }
+            } => files_for_source(*source, cache_directory)
+                .iter()
+                .flat_map(|e| {
+                    CachedRecordIter::new(fs::read(e).unwrap()).map(move |r| (e.clone(), r))
+                })
+                .map(|(e, r)| {
+                    (
+                        Row::pack_slice(&[
+                            Datum::String(e.to_str().unwrap()),
+                            Datum::Int64(r.offset),
+                            Datum::Bytes(&r.key),
+                            Datum::Bytes(&r.value),
+                        ]),
+                        1,
+                    )
+                })
+                .collect::<Vec<(Row, Diff)>>(),
+            TableFunc::UnnestArray { .. } => unnest_array(datums[0]),
             TableFunc::UnnestList { .. } => unnest_list(datums[0]),
         }
     }
@@ -815,6 +859,7 @@ impl TableFunc {
                 ScalarType::Bytes.nullable(false),
                 ScalarType::Bytes.nullable(false),
             ],
+            TableFunc::UnnestArray { el_typ } => vec![el_typ.clone().nullable(true)],
             TableFunc::UnnestList { el_typ } => vec![el_typ.clone().nullable(true)],
         })
     }
@@ -830,11 +875,17 @@ impl TableFunc {
             TableFunc::GenerateSeriesInt64 => 1,
             TableFunc::Repeat => 0,
             TableFunc::ReadCachedData { .. } => 4,
+            TableFunc::UnnestArray { .. } => 1,
             TableFunc::UnnestList { .. } => 1,
         }
     }
 
     pub fn empty_on_null_input(&self) -> bool {
+        // Warning: this returns currently "true" for all TableFuncs.
+        // If adding a TableFunc for which this function will return "false",
+        // check the places where `empty_on_null_input` is called to ensure,
+        // such as NonNullRequirements that the case this function returns
+        // false is properly handled.
         match self {
             TableFunc::JsonbEach { .. }
             | TableFunc::JsonbObjectKeys
@@ -845,7 +896,27 @@ impl TableFunc {
             | TableFunc::CsvExtract(_)
             | TableFunc::Repeat
             | TableFunc::ReadCachedData { .. }
+            | TableFunc::UnnestArray { .. }
             | TableFunc::UnnestList { .. } => true,
+        }
+    }
+
+    /// True iff the table function preserves the append-only property of its input.
+    pub fn preserves_monotonicity(&self) -> bool {
+        // Most variants preserve monotonicity, but all variants are enumerated to
+        // ensure that added variants at least check that this is the case.
+        match self {
+            TableFunc::JsonbEach { .. } => true,
+            TableFunc::JsonbObjectKeys => true,
+            TableFunc::JsonbArrayElements { .. } => true,
+            TableFunc::RegexpExtract(_) => true,
+            TableFunc::CsvExtract(_) => true,
+            TableFunc::GenerateSeriesInt32 => true,
+            TableFunc::GenerateSeriesInt64 => true,
+            TableFunc::Repeat => false,
+            TableFunc::ReadCachedData { .. } => true,
+            TableFunc::UnnestArray { .. } => true,
+            TableFunc::UnnestList { .. } => true,
         }
     }
 }
@@ -860,10 +931,11 @@ impl fmt::Display for TableFunc {
             TableFunc::CsvExtract(n_cols) => write!(f, "csv_extract({}, _)", n_cols),
             TableFunc::GenerateSeriesInt32 => f.write_str("generate_series"),
             TableFunc::GenerateSeriesInt64 => f.write_str("generate_series"),
-            TableFunc::Repeat => f.write_str("repeat"),
+            TableFunc::Repeat => f.write_str("repeat_row"),
             TableFunc::ReadCachedData { source, .. } => {
                 write!(f, "internal_read_cached_data({})", source)
             }
+            TableFunc::UnnestArray { .. } => f.write_str("unnest_array"),
             TableFunc::UnnestList { .. } => f.write_str("unnest_list"),
         }
     }

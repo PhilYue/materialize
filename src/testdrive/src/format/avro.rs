@@ -17,6 +17,7 @@
 // The original source code is subject to the terms of the MIT license, a copy
 // of which can be found in the LICENSE file at the root of this repository.
 
+use std::collections::HashMap;
 use std::convert::{TryFrom, TryInto};
 use std::num::TryFromIntError;
 
@@ -55,14 +56,14 @@ pub fn from_json(json: &JsonValue, schema: SchemaNode) -> Result<Value, String> 
             let ts = n.as_i64().unwrap();
             Ok(Value::Timestamp(chrono::NaiveDateTime::from_timestamp(
                 ts / 1_000,
-                ts as u32 % 1_000,
+                ((ts % 1_000) * 1_000_000) as u32,
             )))
         }
         (JsonValue::Number(ref n), SchemaPiece::TimestampMicro) => {
             let ts = n.as_i64().unwrap();
             Ok(Value::Timestamp(chrono::NaiveDateTime::from_timestamp(
                 ts / 1_000_000,
-                ts as u32 % 1_000_000,
+                ((ts % 1_000_000) * 1_000) as u32,
             )))
         }
         (JsonValue::Array(items), SchemaPiece::Array(inner)) => Ok(Value::Array(
@@ -138,6 +139,24 @@ pub fn from_json(json: &JsonValue, schema: SchemaNode) -> Result<Value, String> 
             }
             Ok(builder.avro())
         }
+        (JsonValue::Object(items), SchemaPiece::Map(m)) => {
+            let mut map = HashMap::new();
+            for (k, v) in items {
+                let (inner, name) = m.get_piece_and_name(schema.root);
+                map.insert(
+                    k.to_owned(),
+                    from_json(
+                        v,
+                        SchemaNode {
+                            root: schema.root,
+                            inner,
+                            name,
+                        },
+                    )?,
+                );
+            }
+            Ok(Value::Map(map))
+        }
         (val, SchemaPiece::Union(us)) => {
             let variants = us.variants();
             let null_variant = variants
@@ -193,7 +212,10 @@ pub fn from_json(json: &JsonValue, schema: SchemaNode) -> Result<Value, String> 
                     }
                 }
             }
-            Err(format!("Type not found in union: {}", name))
+            Err(format!(
+                "Type not found in union: {}. variants: {:#?}",
+                name, variants
+            ))
         }
         _ => Err(format!(
             "unable to match JSON value to schema: {:?} vs {:?}",

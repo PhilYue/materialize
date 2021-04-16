@@ -9,6 +9,11 @@
 
 mode cockroach
 
+query T
+SELECT '-0'::float::text
+----
+-0
+
 query TTTTT
 SELECT 'Inf'::float::text, 'Infinity'::float::text, 'inFinIty'::float::text, '+inf'::float::text, '+infinity'::float::text
 ----
@@ -38,3 +43,40 @@ query TTT
 SELECT 'NaN'::double precision::text, 'nan'::double precision::text, 'nAN'::double precision::text
 ----
 NaN  NaN  NaN
+
+query R
+SELECT 1.2::float8::float4
+----
+1.2
+
+query R
+SELECT '2e40'::float8
+----
+20000000000000000000000000000000000000000
+
+query error value out of range: overflow
+SELECT '2e40'::float8::float4
+
+query R
+SELECT '2147483583'::float4::int;
+----
+2147483520
+
+query error integer out of range
+SELECT '2147483648'::float4::int
+
+query R
+SELECT '-2147483648'::float4::int
+----
+-2147483648
+
+query error integer out of range
+SELECT '-2147483777'::float4::int;
+
+# Invalid type mods
+
+query error precision for type float must be within \(\[1-53\]\)
+SELECT 1::float(0);
+
+query error precision for type float must be within \(\[1-53\]\)
+SELECT 1::float(55);

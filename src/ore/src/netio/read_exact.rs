@@ -1,12 +1,7 @@
 // Copyright 2019 Tokio Contributors
 // Copyright Materialize, Inc. All rights reserved.
 //
-// Use of this software is governed by the Business Source License
-// included in the LICENSE file.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0.
+// Use of this software is governed by the Apache license, Version 2.0
 //
 // Portions of this file are derived from the ReadExact combinator in the Tokio
 // project. The original source code was retrieved on March 1, 2019 from:
@@ -21,7 +16,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use futures::ready;
-use tokio::io::{self, AsyncRead};
+use tokio::io::{self, AsyncRead, ReadBuf};
 
 /// A future which reads exactly enough bytes to fill a buffer, unless EOF is
 /// reached first.
@@ -62,9 +57,10 @@ where
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         while self.pos < self.buf.len() {
             let me = &mut *self;
-            let n = ready!(Pin::new(&mut me.reader).poll_read(cx, &mut me.buf[me.pos..]))?;
-            self.pos += n;
-            if n == 0 {
+            let mut buf = ReadBuf::new(&mut me.buf[me.pos..]);
+            ready!(Pin::new(&mut me.reader).poll_read(cx, &mut buf))?;
+            me.pos += buf.filled().len();
+            if buf.filled().len() == 0 {
                 break;
             }
         }

@@ -34,7 +34,7 @@ impl CachedRecord {
     /// This function will throw an error if the row is larger than 4 GB.
     /// TODO: could this be made more efficient with a RowArena?
     pub fn write_record(&self, buf: &mut Vec<u8>) -> Result<(), anyhow::Error> {
-        let row = Row::pack(&[
+        let row = Row::pack_slice(&[
             Datum::Int64(self.offset),
             Datum::Int64(self.timestamp as i64),
             Datum::Bytes(&self.key),
@@ -59,10 +59,8 @@ impl CachedRecord {
         let len = NetworkEndian::read_u32(&data) as usize;
         assert!(
             len >= 16,
-            format!(
-                "expected to see at least 16 bytes in record, but saw {}",
-                len
-            )
+            "expected to see at least 16 bytes in record, but saw {}",
+            len
         );
 
         // Grab the next len bytes after the 4 byte length header, and turn
@@ -71,7 +69,7 @@ impl CachedRecord {
         let (_, rest) = data.split_at(4);
         let row = rest[..len].to_vec();
 
-        let rec = Row::new(row);
+        let rec = unsafe { Row::from_bytes_unchecked(row) };
         let row = rec.unpack();
 
         let source_offset = row[0].unwrap_int64();

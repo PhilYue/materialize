@@ -15,6 +15,14 @@ use repr::strconv;
 
 #[test]
 fn test_parse_date() {
+    run_test_parse_date("000203", NaiveDate::from_ymd(2000, 2, 3));
+    run_test_parse_date("690203", NaiveDate::from_ymd(2069, 2, 3));
+    run_test_parse_date("700203", NaiveDate::from_ymd(1970, 2, 3));
+    run_test_parse_date("010203", NaiveDate::from_ymd(2001, 2, 3));
+    run_test_parse_date("0010203", NaiveDate::from_ymd(1, 2, 3));
+    run_test_parse_date("00010203", NaiveDate::from_ymd(1, 2, 3));
+    run_test_parse_date("20010203", NaiveDate::from_ymd(2001, 2, 3));
+    run_test_parse_date("99990203", NaiveDate::from_ymd(9999, 2, 3));
     run_test_parse_date("2001-02-03", NaiveDate::from_ymd(2001, 2, 3));
     run_test_parse_date("2001-02-03 04:05:06.789", NaiveDate::from_ymd(2001, 2, 3));
     fn run_test_parse_date(s: &str, n: NaiveDate) {
@@ -25,24 +33,52 @@ fn test_parse_date() {
 #[test]
 fn test_parse_date_errors() {
     run_test_parse_date_errors(
+        "0000203",
+        "invalid input syntax for type date: YEAR cannot be zero: \"0000203\"",
+    );
+    run_test_parse_date_errors(
+        "00000203",
+        "invalid input syntax for type date: YEAR cannot be zero: \"00000203\"",
+    );
+    run_test_parse_date_errors(
+        "0010230",
+        "invalid input syntax for type date: invalid or out-of-range date: \"0010230\"",
+    );
+    run_test_parse_date_errors(
+        "00011303",
+        "invalid input syntax for type date: MONTH must be [1, 12], got 13: \"00011303\"",
+    );
+    run_test_parse_date_errors(
+        "-123456789",
+        "invalid input syntax for type date: MONTH must be [1, 12], got 123456789: \"-123456789\"",
+    );
+    run_test_parse_date_errors(
         "2001-01",
-        "invalid input syntax for date: YEAR, MONTH, DAY are all required: \"2001-01\"",
+        "invalid input syntax for type date: YEAR, MONTH, DAY are all required: \"2001-01\"",
     );
     run_test_parse_date_errors(
         "2001",
-        "invalid input syntax for date: YEAR, MONTH, DAY are all required: \"2001\"",
+        "invalid input syntax for type date: YEAR, MONTH, DAY are all required: \"2001\"",
+    );
+    run_test_parse_date_errors(
+        "2019-02-29",
+        "invalid input syntax for type date: invalid or out-of-range date: \"2019-02-29\"",
+    );
+    run_test_parse_date_errors(
+        "2020-02-30",
+        "invalid input syntax for type date: invalid or out-of-range date: \"2020-02-30\"",
     );
     run_test_parse_date_errors(
         "2001-13-01",
-        "invalid input syntax for date: MONTH must be [1, 12], got 13: \"2001-13-01\"",
+        "invalid input syntax for type date: MONTH must be [1, 12], got 13: \"2001-13-01\"",
     );
     run_test_parse_date_errors(
         "2001-12-32",
-        "invalid input syntax for date: DAY must be [1, 31], got 32: \"2001-12-32\"",
+        "invalid input syntax for type date: DAY must be [1, 31], got 32: \"2001-12-32\"",
     );
     run_test_parse_date_errors(
         "2001-01-02 04",
-        "invalid input syntax for date: have unprocessed tokens 4: \"2001-01-02 04\"",
+        "invalid input syntax for type date: have unprocessed tokens 4: \"2001-01-02 04\"",
     );
     fn run_test_parse_date_errors(s: &str, e: &str) {
         assert_eq!(
@@ -70,23 +106,23 @@ fn test_parse_time() {
 fn test_parse_time_errors() {
     run_test_parse_time_errors(
         "26:01:02.345",
-        "invalid input syntax for time: HOUR must be [0, 23], got 26: \"26:01:02.345\"",
+        "invalid input syntax for type time: HOUR must be [0, 23], got 26: \"26:01:02.345\"",
     );
     run_test_parse_time_errors(
         "01:60:02.345",
-        "invalid input syntax for time: MINUTE must be [0, 59], got 60: \"01:60:02.345\"",
+        "invalid input syntax for type time: MINUTE must be [0, 59], got 60: \"01:60:02.345\"",
     );
     run_test_parse_time_errors(
         "01:02:61.345",
-        "invalid input syntax for time: SECOND must be [0, 60], got 61: \"01:02:61.345\"",
+        "invalid input syntax for type time: SECOND must be [0, 60], got 61: \"01:02:61.345\"",
     );
     run_test_parse_time_errors(
         "03.456",
-        "invalid input syntax for time: have unprocessed tokens 3.456000000: \"03.456\"",
+        "invalid input syntax for type time: have unprocessed tokens 3.456000000: \"03.456\"",
     );
     run_test_parse_time_errors(
         "03.456",
-        "invalid input syntax for time: have unprocessed tokens 3.456000000: \"03.456\"",
+        "invalid input syntax for type time: have unprocessed tokens 3.456000000: \"03.456\"",
     );
 
     fn run_test_parse_time_errors(s: &str, e: &str) {
@@ -129,36 +165,36 @@ fn test_parse_timestamp() {
 fn test_parse_timestamp_errors() {
     run_test_parse_timestamp_errors(
         "2001-01",
-        "invalid input syntax for timestamp: YEAR, MONTH, DAY are all required: \"2001-01\"",
+        "invalid input syntax for type timestamp: YEAR, MONTH, DAY are all required: \"2001-01\"",
     );
     run_test_parse_timestamp_errors(
         "2001",
-        "invalid input syntax for timestamp: YEAR, MONTH, DAY are all required: \"2001\"",
+        "invalid input syntax for type timestamp: YEAR, MONTH, DAY are all required: \"2001\"",
     );
     run_test_parse_timestamp_errors(
         "2001-13-01",
-        "invalid input syntax for timestamp: MONTH must be [1, 12], got 13: \"2001-13-01\"",
+        "invalid input syntax for type timestamp: MONTH must be [1, 12], got 13: \"2001-13-01\"",
     );
     run_test_parse_timestamp_errors(
         "2001-12-32",
-        "invalid input syntax for timestamp: DAY must be [1, 31], got 32: \"2001-12-32\"",
+        "invalid input syntax for type timestamp: DAY must be [1, 31], got 32: \"2001-12-32\"",
     );
     run_test_parse_timestamp_errors(
         "2001-01-02 04",
-        "invalid input syntax for timestamp: have unprocessed tokens 4: \"2001-01-02 04\"",
+        "invalid input syntax for type timestamp: have unprocessed tokens 4: \"2001-01-02 04\"",
     );
 
     run_test_parse_timestamp_errors(
         "2001-01-02 26:01:02.345",
-        "invalid input syntax for timestamp: HOUR must be [0, 23], got 26: \"2001-01-02 26:01:02.345\"",
+        "invalid input syntax for type timestamp: HOUR must be [0, 23], got 26: \"2001-01-02 26:01:02.345\"",
     );
     run_test_parse_timestamp_errors(
         "2001-01-02 01:60:02.345",
-        "invalid input syntax for timestamp: MINUTE must be [0, 59], got 60: \"2001-01-02 01:60:02.345\"",
+        "invalid input syntax for type timestamp: MINUTE must be [0, 59], got 60: \"2001-01-02 01:60:02.345\"",
     );
     run_test_parse_timestamp_errors(
         "2001-01-02 01:02:61.345",
-        "invalid input syntax for timestamp: SECOND must be [0, 60], got 61: \"2001-01-02 01:02:61.345\"",
+        "invalid input syntax for type timestamp: SECOND must be [0, 60], got 61: \"2001-01-02 01:02:61.345\"",
     );
 
     fn run_test_parse_timestamp_errors(s: &str, e: &str) {
@@ -214,17 +250,17 @@ fn test_parse_timestamptz() {
 fn test_parse_timestamptz_errors() {
     run_test_parse_timestamptz_errors(
         "1999-01-01 01:23:34.555 +25:45",
-        "invalid input syntax for timestamptz: Invalid timezone string \
+        "invalid input syntax for type timestamp with time zone: Invalid timezone string \
          (+25:45): timezone hour invalid 25: \"1999-01-01 01:23:34.555 +25:45\"",
     );
     run_test_parse_timestamptz_errors(
-        "1999-01-01 01:23:34.555 +21:61",
-        "invalid input syntax for timestamptz: Invalid timezone string \
-         (+21:61): timezone minute invalid 61: \"1999-01-01 01:23:34.555 +21:61\"",
+        "1999-01-01 01:23:34.555 +15:61",
+        "invalid input syntax for type timestamp with time zone: Invalid timezone string \
+         (+15:61): timezone minute invalid 61: \"1999-01-01 01:23:34.555 +15:61\"",
     );
     run_test_parse_timestamptz_errors(
         "1999-01-01 01:23:34.555 4",
-        "invalid input syntax for timestamptz: Cannot parse timezone offset 4: \
+        "invalid input syntax for type timestamp with time zone: Cannot parse timezone offset 4: \
          \"1999-01-01 01:23:34.555 4\"",
     );
 
@@ -382,7 +418,7 @@ fn parse_interval_error() {
 
     run_test_parse_interval_errors(
         "1 1-1",
-        "invalid input syntax for interval: Cannot determine format of all parts. Add explicit time \
+        "invalid input syntax for type interval: Cannot determine format of all parts. Add explicit time \
          components, e.g. INTERVAL '1 day' or INTERVAL '1' DAY: \"1 1-1\"",
     );
 }

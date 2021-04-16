@@ -9,31 +9,44 @@
 
 //! Coordinates client requests with the dataflow layer.
 //!
-//! Client requests are either a "simple" query, in which SQL is parsed,
-//! planned, and executed in one shot, or an "extended" query, where the client
-//! controls the parsing, planning, and execution via individual messages,
-//! allowing it to reuse pre-parsed and pre-planned queries (i.e., via "prepared
-//! statements"), which can be more efficient when the same query is executed
-//! multiple times.
+//! This crate hosts the "coordinator", an object which sits at the center of
+//! the system and coordinates communication between the various components.
+//! Responsibilities of the coordinator include:
 //!
-//! These commands are derived directly from the commands that
-//! [`pgwire`](../pgwire/index.html) produces, though they can, in theory, be
-//! provided by something other than a pgwire server.
+//!   * Launching the dataflow workers.
+//!   * Periodically allowing the dataflow workers to compact existing data.
+//!   * Executing SQL queries from clients by parsing and planning them, sending
+//!     the plans to the dataflow layer, and then streaming the results back to
+//!     the client.
+//!   * Assigning timestamps to incoming source data.
+//!
+//! The main interface to the coordinator is [`Client`]. To start a coordinator,
+//! use the [`serve`] function.
+
+// TODO(benesch): delete this once we use structured errors everywhere.
+macro_rules! coord_bail {
+    ($($e:expr),*) => {
+        return Err(crate::error::CoordError::Unstructured(::anyhow::anyhow!($($e),*)))
+    }
+}
 
 mod cache;
-mod catalog;
 mod client;
 mod command;
 mod coord;
+mod error;
+mod id_alloc;
+mod persistence;
 mod sink_connector;
 mod timestamp;
 mod util;
 
+pub mod catalog;
 pub mod session;
 
 pub use crate::cache::CacheConfig;
-pub use crate::catalog::dump as dump_catalog;
-pub use crate::client::{Client, SessionClient};
-pub use crate::command::{ExecuteResponse, NoSessionExecuteResponse, StartupMessage};
+pub use crate::client::{Client, ConnClient, Handle, SessionClient};
+pub use crate::command::{Cancelled, ExecuteResponse, StartupMessage, StartupResponse};
 pub use crate::coord::{serve, Config, LoggingConfig};
-pub use crate::timestamp::TimestampConfig;
+pub use crate::error::CoordError;
+pub use crate::persistence::PersistenceConfig;

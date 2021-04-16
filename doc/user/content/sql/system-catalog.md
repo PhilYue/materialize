@@ -9,7 +9,7 @@ menu:
     parent: 'sql'
 ---
 
-{{< version-added v0.5.0 >}}
+{{< version-added v0.5.0 />}}
 
 Materialize exposes a system catalog that contains metadata about the running
 Materialize instance.
@@ -50,6 +50,15 @@ information about the sinks available in a Materialize.
 
 The following sections describe the available objects in the `mz_catalog`
 schema.
+
+### `mz_array_types`
+
+The `mz_array_types` table contains a row for each array type in the system.
+
+Field          | Type       | Meaning
+---------------|------------|----------
+`type_id`      | [`text`]   | The ID of the array type.
+`element_id`   | [`text`]   | The ID of the array's element type.
 
 ### `mz_avro_ocf_sinks`
 
@@ -92,16 +101,30 @@ Field  | Type       | Meaning
 `oid`  | [`oid`]    | A [PostgreSQL-compatible OID][oid] for the database.
 `name` | [`text`]   | The name of the database.
 
+### `mz_functions`
+
+The `mz_functions` table contains a row for each function in the system.
+
+Field         | Type           | Meaning
+--------------|----------------|--------
+`id`          | [`text`]       | Materialize's unique ID for the function.
+`oid`         | [`oid`]        | A [PostgreSQL-compatible OID][oid] for the function.
+`schema_id`   | [`bigint`]     | The ID of the schema to which the function belongs.
+`name`        | [`text`]       | The name of the function.
+`arg_ids`     | [`text array`] | The function's arguments' types. Elements refers to `mz_types.id`.
+`variadic_id` | [`text`]       | The variadic array parameter's elements, or `NULL` if the function does not have a variadic parameter. Refers to `mz_types.id`.
+
 ### `mz_indexes`
 
 The `mz_indexes` table contains a row for each index in the system.
 
-Field   | Type     | Meaning
---------|----------|--------
-`id`    | [`text`] | Materialize's unique ID for the index.
-`oid`   | [`oid`]  | A [PostgreSQL-compatible OID][oid] for the index.
-`name`  | [`text`] | The name of the index.
-`on_id` | [`text`] | The ID of the relation on which the index is built.
+Field        | Type        | Meaning
+-------------|-------------|--------
+`id`         | [`text`]    | Materialize's unique ID for the index.
+`oid`        | [`oid`]     | A [PostgreSQL-compatible OID][oid] for the index.
+`name`       | [`text`]    | The name of the index.
+`on_id`      | [`text`]    | The ID of the relation on which the index is built.
+`volatility` | [`text`]    | Whether the the index is [volatile](/overview/volatility). Either `volatile`, `nonvolatile`, or `unknown`.
 
 ### `mz_index_columns`
 
@@ -120,6 +143,26 @@ Field            | Type        | Meaning
 `on_expression`  | [`text`]    | If not `NULL`, specifies a SQL expression that is evaluated to compute the value of this index column. The expression may contain references to any of the columns of the relation.
 `nullable`       | [`boolean`] | Can this column of the index evaluate to `NULL`?
 
+### `mz_kafka_consumer_partitions`
+
+The `mz_kafka_consumer_partitions` table contains a row for partition being
+read by a Kafka consumer in the system.
+
+Field           | Type       | Meaning
+----------------|------------|--------
+`consumer_name` | [`text`]   | The handle name for the consumer.
+`source_id`     | [`text`]   | The ID of the source that created this consumer object. Corresponds to `mz_source_info.source_id`.
+`dataflow_id`   | [`bigint`] | The ID of the dataflow reading from the consumer. Corresponds to `mz_source_info.dataflow_id`.
+`partition_id`  | [`text`]   | The ID of the topic partition the consumer is reading from.
+`rx_msgs`       | [`bigint`] | The number of messages read by this consumer since materialized startup.
+`rx_bytes`      | [`bigint`] | The number of bytes read by this consumer since materialized startup.
+`tx_msgs`       | [`bigint`] | The number of messages sent by this consumer since materialized startup.
+`tx_bytes`      | [`bigint`] | The number of bytes sent by this consumer since materialized startup.
+`lo_offset`     | [`bigint`] | The partition's low watermark offset on the broker.
+`hi_offset`     | [`bigint`] | The partition's high watermark offset on the broker.
+`ls_offset`     | [`bigint`] | The partition's last stable offset on the broker.
+`app_offset`    | [`bigint`] | The offset of the last message passed to materialized + 1.
+`consumer_lag`  | [`bigint`] | Difference between the `hi_offset` and `app_offset`.
 
 ### `mz_kafka_sinks`
 
@@ -153,6 +196,14 @@ Field       | Type       | Meaning
 `name`      | [`text`]   | The name of the object.
 `type`      | [`text`]   | The type of the object: either `table`, `source`, `view`, `sink`, or `index`.
 
+### `mz_pseudo_types`
+
+The `mz_pseudo_types` table contains a row for each psuedo type in the system.
+
+Field          | Type       | Meaning
+---------------|------------|----------
+`type_id`      | [`text`]   | The ID of the type.
+
 ### `mz_relations`
 
 The `mz_relations` view contains a row for each table, source, and view in the
@@ -165,6 +216,17 @@ Field       | Type       | Meaning
 `schema_id` | [`bigint`] | The ID of the schema to which the relation belongs.
 `name`      | [`text`]   | The name of the relation.
 `type`      | [`text`]   | The type of the relation: either `table`, `source`, or `view`.
+
+### `mz_roles`
+
+The `mz_roles` table contains a row for each role in the system.
+
+Field  | Type       | Meaning
+-------|------------|--------
+`id`   | [`bigint`] | Materialize's unique ID for the role.
+`oid`  | [`oid`]    | A [PostgreSQL-compatible OID][oid] for the role.
+`name` | [`text`]   | The name of the role.
+
 
 ### `mz_schemas`
 
@@ -181,12 +243,27 @@ Field         | Type       | Meaning
 
 The `mz_sinks` table contains a row for each sink in the system.
 
+Field          | Type        | Meaning
+---------------|-------------|--------
+`id`           | [`text`]    | Materialize's unique ID for the sink.
+`oid`          | [`oid`]     | A [PostgreSQL-compatible OID][oid] for the sink.
+`schema_id`    | [`bigint`]  | The ID of the schema to which the sink belongs.
+`name`         | [`text`]    | The name of the sink.
+`volatility`   | [`text`]    | Whether the sink is [volatile](/overview/volatility). Either `volatile`, `nonvolatile`, or `unknown`.
+
+### `mz_source_info`
+
+The `mz_source_info` table contains a row for each partition of each source
+in the system.
+
 Field          | Type       | Meaning
----------------|------------|--------
-`id`           | [`text`]   | Materialize's unique ID for the sink.
-`oid`          | [`oid`]    | A [PostgreSQL-compatible OID][oid] for the sink.
-`schema_id`    | [`bigint`] | The ID of the schema to which the sink belongs.
-`name`         | [`text`]   | The name of the sink.
+---------------|------------|----------
+`source_name`  | [`text`]   | Materialize's internal name for the source.
+`source_id`    | [`text`]   | Materialize's unique ID for the source. Corresponds to `mz_sources.id`.
+`dataflow_id`  | [`bigint`] | The ID of the dataflow responsible for processing this source.
+`partition_id` | [`text`]   | The ID of the partition within the source. The concept of partition varies by source type. Not all sources types have multiple partitions, in which case there will be only one entry for partition ID `0`.
+`offset`       | [`bigint`] | The highest offset processed by this source.
+`timestamp`    | [`bigint`] | The largest `mz_timestamp` processed by this source.
 
 ### `mz_sources`
 
@@ -198,6 +275,7 @@ Field          | Type       | Meaning
 `oid`          | [`oid`]    | A [PostgreSQL-compatible OID][oid] for the source.
 `schema_id`    | [`bigint`] | The ID of the schema to which the source belongs.
 `name`         | [`text`]   | The name of the source.
+`volatility`   | [`text`]   | Whether the source is [volatile](/overview/volatility). Either `volatile`, `nonvolatile`, or `unknown`.
 
 ### `mz_tables`
 
@@ -225,12 +303,13 @@ Field          | Type       | Meaning
 
 The `mz_views` table contains a row for each view in the system.
 
-Field          | Type       | Meaning
----------------|------------|----------
-`id`           | [`text`]   | Materialize's unique ID for the view.
-`oid`          | [`oid`]    | A [PostgreSQL-compatible OID][oid] for the view.
-`schema_id`    | [`bigint`] | The ID of the schema to which the view belongs.
-`name`         | [`text`]   | The name of the view.
+Field          | Type        | Meaning
+---------------|-------------|----------
+`id`           | [`text`]    | Materialize's unique ID for the view.
+`oid`          | [`oid`]     | A [PostgreSQL-compatible OID][oid] for the view.
+`schema_id`    | [`bigint`]  | The ID of the schema to which the view belongs.
+`name`         | [`text`]    | The name of the view.
+`volatility`   | [`text`]    | Whether the view is [volatile](/overview/volatility). Either `volatile`, `nonvolatile`, or `unknown`.
 
 ## `pg_catalog`
 
@@ -264,3 +343,4 @@ Materialize with minor changes to the `pg_catalog` compatibility shim.
 [`text`]: /sql/types/text
 [gh-issue]: https://github.com/MaterializeInc/materialize/issues/new?labels=C-feature&template=feature.md
 [oid]: /sql/types/oid
+[`text array`]: /sql/types/array

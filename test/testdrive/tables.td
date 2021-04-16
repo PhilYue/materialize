@@ -18,13 +18,28 @@ unknown catalog item 't'
 > SHOW CREATE TABLE t;
 Table   "Create Table"
 ------------------------
-materialize.public.t  "CREATE TABLE \"materialize\".\"public\".\"t\" (\"a\" int, \"b\" text NOT NULL)"
+materialize.public.t  "CREATE TABLE \"materialize\".\"public\".\"t\" (\"a\" \"pg_catalog\".\"int4\", \"b\" \"pg_catalog\".\"text\" NOT NULL)"
 
-! CREATE TABLE s (a int DEFAULT 1)
-CREATE TABLE with column constraint: DEFAULT 1 not yet supported
+> CREATE TABLE s (a int DEFAULT 1)
+> DROP TABLE s;
+
+> CREATE TABLE s (a date DEFAULT now())
+> DROP TABLE s;
+
+> CREATE TABLE s (a date DEFAULT now() + interval '1 day');
+> DROP TABLE s;
+
+> CREATE TABLE s (a int NOT NULL DEFAULT NULL)
+> DROP TABLE s;
+
+! CREATE TABLE s (a date DEFAULT 42)
+DEFAULT expression does not support casting from integer to date
+
+! CREATE TABLE s (a int, b int DEFAULT a + 3)
+column "a" does not exist
 
 ! CREATE TABLE t (a int, b int, a int);
-cannot CREATE TABLE with duplicate column names
+cannot CREATE TABLE: column "a" specified more than once
 
 > SELECT * FROM t;
 
@@ -49,10 +64,12 @@ cannot drop 'materialize.public.t_primary_idx' as it is the default index for a 
 > SHOW COLUMNS in t;
 name       nullable  type
 -------------------------
-a          true       int4
+a          true       integer
 b          false      text
+
 > SHOW COLUMNS in t WHERE name = 'a'
-a  true  int4
+a  true  integer
+
 > SHOW COLUMNS in t LIKE 'b%'
 b  false  text
 
@@ -125,20 +142,17 @@ a      b
 2      "b"
 <null> "c"
 
-! INSERT INTO t DEFAULT VALUES;
-INSERT ... DEFAULT VALUES not yet supported
-
 ! INSERT INTO t SELECT * FROM t;
 INSERT statements cannot reference other relations
 
 ! INSERT INTO t VALUES (1);
-INSERT statement specifies 1 columns, but table has 2 columns
+null value in column "b" violates not-null constraint
 
 ! INSERT INTO t VALUES (1, NULL);
-NULL value in column b violates not-null constraint
+null value in column "b" violates not-null constraint
 
 ! INSERT INTO t VALUES ('d', 4);
-invalid input syntax for int4: invalid digit found in string: "d"
+invalid input syntax for type integer: invalid digit found in string: "d"
 
 # Test that the INSERT body can be a SELECT query.
 > INSERT INTO t SELECT 3, 'd'
@@ -148,7 +162,7 @@ invalid input syntax for int4: invalid digit found in string: "d"
 
 # ...but not in complicated VALUES clauses, per PostgreSQL.
 ! INSERT INTO t VALUES ('4', 'e') LIMIT 0
-column "a" is of type int4 but expression is of type text
+column "a" is of type integer but expression is of type text
 
 # Test that assignment casts occur when possible...
 > INSERT INTO t VALUES (5.0, 'f');
@@ -156,14 +170,14 @@ column "a" is of type int4 but expression is of type text
 
 # ...but not when impossible.
 ! INSERT INTO t VALUES (DATE '2020-01-01', 'bad')
-column "a" is of type int4 but expression is of type date
+column "a" is of type integer but expression is of type date
 
 # Attempting to insert JSON into an int column is particularly interesting.
 # While there is an "explicit" cast from `jsonb` to `int`, there is no
 # "assignment" cast, and INSERT is only allowed to use assignment/implicit
 # casts.
 ! INSERT INTO t VALUES (JSON '1', 'bad')
-column "a" is of type int4 but expression is of type jsonb
+column "a" is of type integer but expression is of type jsonb
 
 > SELECT * FROM t;
 a       b
@@ -179,7 +193,7 @@ a       b
 > CREATE TABLE s (a int NOT NULL);
 
 ! INSERT INTO s VALUES (1 + NULL);
-NULL value in column a violates not-null constraint
+null value in column "a" violates not-null constraint
 
 > CREATE TABLE v (a timestamptz, b decimal(38, 0));
 
@@ -257,40 +271,62 @@ cannot insert into system table 'mz_catalog.mz_kafka_sinks'
     (1), (2), (3), (4), (5), (6), (7), (8), (9), (10), (11), (12), (13), (14), (15), (16), (17), (18), (19), (20), (21), (22), (23), (24), (25), (26), (27), (28), (29), (30), (31), (32), (33), (34), (35), (36), (37), (38), (39), (40), (41), (42), (43), (44), (45), (46), (47), (48), (49), (50), (51), (52), (53), (54), (55), (56), (57), (58), (59), (60), (61), (62), (63), (64), (65), (66), (67), (68), (69), (70), (71), (72), (73), (74), (75), (76), (77), (78), (79), (80), (81), (82), (83), (84), (85), (86), (87), (88), (89), (90), (91), (92), (93), (94), (95), (96), (97), (98), (99), (100), (101), (102), (103), (104), (105), (106), (107), (108), (109), (110), (111), (112), (113), (114), (115), (116), (117), (118), (119), (120), (121), (122), (123), (124), (125), (126), (127), (128),
     (1), (2), (3), (4), (5), (6), (7), (8), (9), (10), (11), (12), (13), (14), (15), (16), (17), (18), (19), (20), (21), (22), (23), (24), (25), (26), (27), (28), (29), (30), (31), (32), (33), (34), (35), (36), (37), (38), (39), (40), (41), (42), (43), (44), (45), (46), (47), (48), (49), (50), (51), (52), (53), (54), (55), (56), (57), (58), (59), (60), (61), (62), (63), (64), (65), (66), (67), (68), (69), (70), (71), (72), (73), (74), (75), (76), (77), (78), (79), (80), (81), (82), (83), (84), (85), (86), (87), (88), (89), (90), (91), (92), (93), (94), (95), (96), (97), (98), (99), (100), (101), (102), (103), (104), (105), (106), (107), (108), (109), (110), (111), (112), (113), (114), (115), (116), (117), (118), (119), (120), (121), (122), (123), (124), (125), (126), (127), (128);
 
+# Test INSERT with default values
+> DROP TABLE IF EXISTS t;
+> CREATE TABLE t (a int DEFAULT 4, b int DEFAULT 6 * 7)
+
+> INSERT INTO t (a) VALUES (1);
+> INSERT INTO t DEFAULT VALUES;
+
+> SELECT * FROM t;
+a  b
+------
+1  42
+4  42
+
 # Test INSERT with column specifiers
 > DROP TABLE IF EXISTS t;
-> CREATE TABLE t (a int, b text not null)
-> INSERT INTO t (b, a) VALUES ('a', 1), ('b', NULL);
+> CREATE TABLE t (a int, b text not null, c int)
+> INSERT INTO t (b, c, a) VALUES ('a', 2, 1), ('b', NULL, 3);
 
 > select * from t;
-a    b
----------
-1    "a"
-<null> "b"
+a      b    c
+-------------------
+1      "a"  2
+3      "b"  <null>
 
-! INSERT INTO t (notpresent, a) VALUES ('str', 1);
-INSERT statement specifies column notpresent, but it is not present in table
+> INSERT INTO t (b) VALUES ('c');
 
-! INSERT INTO t (a, b) VALUES ('str', 1);
-invalid input syntax for int4: invalid digit found in string: "str"
+> select * from t;
+a      b    c
+-------------------
+1      "a"  2
+3      "b"  <null>
+<null> "c"  <null>
 
-! INSERT INTO t (b, a) VALUES (1, 'str');
-invalid input syntax for int4: invalid digit found in string: "str"
+! INSERT INTO t (notpresent, a, c) VALUES ('str', 1, 2);
+column "notpresent" of relation "materialize.public.t" does not exist
 
-! INSERT INTO t (c, b, a) VALUES (1, 1, 'str');
-INSERT statement specifies column c, but it is not present in table
+! INSERT INTO t (a, b, c) VALUES ('str', 1, 2);
+invalid input syntax for type integer: invalid digit found in string: "str"
+
+! INSERT INTO t (b, a, c) VALUES (1, 'str', 2);
+invalid input syntax for type integer: invalid digit found in string: "str"
+
+! INSERT INTO t (d, c, b, a) VALUES (1, 1, 1, 'str');
+column "d" of relation "materialize.public.t" does not exist
 
 ! INSERT INTO t (a) VALUES (1);
-INSERT statement with incomplete column set not yet supported
+null value in column "b" violates not-null constraint
 
 ! INSERT INTO t (a) VALUES (1, 'str');
-INSERT statement with incomplete column set not yet supported
+INSERT has more expressions than target columns
 
-! INSERT INTO t (a, b) VALUES (1);
-INSERT statement specifies 1 columns, but table has 2 columns
+! INSERT INTO t (a, b, c) VALUES (1);
+INSERT has more target columns than expressions
 
 ! INSERT INTO t (a, a) VALUES (1, 'str')
-INSERT statement specifies duplicate column
+column "a" specified more than once
 
 # Test pg_table_is_visible.
 > CREATE SCHEMA non_default
@@ -308,7 +344,7 @@ v       true
 # pretty useless.
 > CREATE TABLE nocols ();
 ! INSERT INTO nocols VALUES (1)
-INSERT statement specifies 1 columns, but table has 0 columns
+INSERT has more expressions than target columns
 > SELECT count(*) FROM nocols
 0
 > INSERT INTO nocols SELECT UNION ALL SELECT

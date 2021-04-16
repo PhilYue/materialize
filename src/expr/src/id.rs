@@ -7,19 +7,23 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use anyhow::{anyhow, Error};
-use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
+use anyhow::{anyhow, Error};
+use serde::{Deserialize, Serialize};
+
 /// An opaque identifier for a dataflow component. In other words, identifies
-/// the target of a [`RelationExpr::Get`](crate::RelationExpr::Get).
+/// the target of a [`MirRelationExpr::Get`](crate::MirRelationExpr::Get).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum Id {
     /// An identifier that refers to a local component of a dataflow.
     Local(LocalId),
     /// An identifier that refers to a global dataflow.
     Global(GlobalId),
+    /// Used to refer to a bare source within the RelationExpr defining the transformation of that source (before an ID has been
+    /// allocated for the bare source).
+    LocalBareSource,
 }
 
 impl fmt::Display for Id {
@@ -27,14 +31,9 @@ impl fmt::Display for Id {
         match self {
             Id::Local(id) => id.fmt(f),
             Id::Global(id) => id.fmt(f),
+            Id::LocalBareSource => write!(f, "(bare source for this source)"),
         }
     }
-}
-
-/// A trait for turning [`Id`]s into human-readable strings.
-pub trait IdHumanizer {
-    /// Attempts to return the a human-readable string for `id`.
-    fn humanize_id(&self, id: Id) -> Option<String>;
 }
 
 /// The identifier for a local component of a dataflow.
@@ -64,6 +63,8 @@ pub enum GlobalId {
     User(u64),
     /// Transient namespace.
     Transient(u64),
+    /// Dummy id for query being explained
+    Explain,
 }
 
 impl GlobalId {
@@ -106,6 +107,7 @@ impl fmt::Display for GlobalId {
             GlobalId::System(id) => write!(f, "s{}", id),
             GlobalId::User(id) => write!(f, "u{}", id),
             GlobalId::Transient(id) => write!(f, "t{}", id),
+            GlobalId::Explain => write!(f, "Explained Query"),
         }
     }
 }
@@ -113,10 +115,10 @@ impl fmt::Display for GlobalId {
 /// Unique identifier for an instantiation of a source.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct SourceInstanceId {
-    // The ID of the source.
+    /// The ID of the source, shared across all instances.
     pub source_id: GlobalId,
-    // The ID of the timely dataflow containing this instantiation of this
-    // source.
+    /// The ID of the timely dataflow containing this instantiation of this
+    /// source.
     pub dataflow_id: usize,
 }
 
@@ -128,19 +130,24 @@ impl fmt::Display for SourceInstanceId {
 
 /// Unique identifier for each part of a whole source.
 ///     Kafka -> partition
-///     Kinesis -> shard
+///     Kinesis -> currently treated as single partition, should be shard.
+///     File -> only one
+///     S3 -> https://github.com/MaterializeInc/materialize/issues/5715
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum PartitionId {
     Kafka(i32),
-    Kinesis(String),
+    Kinesis,
     File,
+    S3,
 }
 
 impl fmt::Display for PartitionId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             PartitionId::Kafka(id) => write!(f, "{}", id.to_string()),
-            _ => write!(f, "0"),
+            PartitionId::S3 => write!(f, "s3"),
+            PartitionId::Kinesis => write!(f, "kinesis"),
+            PartitionId::File => write!(f, "0"),
         }
     }
 }
@@ -150,27 +157,6 @@ impl PartitionId {
         match self {
             PartitionId::Kafka(id) => Some(*id),
             _ => None,
-        }
-    }
-}
-
-/// Humanizer that provides no additional information.
-#[derive(Debug)]
-pub struct DummyHumanizer;
-
-impl IdHumanizer for DummyHumanizer {
-    fn humanize_id(&self, _: Id) -> Option<String> {
-        None
-    }
-}
-
-#[cfg(test)]
-pub mod test_utils {
-    use super::*;
-
-    impl From<&LocalId> for char {
-        fn from(id: &LocalId) -> char {
-            id.0 as u8 as char
         }
     }
 }

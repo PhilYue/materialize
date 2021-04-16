@@ -25,6 +25,7 @@
 //! extremely slow and inefficient on large data sets.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::collections::{BTreeMap, HashMap};
 use std::convert::TryInto;
 use std::env;
@@ -37,19 +38,22 @@ use uuid::Uuid;
 
 use pgrepr::Jsonb;
 use repr::adt::decimal::Significand;
-use repr::{Datum, RelationDesc, RelationType, Row, RowPacker, ScalarType};
+use repr::{Datum, RelationDesc, RelationType, Row};
 use sql::ast::{
-    ColumnOption, CreateTableStatement, DataType, DeleteStatement, DropObjectsStatement,
-    InsertStatement, ObjectType, Statement, TableConstraint, UpdateStatement,
+    ColumnOption, CreateTableStatement, DataType, DeleteStatement, DropObjectsStatement, Expr,
+    InsertStatement, ObjectType, Raw, Statement, TableConstraint, UpdateStatement,
 };
 use sql::catalog::Catalog;
 use sql::names::FullName;
 use sql::normalize;
-use sql::plan::{scalar_type_from_sql, MutationKind, Plan, PlanContext, StatementContext, Table};
+use sql::plan::{
+    plan_default_expr, resolve_names_data_type, Aug, MutationKind, Plan, PlanContext,
+    StatementContext, Table,
+};
 
 pub struct Postgres {
     client: tokio_postgres::Client,
-    table_types: HashMap<FullName, (Vec<DataType>, RelationDesc)>,
+    table_types: HashMap<FullName, (Vec<DataType<Aug>>, RelationDesc)>,
 }
 
 impl Postgres {
@@ -57,12 +61,7 @@ impl Postgres {
         let mut config: tokio_postgres::Config = url.parse()?;
         let username = whoami::username();
         if config.get_user().is_none() {
-            config.user(
-                env::var("PGUSER")
-                    .ok()
-                    .as_deref()
-                    .unwrap_or_else(|| &username),
-            );
+            config.user(env::var("PGUSER").ok().as_deref().unwrap_or(&username));
         }
         if config.get_password().is_none() {
             if let Ok(password) = env::var("PGPASSWORD") {
@@ -75,12 +74,7 @@ impl Postgres {
             }
         }
         if config.get_hosts().is_empty() {
-            config.host(
-                env::var("PGHOST")
-                    .ok()
-                    .as_deref()
-                    .unwrap_or_else(|| "localhost"),
-            );
+            config.host(env::var("PGHOST").ok().as_deref().unwrap_or("localhost"));
         }
         let (client, conn) = config
             .connect(tokio_postgres::NoTls)
@@ -114,24 +108,27 @@ END $$;
         })
     }
 
-    pub fn can_handle(&self, stmt: &Statement) -> bool {
-        matches!(stmt,
+    pub fn can_handle(&self, stmt: &Statement<Raw>) -> bool {
+        matches!(
+            stmt,
             Statement::CreateTable { .. }
-            | Statement::DropObjects { .. }
-            | Statement::Delete { .. }
-            | Statement::Insert { .. }
-            | Statement::Update { .. })
+                | Statement::DropObjects { .. }
+                | Statement::Delete { .. }
+                | Statement::Insert { .. }
+                | Statement::Update { .. }
+        )
     }
 
     pub async fn execute(
         &mut self,
         pcx: &PlanContext,
         catalog: &dyn Catalog,
-        stmt: &Statement,
+        stmt: &Statement<Raw>,
     ) -> Result<Plan, anyhow::Error> {
         let scx = StatementContext {
             pcx,
             catalog,
+            ids: HashSet::new(),
             param_types: Rc::new(RefCell::new(BTreeMap::new())),
         };
         Ok(match stmt {
@@ -140,44 +137,53 @@ END $$;
                 columns,
                 constraints,
                 if_not_exists,
+                temporary,
                 ..
             }) => {
-                let sql_types: Vec<_> = columns
-                    .iter()
-                    .map(|column| column.data_type.clone())
-                    .collect();
-
                 let names: Vec<_> = columns
                     .iter()
                     .map(|c| Some(sql::normalize::column_name(c.name.clone())))
                     .collect();
 
                 // Build initial relation type that handles declared data types
-                // and NOT NULL constraints.
-                let mut typ = RelationType::new(
-                    columns
-                        .iter()
-                        .map(|c| {
-                            let ty = scalar_type_from_sql(&c.data_type)?;
-                            let nullable =
-                                !c.options.iter().any(|o| o.option == ColumnOption::NotNull);
-                            Ok(ty.nullable(nullable))
-                        })
-                        .collect::<Result<Vec<_>, anyhow::Error>>()?,
-                );
+                // and NOT NULL, UNIQUE, and PRIMARY KEY constraints.
+                let mut column_types = Vec::with_capacity(columns.len());
+                let mut defaults = Vec::with_capacity(columns.len());
+                let mut depends_on = Vec::new();
+                let mut keys = vec![];
 
-                // Handle column-level UNIQUE and PRIMARY KEY constraints.
-                // PRIMARY KEY implies UNIQUE and NOT NULL.
+                let mut sql_types: Vec<_> = Vec::with_capacity(columns.len());
                 for (index, column) in columns.iter().enumerate() {
-                    for option in column.options.iter() {
-                        if let ColumnOption::Unique { is_primary } = option.option {
-                            typ = typ.with_key(vec![index]);
-                            if is_primary {
-                                typ.column_types[index].nullable = false;
+                    let (aug_data_type, ids) =
+                        resolve_names_data_type(&scx, column.data_type.clone())?;
+                    let ty = sql::plan::scalar_type_from_sql(&scx, &aug_data_type)?;
+                    sql_types.push(aug_data_type);
+                    let mut nullable = true;
+                    let mut default = Expr::null();
+
+                    for option in &column.options {
+                        match &option.option {
+                            ColumnOption::NotNull => nullable = false,
+                            ColumnOption::Default(expr) => {
+                                let (_, expr_depends_on) = plan_default_expr(&scx, expr, &ty)?;
+                                depends_on.extend(expr_depends_on);
+                                default = expr.clone();
                             }
+                            // PRIMARY KEY implies UNIQUE and NOT NULL.
+                            ColumnOption::Unique { is_primary } => {
+                                keys.push(vec![index]);
+                                if *is_primary {
+                                    nullable = false;
+                                }
+                            }
+                            other => bail!("unsupported column constraint: {}", other),
                         }
                     }
+                    column_types.push(ty.nullable(nullable));
+                    defaults.push(default);
+                    depends_on.extend(ids);
                 }
+                let mut typ = RelationType { column_types, keys };
 
                 // Handle table-level UNIQUE and PRIMARY KEY constraints.
                 // PRIMARY KEY implies UNIQUE and NOT NULL.
@@ -206,19 +212,23 @@ END $$;
                 }
 
                 self.client.execute(&*stmt.to_string(), &[]).await?;
-                let name = scx.allocate_name(normalize::object_name(name.clone())?);
+                let name = scx.allocate_name(normalize::unresolved_object_name(name.clone())?);
                 let desc = RelationDesc::new(typ, names);
                 self.table_types
                     .insert(name.clone(), (sql_types, desc.clone()));
 
+                let temporary = *temporary;
                 let table = Table {
                     create_sql: stmt.to_string(),
                     desc,
+                    defaults,
+                    temporary,
                 };
                 Plan::CreateTable {
                     name,
                     table,
                     if_not_exists: *if_not_exists,
+                    depends_on,
                 }
             }
             Statement::DropObjects(DropObjectsStatement {
@@ -230,8 +240,8 @@ END $$;
                 self.client.execute(&*stmt.to_string(), &[]).await?;
                 let mut items = vec![];
                 for name in names {
-                    let name = match scx.resolve_item(name.clone()) {
-                        Ok(name) => name,
+                    match scx.resolve_item(name.clone()) {
+                        Ok(item) => items.push(item.id()),
                         Err(err) => {
                             if *if_exists {
                                 continue;
@@ -239,8 +249,7 @@ END $$;
                                 return Err(err.into());
                             }
                         }
-                    };
-                    items.push(catalog.get_item(&name).id());
+                    }
                 }
                 Plan::DropItems {
                     items,
@@ -249,14 +258,14 @@ END $$;
             }
             Statement::Delete(DeleteStatement { table_name, .. }) => {
                 let mut updates = vec![];
-                let table_name = scx.resolve_item(table_name.clone())?;
+                let table = scx.resolve_item(table_name.clone())?;
                 let sql = format!("{} RETURNING *", stmt.to_string());
-                for row in self.run_query(&table_name, sql, 0).await? {
+                for row in self.run_query(table.name(), sql, 0).await? {
                     updates.push((row, -1));
                 }
                 let affected_rows = updates.len();
                 Plan::SendDiffs {
-                    id: catalog.get_item(&table_name).id(),
+                    id: table.id(),
                     updates,
                     affected_rows,
                     kind: MutationKind::Delete,
@@ -264,18 +273,18 @@ END $$;
             }
             Statement::Insert(InsertStatement { table_name, .. }) => {
                 let mut updates = vec![];
-                let table_name = scx.resolve_item(table_name.clone())?;
+                let table = scx.resolve_item(table_name.clone())?;
                 // RETURNING cannot return zero columns, but we might be
                 // executing INSERT INTO t DEFAULT VALUES where t is a zero
                 // arity table. So use a time-honored trick of always including
                 // a junk column in RETURNING, then stripping that column out.
                 let sql = format!("{} RETURNING *, 1", stmt.to_string());
-                for row in self.run_query(&table_name, sql, 1).await? {
+                for row in self.run_query(table.name(), sql, 1).await? {
                     updates.push((row, 1));
                 }
                 let affected_rows = updates.len();
                 Plan::SendDiffs {
-                    id: catalog.get_item(&table_name).id(),
+                    id: table.id(),
                     updates,
                     affected_rows,
                     kind: MutationKind::Insert,
@@ -288,21 +297,21 @@ END $$;
             }) => {
                 let mut updates = vec![];
                 let mut sql = format!("SELECT * FROM {}", table_name);
-                let table_name = scx.resolve_item(table_name.clone())?;
+                let table = scx.resolve_item(table_name.clone())?;
                 if let Some(selection) = selection {
                     sql += &format!(" WHERE {}", selection);
                 }
-                for row in self.run_query(&table_name, sql, 0).await? {
+                for row in self.run_query(table.name(), sql, 0).await? {
                     updates.push((row, -1))
                 }
                 let affected_rows = updates.len();
                 let sql = format!("{} RETURNING *", stmt.to_string());
-                for row in self.run_query(&table_name, sql, 0).await? {
+                for row in self.run_query(table.name(), sql, 0).await? {
                     updates.push((row, 1));
                 }
                 assert_eq!(affected_rows * 2, updates.len());
                 Plan::SendDiffs {
-                    id: catalog.get_item(&table_name).id(),
+                    id: table.id(),
                     updates,
                     affected_rows,
                     kind: MutationKind::Update,
@@ -325,7 +334,7 @@ END $$;
             .clone();
         let mut rows = vec![];
         let postgres_rows = self.client.query(&*query, &[]).await?;
-        let mut row = RowPacker::new();
+        let mut row = Row::default();
         for postgres_row in postgres_rows.iter() {
             for c in 0..postgres_row.len() - junk {
                 row = push_column(
@@ -343,109 +352,109 @@ END $$;
 }
 
 fn push_column(
-    mut row: RowPacker,
+    mut row: Row,
     postgres_row: &tokio_postgres::Row,
     i: usize,
-    sql_type: &DataType,
+    sql_type: &DataType<Aug>,
     nullable: bool,
-) -> Result<RowPacker, anyhow::Error> {
+) -> Result<Row, anyhow::Error> {
     // NOTE this needs to stay in sync with materialize::sql::scalar_type_from_sql
     // in some cases, we use slightly different representations than postgres does for the same sql types, so we have to be careful about conversions
     match sql_type {
-        DataType::Boolean => {
-            let bool = get_column_inner::<bool>(postgres_row, i, nullable)?;
-            row.push(bool.into());
-        }
-        DataType::Char(_) | DataType::Varchar(_) | DataType::Text => {
-            let string = get_column_inner::<String>(postgres_row, i, nullable)?;
-            row.push(string.as_deref().into());
-        }
-        DataType::SmallInt => {
-            let i = get_column_inner::<i16>(postgres_row, i, nullable)?.map(i32::from);
-            row.push(i.into());
-        }
-        DataType::Int | DataType::Oid => {
-            let i = get_column_inner::<i32>(postgres_row, i, nullable)?;
-            row.push(i.into());
-        }
-        DataType::BigInt => {
-            let i = get_column_inner::<i64>(postgres_row, i, nullable)?;
-            row.push(i.into());
-        }
-        DataType::Float(p) => {
-            if p.unwrap_or(53) <= 24 {
-                let f = get_column_inner::<f32>(postgres_row, i, nullable)?.map(f64::from);
-                row.push(f.into());
-            } else {
-                let f = get_column_inner::<f64>(postgres_row, i, nullable)?;
-                row.push(f.into());
-            }
-        }
-        DataType::Real => {
-            let f = get_column_inner::<f32>(postgres_row, i, nullable)?.map(f64::from);
-            row.push(f.into());
-        }
-        DataType::Double => {
-            let f = get_column_inner::<f64>(postgres_row, i, nullable)?;
-            row.push(f.into());
-        }
-        DataType::Date => {
-            let d: chrono::NaiveDate =
-                get_column_inner::<chrono::NaiveDate>(postgres_row, i, nullable)?.unwrap();
-            row.push(Datum::Date(d));
-        }
-        DataType::Timestamp => {
-            let d: chrono::NaiveDateTime =
-                get_column_inner::<chrono::NaiveDateTime>(postgres_row, i, nullable)?.unwrap();
-            row.push(Datum::Timestamp(d));
-        }
-        DataType::TimestampTz => {
-            let d: chrono::DateTime<Utc> =
-                get_column_inner::<chrono::DateTime<Utc>>(postgres_row, i, nullable)?.unwrap();
-            row.push(Datum::TimestampTz(d));
-        }
-        DataType::Interval => {
-            let iv = get_column_inner::<pgrepr::Interval>(postgres_row, i, nullable)?.unwrap();
-            row.push(Datum::Interval(iv.0));
-        }
-        DataType::Decimal(_, _) => {
-            let desired_scale = match scalar_type_from_sql(sql_type).unwrap() {
-                ScalarType::Decimal(_precision, desired_scale) => desired_scale,
-                _ => unreachable!(),
-            };
-            match get_column_inner::<pgrepr::Numeric>(postgres_row, i, nullable)? {
-                None => row.push(Datum::Null),
-                Some(d) => {
-                    let mut significand = d.0.significand();
-                    // TODO(jamii) lots of potential for unchecked edge cases here eg 10^scale_correction could overflow
-                    // current representation is `significand * 10^current_scale`
-                    // want to get to `significand2 * 10^desired_scale`
-                    // so `significand2 = significand * 10^(current_scale - desired_scale)`
-                    let scale_correction = (d.0.scale() as isize) - (desired_scale as isize);
-                    if scale_correction > 0 {
-                        significand /= 10i128.pow(scale_correction.try_into()?);
-                    } else {
-                        significand *= 10i128.pow((-scale_correction).try_into()?);
-                    };
-                    row.push(Significand::new(significand).into());
+        DataType::Other { name, typ_mod } => {
+            match name.raw_name().to_string().as_str() {
+                "pg_catalog.bool" => {
+                    let bool = get_column_inner::<bool>(postgres_row, i, nullable)?;
+                    row.push(Datum::from(bool));
                 }
+                "pg_catalog.bytea" => {
+                    let bytes = get_column_inner::<Vec<u8>>(postgres_row, i, nullable)?;
+                    row.push(Datum::from(bytes.as_deref()));
+                }
+                "pg_catalog.char" | "pg_catalog.text" | "pg_catalog.varchar" => {
+                    let string = get_column_inner::<String>(postgres_row, i, nullable)?;
+                    row.push(Datum::from(string.as_deref()));
+                }
+                "pg_catalog.date" => {
+                    let d: chrono::NaiveDate =
+                        get_column_inner::<chrono::NaiveDate>(postgres_row, i, nullable)?.unwrap();
+                    row.push(Datum::Date(d));
+                }
+                "pg_catalog.float4" => {
+                    let f = get_column_inner::<f32>(postgres_row, i, nullable)?.map(f32::from);
+                    row.push(Datum::from(f));
+                }
+                "pg_catalog.float8" => {
+                    let f = get_column_inner::<f64>(postgres_row, i, nullable)?;
+                    row.push(Datum::from(f));
+                }
+                "pg_catalog.int4" => {
+                    let i = get_column_inner::<i32>(postgres_row, i, nullable)?;
+                    row.push(Datum::from(i));
+                }
+                "pg_catalog.int8" => {
+                    let i = get_column_inner::<i64>(postgres_row, i, nullable)?;
+                    row.push(Datum::from(i));
+                }
+                "pg_catalog.interval" => {
+                    let iv =
+                        get_column_inner::<pgrepr::Interval>(postgres_row, i, nullable)?.unwrap();
+                    row.push(Datum::Interval(iv.0));
+                }
+                "pg_catalog.jsonb" => {
+                    let jsonb = get_column_inner::<Jsonb>(postgres_row, i, nullable)?;
+                    if let Some(jsonb) = jsonb {
+                        row.extend_by_row(&jsonb.0.into_row())
+                    } else {
+                        row.push(Datum::Null)
+                    }
+                }
+                "pg_catalog.numeric" => {
+                    let (_, desired_scale) = sql::plan::unwrap_numeric_typ_mod(typ_mod)?;
+                    match get_column_inner::<pgrepr::Numeric>(postgres_row, i, nullable)? {
+                        None => row.push(Datum::Null),
+                        Some(d) => {
+                            let mut significand = d.0.significand();
+                            // TODO(jamii) lots of potential for unchecked edge cases here eg 10^scale_correction could overflow
+                            // current representation is `significand * 10^current_scale`
+                            // want to get to `significand2 * 10^desired_scale`
+                            // so `significand2 = significand * 10^(current_scale - desired_scale)`
+                            let scale_correction =
+                                (d.0.scale() as isize) - (desired_scale as isize);
+                            if scale_correction > 0 {
+                                significand /= 10i128.pow(scale_correction.try_into()?);
+                            } else {
+                                significand *= 10i128.pow((-scale_correction).try_into()?);
+                            };
+                            row.push(Datum::from(Significand::new(significand)));
+                        }
+                    }
+                }
+                "pg_catalog.int2" | "pg_catalog.smallint" => {
+                    let i = get_column_inner::<i16>(postgres_row, i, nullable)?.map(i32::from);
+                    row.push(Datum::from(i));
+                }
+                "pg_catalog.timestamp" => {
+                    let d: chrono::NaiveDateTime =
+                        get_column_inner::<chrono::NaiveDateTime>(postgres_row, i, nullable)?
+                            .unwrap();
+                    row.push(Datum::Timestamp(d));
+                }
+                "pg_catalog.timestamptz" => {
+                    let d: chrono::DateTime<Utc> =
+                        get_column_inner::<chrono::DateTime<Utc>>(postgres_row, i, nullable)?
+                            .unwrap();
+                    row.push(Datum::TimestampTz(d));
+                }
+                "pg_catalog.uuid" => {
+                    let u = get_column_inner::<Uuid>(postgres_row, i, nullable)?.unwrap();
+                    row.push(Datum::Uuid(u));
+                }
+                _ => bail!(
+                    "Postgres to materialize conversion not yet supported for {:?}",
+                    sql_type
+                ),
             }
-        }
-        DataType::Bytea => {
-            let bytes = get_column_inner::<Vec<u8>>(postgres_row, i, nullable)?;
-            row.push(bytes.as_deref().into());
-        }
-        DataType::Jsonb => {
-            let jsonb = get_column_inner::<Jsonb>(postgres_row, i, nullable)?;
-            if let Some(jsonb) = jsonb {
-                row.extend_by_row(&jsonb.0.into_row())
-            } else {
-                row.push(Datum::Null)
-            }
-        }
-        DataType::Uuid => {
-            let u = get_column_inner::<Uuid>(postgres_row, i, nullable)?.unwrap();
-            row.push(Datum::Uuid(u));
         }
         _ => bail!(
             "Postgres to materialize conversion not yet supported for {:?}",

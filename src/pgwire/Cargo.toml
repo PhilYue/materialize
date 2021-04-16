@@ -1,32 +1,32 @@
 [package]
 name = "pgwire"
 description = "A server for the PostgreSQL wire protocol."
-version = "0.1.0"
+version = "0.0.0"
 edition = "2018"
 publish = false
 
 [dependencies]
-anyhow = "1.0.34"
-byteorder = "1.3"
-bytes = "0.5"
-chrono = "0.4"
-comm = { path = "../comm" }
+anyhow = "1.0.40"
+async-trait = "0.1.48"
+byteorder = "1.4.3"
+bytes = "1.0.1"
+chrono = { version = "0.4.0", default-features = false, features = ["std"] }
 coord = { path = "../coord" }
 dataflow-types = { path = "../dataflow-types" }
 expr = { path = "../expr" }
-futures = "0.3"
-itertools = "0.9"
+futures = "0.3.13"
+itertools = "0.9.0"
 lazy_static = "1.4.0"
-log = "0.4.11"
-openssl = { version = "0.10.30", features = ["vendored"] }
-ordered-float = { version = "2.0.0", features = ["serde"] }
+log = "0.4.13"
+openssl = { version = "0.10.33", features = ["vendored"] }
+ordered-float = { version = "2.1.1", features = ["serde"] }
 ore = { path = "../ore" }
 pgrepr = { path = "../pgrepr" }
-prometheus = { git = "https://github.com/MaterializeInc/rust-prometheus.git", default-features = false, features = ["process"] }
-rand = "0.7"
+postgres = { git = "https://github.com/MaterializeInc/rust-postgres" }
+prometheus = { git = "https://github.com/MaterializeInc/rust-prometheus.git", default-features = false }
 repr = { path = "../repr" }
 sql = { path = "../sql" }
-tokio = "0.2"
-tokio-openssl = "0.4.0"
-tokio-util = { version = "0.3", features = ["codec"] }
-postgres = "0.17.5"
+tokio = "1.4.0"
+tokio-openssl = "0.6.1"
+tokio-stream = "0.1.5"
+tokio-util = { version = "0.6.5", features = ["codec"] }

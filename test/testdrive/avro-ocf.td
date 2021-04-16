@@ -32,9 +32,9 @@ a  b  mz_obj_no
 > SHOW COLUMNS FROM basic
 name       nullable  type
 -------------------------
-a          false     int8
-b          false     int4
-mz_obj_no  false     int8
+a          false     bigint
+b          false     integer
+mz_obj_no  false     bigint
 
 $ avro-ocf-write path=data-no-codec.ocf schema=${writer-schema}
 {"a": 1, "b": 2}
@@ -52,9 +52,9 @@ a  b  mz_obj_no
 > SHOW COLUMNS FROM basic_no_codec
 name       nullable  type
 -------------------------
-a          false     int8
-b          false     int4
-mz_obj_no  false     int8
+a          false     bigint
+b          false     integer
+mz_obj_no  false     bigint
 
 $ avro-ocf-write path=data-snappy.ocf schema=${writer-schema} codec=snappy
 {"a": 1, "b": 2}
@@ -72,9 +72,9 @@ a  b  mz_obj_no
 > SHOW COLUMNS FROM basic_snappy
 name       nullable  type
 -------------------------
-a          false     int8
-b          false     int4
-mz_obj_no  false     int8
+a          false     bigint
+b          false     integer
+mz_obj_no  false     bigint
 
 $ set reader-schema={
     "name": "row",
@@ -98,14 +98,14 @@ a  b  mz_obj_no
 > SHOW COLUMNS FROM reader_schema
 name       nullable  type
 -------------------------
-a          false     int8
-b          false     int8
-mz_obj_no  false     int8
+a          false     bigint
+b          false     bigint
+mz_obj_no  false     bigint
 
 ! CREATE MATERIALIZED SOURCE reader_schema
   FROM AVRO OCF '${testdrive.temp-dir}/data.ocf'
   WITH (reader_schema = '{"bad": "news", "bears"')
-validating avro ocf reader schema:
+validating avro value schema:
 
 > CREATE MATERIALIZED SOURCE tailed
   FROM AVRO OCF '${testdrive.temp-dir}/data.ocf' WITH (tail = true)
@@ -174,8 +174,8 @@ $ avro-ocf-write path=timestamp.ocf schema=${timestamp-schema}
 > SELECT * FROM timestamp_source
 d     ts ts_tz  mz_obj_no
 -------------------------
-"2000-02-01" "2000-02-01 10:10:10.000297" "2000-02-01 08:10:10.000232" 1
-"2000-01-01" "2000-01-01 10:10:10.000890" "2000-01-01 08:10:10.000857" 2
+"2000-02-01" "2000-02-01 10:10:10.111" "2000-02-01 08:10:10.111" 1
+"2000-01-01" "2000-01-01 10:10:10.111" "2000-01-01 08:10:10.111" 2
 
 > SHOW COLUMNS FROM timestamp_source
 name        nullable  type
@@ -183,7 +183,7 @@ name        nullable  type
 d           false     date
 ts          false     timestamp
 ts_tz       false     timestamp
-mz_obj_no   false     int8
+mz_obj_no   false     bigint
 
 > CREATE SINK basic_sink_${testdrive.seed} FROM basic
   INTO AVRO OCF '${testdrive.temp-dir}/basic-sink.ocf'

@@ -13,7 +13,8 @@
 //! set of columns that form unique keys for the input, the reduce
 //! can be simplified to a map operation.
 
-use crate::{RelationExpr, ScalarExpr, TransformArgs};
+use crate::TransformArgs;
+use expr::{MirRelationExpr, MirScalarExpr};
 
 /// Removes `Reduce` when the input has as unique keys the keys of the reduce.
 #[derive(Debug)]
@@ -22,7 +23,7 @@ pub struct ReduceElision;
 impl crate::Transform for ReduceElision {
     fn transform(
         &self,
-        relation: &mut RelationExpr,
+        relation: &mut MirRelationExpr,
         _: TransformArgs,
     ) -> Result<(), crate::TransformError> {
         relation.visit_mut(&mut |e| {
@@ -34,18 +35,19 @@ impl crate::Transform for ReduceElision {
 
 impl ReduceElision {
     /// Removes `Reduce` when the input has as unique keys the keys of the reduce.
-    pub fn action(&self, relation: &mut RelationExpr) {
-        if let RelationExpr::Reduce {
+    pub fn action(&self, relation: &mut MirRelationExpr) {
+        if let MirRelationExpr::Reduce {
             input,
             group_key,
             aggregates,
             monotonic: _,
+            expected_group_size: _,
         } = relation
         {
             let input_type = input.typ();
             if input_type.keys.iter().any(|keys| {
                 keys.iter()
-                    .all(|k| group_key.contains(&crate::ScalarExpr::Column(*k)))
+                    .all(|k| group_key.contains(&expr::MirScalarExpr::Column(*k)))
             }) {
                 use expr::{AggregateFunc, UnaryFunc, VariadicFunc};
                 use repr::Datum;
@@ -56,14 +58,11 @@ impl ReduceElision {
                         AggregateFunc::Count => {
                             let column_type = a.typ(&input_type);
                             a.expr.clone().call_unary(UnaryFunc::IsNull).if_then_else(
-                                ScalarExpr::literal_ok(
+                                MirScalarExpr::literal_ok(
                                     Datum::Int64(0),
-                                    column_type.scalar_type.clone().nullable(false),
+                                    column_type.scalar_type.clone(),
                                 ),
-                                ScalarExpr::literal_ok(
-                                    Datum::Int64(1),
-                                    column_type.scalar_type.nullable(false),
-                                ),
+                                MirScalarExpr::literal_ok(Datum::Int64(1), column_type.scalar_type),
                             )
                         }
 
@@ -72,8 +71,13 @@ impl ReduceElision {
                             a.expr.clone().call_unary(UnaryFunc::CastInt32ToInt64)
                         }
 
+                        // SumInt64 takes Int64s as input, but outputs Decimals.
+                        AggregateFunc::SumInt64 => {
+                            a.expr.clone().call_unary(UnaryFunc::CastInt64ToDecimal)
+                        }
+
                         // JsonbAgg takes _anything_ as input, but must output a Jsonb array.
-                        AggregateFunc::JsonbAgg => ScalarExpr::CallVariadic {
+                        AggregateFunc::JsonbAgg => MirScalarExpr::CallVariadic {
                             func: VariadicFunc::JsonbBuildArray,
                             exprs: vec![a.expr.clone()],
                         },

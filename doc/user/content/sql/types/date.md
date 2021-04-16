@@ -12,6 +12,8 @@ Detail | Info
 -------|------
 **Quick Syntax** | `DATE '2007-02-01'`
 **Size** | 1 byte
+**Catalog name** | `pg_catalog.date`
+**OID** | 1082
 **Min value** | 4713 BC
 **Max value** | 5874897 AD
 **Resolution** | 1 day
@@ -34,15 +36,17 @@ _tz&lowbar;offset_ | _(NOP)_ The timezone's distance, in hours, from UTC.
 
 You can [cast](../../functions/cast) `date` to:
 
-- [`text`](../text)
-- [`timestamp`](../timestamp)
-- [`timestamptz`](../timestamp)
+- [`text`](../text) (by assignment)
+- [`timestamp`](../timestamp) (implicitly)
+- [`timestamptz`](../timestamp) (implicitly)
 
 #### To `date`
 
-You can [cast](../../functions/cast) the following types to `date`:
+You can [cast](../../functions/cast) from the following types to `date`:
 
-- [`text`](../text)
+- [`text`](../text) (explicity)
+- [`timestamp`](../timestamp) (by assignment)
+- [`timestamptz`](../timestamp) (by assignment)
 
 ### Valid operations
 

@@ -10,6 +10,8 @@
 use std::error::Error;
 use std::fmt;
 
+use ore::str::StrExt;
+
 use crate::catalog::CatalogError;
 
 #[derive(Debug)]
@@ -24,6 +26,7 @@ pub enum PlanError {
     OverqualifiedDatabaseName(String),
     OverqualifiedSchemaName(String),
     Catalog(CatalogError),
+    UpsertSinkWithoutKey,
 }
 
 impl fmt::Display for PlanError {
@@ -36,8 +39,8 @@ impl fmt::Display for PlanError {
                 }
                 Ok(())
             }
-            Self::UnknownColumn(name) => write!(f, "column \"{}\" does not exist", name),
-            Self::AmbiguousColumn(name) => write!(f, "column name \"{}\" is ambiguous", name),
+            Self::UnknownColumn(name) => write!(f, "column {} does not exist", name.quoted()),
+            Self::AmbiguousColumn(name) => write!(f, "column name {} is ambiguous", name.quoted()),
             Self::MisqualifiedName(name) => write!(
                 f,
                 "qualified name did not have between 1 and 3 components: {}",
@@ -54,6 +57,7 @@ impl fmt::Display for PlanError {
                 name
             ),
             Self::Catalog(e) => write!(f, "{}", e),
+            Self::UpsertSinkWithoutKey => write!(f, "upsert sinks must specify a key"),
         }
     }
 }

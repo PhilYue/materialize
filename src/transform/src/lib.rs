@@ -10,7 +10,7 @@
 //! Transformations for relation expressions.
 //!
 //! This crate contains traits, types, and methods suitable for transforming
-//! `RelationExpr` types in ways that preserve semantics and improve performance.
+//! `MirRelationExpr` types in ways that preserve semantics and improve performance.
 //! The core trait is `Transform`, and many implementors of this trait can be
 //! boxed and iterated over. Some common transformation patterns are wrapped
 //! as `Transform` implementors themselves.
@@ -25,15 +25,15 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 
-use expr::{EvalError, GlobalId, IdGen, OptimizedRelationExpr, RelationExpr, ScalarExpr};
+use expr::MirRelationExpr;
+use expr::MirScalarExpr;
+use expr::{GlobalId, IdGen};
 
 pub mod column_knowledge;
 pub mod cse;
 pub mod demand;
-pub mod empty_map;
 pub mod fusion;
 pub mod inline_let;
-pub mod join_elision;
 pub mod join_implementation;
 pub mod map_lifting;
 pub mod nonnull_requirements;
@@ -45,10 +45,9 @@ pub mod reduce_elision;
 pub mod reduction;
 pub mod reduction_pushdown;
 pub mod redundant_join;
-pub mod split_predicates;
 pub mod topk_elision;
+pub mod union_cancel;
 pub mod update_let;
-// pub mod use_indexes;
 
 pub mod dataflow;
 pub use dataflow::optimize_dataflow;
@@ -59,7 +58,7 @@ pub struct TransformArgs<'a> {
     /// A shared instance of IdGen to allow constructing new Let expressions.
     pub id_gen: &'a mut IdGen,
     /// The indexes accessible.
-    pub indexes: &'a HashMap<GlobalId, Vec<(GlobalId, Vec<ScalarExpr>)>>,
+    pub indexes: &'a HashMap<GlobalId, Vec<(GlobalId, Vec<MirScalarExpr>)>>,
 }
 
 /// Types capable of transforming relation expressions.
@@ -67,16 +66,21 @@ pub trait Transform: std::fmt::Debug {
     /// Transform a relation into a functionally equivalent relation.
     fn transform(
         &self,
-        relation: &mut RelationExpr,
+        relation: &mut MirRelationExpr,
         args: TransformArgs,
     ) -> Result<(), TransformError>;
+    /// A string describing the transform.
+    ///
+    /// This is useful mainly when iterating through many `Box<Tranform>`
+    /// and one wants to judge progress before some defect occurs.
+    fn debug(&self) -> String {
+        format!("{:?}", self)
+    }
 }
 
 /// Errors that can occur during a transformation.
 #[derive(Debug, Clone)]
 pub enum TransformError {
-    /// An error resulting from evaluation of a `ScalarExpr`.
-    Eval(EvalError),
     /// An unstructured error.
     Internal(String),
 }
@@ -84,19 +88,12 @@ pub enum TransformError {
 impl fmt::Display for TransformError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            TransformError::Eval(e) => write!(f, "{}", e),
             TransformError::Internal(msg) => write!(f, "internal transform error: {}", msg),
         }
     }
 }
 
 impl Error for TransformError {}
-
-impl From<EvalError> for TransformError {
-    fn from(e: EvalError) -> TransformError {
-        TransformError::Eval(e)
-    }
-}
 
 /// A sequence of transformations iterated some number of times.
 #[derive(Debug)]
@@ -108,7 +105,7 @@ pub struct Fixpoint {
 impl Transform for Fixpoint {
     fn transform(
         &self,
-        relation: &mut RelationExpr,
+        relation: &mut MirRelationExpr,
         args: TransformArgs,
     ) -> Result<(), TransformError> {
         for _ in 0..self.limit {
@@ -161,8 +158,8 @@ impl Optimizer {
     /// Optimizes the supplied relation expression.
     fn transform(
         &self,
-        relation: &mut RelationExpr,
-        indexes: &HashMap<GlobalId, Vec<(GlobalId, Vec<ScalarExpr>)>>,
+        relation: &mut MirRelationExpr,
+        indexes: &HashMap<GlobalId, Vec<(GlobalId, Vec<MirScalarExpr>)>>,
     ) -> Result<(), TransformError> {
         let mut id_gen = Default::default();
         for transform in self.transforms.iter() {
@@ -183,26 +180,19 @@ impl Default for Optimizer {
         let transforms: Vec<Box<dyn crate::Transform + Send>> = vec![
             // The first block are peep-hole optimizations that simplify
             // the representation of the query and are largely uncontentious.
-            Box::new(crate::join_elision::JoinElision),
+            Box::new(crate::fusion::join::Join),
             Box::new(crate::inline_let::InlineLet),
             Box::new(crate::reduction::FoldConstants),
-            Box::new(crate::split_predicates::SplitPredicates),
             Box::new(crate::fusion::filter::Filter),
             Box::new(crate::fusion::map::Map),
             Box::new(crate::projection_extraction::ProjectionExtraction),
             Box::new(crate::fusion::project::Project),
             Box::new(crate::fusion::join::Join),
-            Box::new(crate::join_elision::JoinElision),
-            Box::new(crate::empty_map::EmptyMap),
             // Early actions include "no-brainer" transformations that reduce complexity in linear passes.
-            Box::new(crate::join_elision::JoinElision),
             Box::new(crate::reduction::FoldConstants),
             Box::new(crate::fusion::filter::Filter),
             Box::new(crate::fusion::map::Map),
             Box::new(crate::reduction::FoldConstants),
-            Box::new(crate::reduction::DeMorgans),
-            Box::new(crate::reduction::UndistributeAnd),
-            Box::new(crate::split_predicates::SplitPredicates),
             Box::new(crate::Fixpoint {
                 limit: 100,
                 transforms: vec![
@@ -214,8 +204,6 @@ impl Default for Optimizer {
                     Box::new(crate::fusion::project::Project),
                     Box::new(crate::fusion::map::Map),
                     Box::new(crate::fusion::union::Union),
-                    Box::new(crate::empty_map::EmptyMap),
-                    Box::new(crate::join_elision::JoinElision),
                     Box::new(crate::reduce_elision::ReduceElision),
                     Box::new(crate::inline_let::InlineLet),
                     Box::new(crate::update_let::UpdateLet),
@@ -227,13 +215,13 @@ impl Default for Optimizer {
                     Box::new(crate::reduction_pushdown::ReductionPushdown),
                     Box::new(crate::redundant_join::RedundantJoin),
                     Box::new(crate::topk_elision::TopKElision),
-                    Box::new(crate::reduction::NegatePredicate),
                     Box::new(crate::demand::Demand),
+                    Box::new(crate::union_cancel::UnionBranchCancellation),
                 ],
             }),
             // As a final logical action, convert any constant expression to a constant.
             // Some optimizations fight against this, and we want to be sure to end as a
-            // `RelationExpr::Constant` if that is the case, so that subsequent use can
+            // `MirRelationExpr::Constant` if that is the case, so that subsequent use can
             // clearly see this.
             Box::new(crate::reduction::FoldConstants),
             // TODO (wangandi): materialize#616 the FilterEqualLiteral transform
@@ -245,6 +233,8 @@ impl Default for Optimizer {
                 transforms: vec![
                     Box::new(crate::projection_lifting::ProjectionLifting),
                     Box::new(crate::join_implementation::JoinImplementation),
+                    Box::new(crate::column_knowledge::ColumnKnowledge),
+                    Box::new(crate::reduction::FoldConstants),
                     Box::new(crate::fusion::filter::Filter),
                     Box::new(crate::demand::Demand),
                     Box::new(crate::map_lifting::LiteralLifting),
@@ -265,27 +255,24 @@ impl Optimizer {
     /// Optimizes the supplied relation expression.
     pub fn optimize(
         &mut self,
-        mut relation: RelationExpr,
-        indexes: &HashMap<GlobalId, Vec<(GlobalId, Vec<ScalarExpr>)>>,
-    ) -> Result<OptimizedRelationExpr, TransformError> {
+        mut relation: MirRelationExpr,
+        indexes: &HashMap<GlobalId, Vec<(GlobalId, Vec<MirScalarExpr>)>>,
+    ) -> Result<expr::OptimizedMirRelationExpr, TransformError> {
         self.transform(&mut relation, indexes)?;
-        Ok(expr::OptimizedRelationExpr(relation))
+        Ok(expr::OptimizedMirRelationExpr(relation))
     }
 
     /// Simple fusion and elision transformations to render the query readable.
     pub fn pre_optimization() -> Self {
         let transforms: Vec<Box<dyn crate::Transform + Send>> = vec![
-            Box::new(crate::join_elision::JoinElision),
+            Box::new(crate::fusion::join::Join),
             Box::new(crate::inline_let::InlineLet),
             Box::new(crate::reduction::FoldConstants),
-            Box::new(crate::split_predicates::SplitPredicates),
             Box::new(crate::fusion::filter::Filter),
             Box::new(crate::fusion::map::Map),
             Box::new(crate::projection_extraction::ProjectionExtraction),
             Box::new(crate::fusion::project::Project),
             Box::new(crate::fusion::join::Join),
-            Box::new(crate::join_elision::JoinElision),
-            Box::new(crate::empty_map::EmptyMap),
         ];
         Self { transforms }
     }

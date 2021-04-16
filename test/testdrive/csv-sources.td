@@ -13,6 +13,13 @@ Rochester,NY,14618
 New York,NY,10004
 "bad,place""",CA,92679
 
+# We should refuse to create a source with invalid WITH options
+! CREATE SOURCE invalid_with_option
+  FROM FILE '${testdrive.temp-dir}/static.csv'
+  WITH (badoption=true)
+  FORMAT CSV WITH 3 COLUMNS
+unexpected parameters for CREATE SOURCE: badoption
+
 # Static CSV without headers.
 > CREATE MATERIALIZED SOURCE static_csv
   FROM FILE '${testdrive.temp-dir}/static.csv'
@@ -100,3 +107,30 @@ Source error: File IO:
 
 ! CREATE SOURCE should_fail FROM FILE '/'
 / is a directory.
+
+# Static malformed CSV
+$ file-append path=malformed.csv
+Dollars,Category
+5161669,Clothing&Shoes
+1000000000
+,badrow
+badint,
+
+> CREATE MATERIALIZED SOURCE malformed_csv
+  FROM FILE '${testdrive.temp-dir}/malformed.csv'
+  FORMAT CSV WITH HEADER
+
+! SELECT * FROM malformed_csv
+Decode error: Text: CSV error at lineno 3: expected 2 columns, got 1.
+
+# Static non-utf-8 CSV
+$ file-append path=bad-text.csv
+Dollars,Category
+5161669,\x80
+
+> CREATE MATERIALIZED SOURCE bad_text_csv
+  FROM FILE '${testdrive.temp-dir}/bad-text.csv'
+  FORMAT CSV WITH HEADER
+
+! SELECT * FROM bad_text_csv
+Decode error: Text: CSV error at lineno 2: invalid UTF-8

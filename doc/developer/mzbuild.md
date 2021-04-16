@@ -4,9 +4,6 @@ mzbuild is an build and orchestration system for [Docker] containers.
 
 As a user or developer, you'll interact with mzbuild through three commands:
 
-  * [**`mzconduct`**](#mzconduct) is a layer on top of `mzcompose` which adds the ability
-    to run complex workflows on top of [Docker Compose].
-
   * [**`mzcompose`**](#mzcompose) is a thin layer on top of [Docker Compose]
     that automatically downloads cached images from Docker Hub if available, or
     otherwise builds them locally if you've made changes to the inputs of the
@@ -195,7 +192,7 @@ If you're unfamiliar with Compose, you may want to take a look at the
 Now bring the configuration up with `bin/mzcompose`:
 
 ```shell
-$ bin/mzcompose -f test/fancy/mzcompose.yml up
+$ bin/mzcompose --mz-find fancy up
 ==> Collecting mzbuild dependencies
 materialize/billing-demo:FM4STU42G7W44OLAPKZNEZWGEPTMIVE6
 materialize/fancy-loadgen:Z2GPU4TQMCV2PGFTNUPYLQO2PQAYD6OY
@@ -205,6 +202,10 @@ Attaching to fancy_fancy_1
 fancy_1  | 🎩 load
 fancy_fancy_1 exited with code 0
 ```
+
+The argument you pass to `--mz-find` is the name of the directory containing the
+`mzcompose.yml`. Don't worry: if this directory name is not unique across the
+entire repository, `mzcompose` will complain.
 
 Notice how `mzcompose` automatically acquired images for not just
 `fancy-loadgen` but all of its dependencies before delegating to Docker Compose
@@ -290,11 +291,50 @@ services:
     image: zookeeper:3.4.13
 ```
 
-### `mzconduct`
+A common complaint with Docker Compose is the lack of proper service
+orchestration. It is not possible to express, for exaple, that the `fancy`
+service cannot be started until `materialized` has booted successfully.
 
-The primary feature that mzconduct provides is set of actions that can be configured
-inside of mzcompose.yml files. While docs are coming soon, see the [chbench demo
-mzcompose](../../demo/chbench/mzcompose.yml) for an example.
+`mzcompose` therefore provides a feature called "workflows" that orchestrate
+interacting with the defined services. The following `load-test` workflow waits
+for `materialized` to start listening on port 6875 before launching the `fancy`
+service.
+
+```
+version: "3.7"
+
+services:
+  fancy:
+    mzbuild: fancy-loadgen
+  materialized:
+    mzbuild: materialized
+
+mzworkflows:
+  load-test:
+    steps:
+    - step: start-services
+      services: [materialized]
+    - step: wait-for-tcp
+      host: materialized
+      port: 6875
+    - step: start-services
+      services: [fancy-loadgen]
+```
+
+To run the workflow, run `./mzcompose run load-test`, just like you would if
+`load-test` were a normal service.
+
+#### Release vs Development Builds
+
+Via `mzbuild`, `mzcompose` supports building binaries in either release or
+development mode. By default, binaries are built using release mode. You can
+specify the desired flavor by passing the `--mz-build-mode` flag to
+`mzcompose`:
+
+```shell
+$ bin/mzcompose --mz-build-mode=dev --mz-find fancy up
+$ bin/mzcompose --mz-build-mode=release --mz-find fancy up
+```
 
 ## Input addressability
 
@@ -316,16 +356,19 @@ any non-alphanumeric characters.)
 
 ## Development
 
-mzbuild is a Python 3 library that lives in
-[misc/python/mzbuild.py](/misc/python). Its only dependency is Python 3.5+,
-which is easy to find or pre-installed on most Linux distributions, and
-pre-installed on recent versions of macOS, too. Python dependencies are
-automatically installed into a virtualenv by the [pyactivate wrapper
-script](/bin/pyactivate).
+mzbuild and mzcompose are Python 3 libraries that lives in
+[misc/python/materialize/cli](/misc/python/materialize/cli).
+
+Its only dependency is Python 3.5+, which is easy to find or pre-installed on
+most Linux distributions, and pre-installed on recent versions of macOS, too.
+Python dependencies are automatically installed into a virtualenv by the
+[pyactivate wrapper script](/bin/pyactivate).
 
 Using Python 3.6 would be a good bit more convenient, but our CI image runs on
 Ubuntu 16.04, which is still shipping Python 3.5. Supporting the oldest Ubuntu
 LTS release seems like a decent baseline, anyway.
+
+Integration tests for `mzcompose` are in [`test/mzcompose`](/test/mzcompose).
 
 ## Reference
 
@@ -356,7 +399,23 @@ publish: true
 * `pre-image` (map) specifies a plugin to run *before* invoking `docker build`.
   This is where the magic happens for Rust code.
 
-  At the moment `pre-image` only supports two plugins:
+  At the moment `pre-image` only supports three plugins:
+
+  * `type: copy` recursively copies the contents of a directory into the mzbuild
+     context.
+
+     The `source` field specifies the directory from which files should be
+     copied. It is relative to the root of the repository. The `destination`
+     field specifies the directory into which files should be copied. It is
+     relative to the mzbuild context. Both fields are required.
+
+     The name of the file in the `destination` directory will be the name of the
+     file in the `source` directory with the `source` prefix removed. So a file
+     named `/path/to/source/a/b/c.ext` will be copied into
+     `/path/to/destination/a/b/c.ext`.
+
+     The optional `matching` field specifies a glob that determines which
+     files in the `source` directory to copy.
 
   *  `type: cargo-bin` builds a Rust binary with Cargo. The `bin` field
      indicates the name of the binary target in the Cargo workspace to build.
@@ -368,10 +427,10 @@ publish: true
      inputs to the build, plus the top-level `Cargo.toml`, `Cargo.lock`, and
      `.cargo/config` files.
 
-     Cargo is invoked with the `--release` flag if the `BUILD_MODE`
-     environment variable is `release` (the default; set to `debug`
-     for a non-release binary). The binary will be stripped of debug
-     information unless `strip: false` is requested.
+     Cargo is invoked with the `--release` flag if the `--mz-build-mode` flag
+     variable is `release` (the default; set to `dev` for a non-release
+     binary). The binary will be stripped of debug information unless `strip:
+     false` is requested.
 
      In rare cases, it may be necessary to extract files from the build
      directory of a dependency. The `extract` key specifies a mapping from a
@@ -426,6 +485,14 @@ services:
   materialized:
     mzbuild: materialized
     propagate-uid-gid: true
+
+mzworkflows:
+  NAME:
+    env:
+      KEY: VALUE
+    steps:
+    - step: STEP-NAME
+      STEP-OPTION: STEP-OPTION-VALUE
 ```
 
 #### Fields
@@ -440,6 +507,92 @@ services:
 * `propagate-uid-gid` (bool) requests that the Docker image be run with the user
   ID and group ID of the host user. It is equivalent to passing `--user $(id
   -u):$(id -g)` to `docker run`. The default is `false`.
+
+* `mzworkflows` (dict) specifies a named set of workflows. A workflow consists
+  of a series of steps that are executed in sequence and a set of environment
+  variables that are set during the execution of the workflow. The available
+  steps and their options are only documented by way of the developer docs.
+  See <https://mtrlz.dev/api/python/materialize/mzcompose.html>.
+
+  Also see the [chbench demo mzcompose](../../demo/chbench/mzcompose.yml) for
+  a detailed example.
+
+#### Bash-like Environment Substitution
+
+`mzcompose` performs "bash-like" variable substitution within workflows (for `services` the block,
+docker-compose is responsible for [variable
+substitution](https://docs.docker.com/compose/compose-file/compose-file-v3/#variable-substitution)).
+For example, you can define the following workflow, and it will pull `MZ_WORKERS` from your
+environment:
+
+```yaml
+mzworkflows:
+  example_workflow:
+    env:
+      # Use MZ_WORKERS from the environment. If not set, default to empty string
+      MZ_WORKERS: ${MZ_WORKERS}
+    steps:
+    - step: STEP-NAME
+      STEP-OPTION: STEP-OPTION-VALUE
+```
+
+The variable substitution can occur anywhere with the workflow specification:
+
+```yaml
+mzworkflows:
+  example_workflow:
+    env:
+      # Use MZ_WORKERS from the environment. If not set, default to empty string
+      MZ_WORKERS: ${MZ_WORKERS}
+    steps:
+    - step: STEP-NAME
+      STEP-OPTION: ${MZ_WORKERS}
+```
+
+Support for default values similarly as it does in bash, but the full syntax is not supported. At
+the moment, `mzcompose` only supports default replacement via the `:-` operator and only for
+variables using the `${VARIABLE}` syntax:
+
+```yaml
+mzworkflows:
+  example_workflow:
+    env:
+      # If MZ_WORKERS is set, use the value from the environment. Otherwise use 16
+      MZ_WORKERS: ${MZ_WORKERS:-16}
+    steps:
+    - step: STEP-NAME
+      STEP-OPTION: STEP-OPTION-VALUE
+```
+
+For workflows triggered by another workflow, variables substitution occurs at the time the
+workflow is triggered (as opposed to when the composition is loaded). This means that you can set
+an environment variable in one workflow and it will be picked up by the second workflow:
+
+```yaml
+mzworkflows:
+  workflow1:
+    env:
+      # Explicitly set the value to 16, ignoring the parent environment
+      MZ_WORKERS: 16
+    steps:
+    - step: workflow
+      workflow: workflow2
+  workflow2:
+    env:
+      # MZ_WORKERS will be 16 if called from workflow1
+      # If not called from workflow1, it pull the value from the environment or default
+      MZ_WORKERS: ${MZ_WORKERS:-32}
+    steps:
+    - step: STEP-NAME
+      STEP-OPTION: STEP-OPTION-VALUE
+```
+
+The preference order for variable subsitution is:
+
+1. The value specified by the mzworkflow.
+2. The value specified by the environment.
+3. The default value specified where the variable is being used.
+4. Empty string.
 
 ### mzbuild Dockerfile
 
@@ -463,14 +616,6 @@ COPY --from=0 ...
   specified mzbuild image. It is like the vanilla Dockerfile [FROM
   command][dockerfile-from], except that the image named must be a valid mzbuild
   image in the repository, not a vanilla Docker image.
-
-### Environment Variables
-
-The following environment variables are supported by all commands:
-
-* `BUILD_MODE` can be set to `release` (the default) or `debug`. If Cargo
-  needs to build a Rust binary, `--release` will only be passed if set to
-  `release`.
 
 ## Motivation
 

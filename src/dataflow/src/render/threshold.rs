@@ -14,19 +14,19 @@ use differential_dataflow::trace::implementations::ord::OrdValSpine;
 use timely::dataflow::Scope;
 use timely::progress::{timestamp::Refines, Timestamp};
 
-use expr::RelationExpr;
+use expr::MirRelationExpr;
 use repr::Row;
 
 use crate::render::context::{ArrangementFlavor, Context};
 
-impl<G, T> Context<G, RelationExpr, Row, T>
+impl<G, T> Context<G, MirRelationExpr, Row, T>
 where
     G: Scope,
     G::Timestamp: Lattice + Refines<T>,
     T: Timestamp + Lattice,
 {
-    pub fn render_threshold(&mut self, relation_expr: &RelationExpr) {
-        if let RelationExpr::Threshold { input } = relation_expr {
+    pub fn render_threshold(&mut self, relation_expr: &MirRelationExpr) {
+        if let MirRelationExpr::Threshold { input } = relation_expr {
             // TODO: re-use and publish arrangement here.
             let arity = input.arity();
             let keys = (0..arity).collect::<Vec<_>>();
@@ -38,10 +38,12 @@ where
                 let keys2 = keys.clone();
                 let ok_keyed = ok_built
                     .map({
-                        let mut row_packer = repr::RowPacker::new();
                         move |row| {
                             let datums = row.unpack();
-                            let key_row = row_packer.pack(keys2.iter().map(|i| datums[*i]));
+                            let iterator = keys2.iter().map(|i| datums[*i]);
+                            let total_size = repr::datums_size(iterator.clone());
+                            let mut key_row = Row::with_capacity(total_size);
+                            key_row.extend(iterator);
                             (key_row, row)
                         }
                     })

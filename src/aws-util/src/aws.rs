@@ -7,39 +7,117 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-//! Utility mod for AWS.
+//! Utility functions for AWS.
 
-use std::time::Duration;
-
+use anyhow::{anyhow, Context};
 use rusoto_core::Region;
-use rusoto_credential::{AwsCredentials, ChainProvider, ProvideAwsCredentials};
+use rusoto_credential::{
+    AutoRefreshingProvider, AwsCredentials, ChainProvider, ProvideAwsCredentials, StaticProvider,
+};
 use rusoto_sts::{GetCallerIdentityRequest, Sts, StsClient};
+use serde::{Deserialize, Serialize};
+use tokio::time::{self, Duration};
+
+/// Information required to connnect to AWS
+///
+/// Credentials are optional because in most cases users should use the
+/// [`ChainProvider`] to pull information from the process or AWS environment.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectInfo {
+    /// The AWS Region to connect to
+    pub region: Region,
+    /// Credentials, if missing will be obtained from environment
+    pub credentials: Option<Credentials>,
+}
+
+/// A thin dupe of [`AwsCredentials`] so we can impl Serialize
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Credentials {
+    key: String,
+    secret: String,
+    token: Option<String>,
+}
+
+impl From<Credentials> for AwsCredentials {
+    fn from(creds: Credentials) -> AwsCredentials {
+        AwsCredentials::new(creds.key, creds.secret, creds.token, None)
+    }
+}
+
+impl ConnectInfo {
+    /// Construct a ConnectInfo
+    pub fn new(
+        region: Region,
+        key: Option<String>,
+        secret: Option<String>,
+        token: Option<String>,
+    ) -> Result<ConnectInfo, anyhow::Error> {
+        match (key, secret) {
+            (Some(key), Some(secret)) => Ok(ConnectInfo {
+                region,
+                credentials: Some(Credentials { key, secret, token }),
+            }),
+            (None, None) => Ok(ConnectInfo {
+                region,
+                credentials: None,
+            }),
+            (_, _) => {
+                anyhow::bail!(
+                    "Both aws_acccess_key_id and aws_secret_access_key \
+                               must be provided, or neither"
+                );
+            }
+        }
+    }
+}
 
 /// Fetches the AWS account number of the caller via AWS Security Token Service.
 ///
-/// For details about STS, see AWS documentation.
-pub async fn account(timeout: Duration) -> Result<String, anyhow::Error> {
-    let sts_client = StsClient::new(Region::default());
+/// For details about STS, see [AWS documentation][].
+///
+/// [AWS documentation]: https://docs.aws.amazon.com/STS/latest/APIReference/API_GetCallerIdentity.html
+pub async fn account(
+    provider: impl ProvideAwsCredentials + Send + Sync + 'static,
+    region: Region,
+    timeout: Duration,
+) -> Result<String, anyhow::Error> {
+    let dispatcher =
+        crate::client::http().context("creating HTTP client for AWS STS Account verification")?;
+    let sts_client = StsClient::new_with(dispatcher, provider, region);
     let get_identity = sts_client.get_caller_identity(GetCallerIdentityRequest {});
-    let account = tokio::time::timeout(timeout, get_identity)
+    let account = time::timeout(timeout, get_identity)
         .await
-        .map_err(|e: tokio::time::Elapsed| {
-            anyhow::Error::new(e)
-                .context("timeout while retrieving AWS account number from STS".to_owned())
-        })?
-        .map_err(|e| anyhow::Error::new(e).context("retrieving AWS account ID".to_owned()))?
+        .context("timeout while retrieving AWS account number from STS".to_owned())?
+        .context("retrieving AWS account ID")?
         .account
-        .ok_or_else(|| anyhow::Error::msg("AWS did not return account ID".to_owned()))?;
+        .ok_or_else(|| anyhow!("AWS did not return account ID"))?;
     Ok(account)
 }
 
-/// Fetches AWS credentials by consulting several known sources.
+/// Verify that the provided credentials are legitimate
 ///
-/// For details about where AWS credentials can be stored, see Rusoto's
-/// [`ChainProvider`] documentation.
-pub async fn credentials(timeout: Duration) -> Result<AwsCredentials, anyhow::Error> {
-    let mut provider = ChainProvider::new();
-    provider.set_timeout(timeout);
-    let credentials = provider.credentials().await?;
-    Ok(credentials)
+/// This uses an [always-valid][] API request to check that the AWS credentials
+/// provided are recognized by AWS. It does not verify that the credentials can
+/// perform all of the actions required for any specific source.
+///
+/// [always-valid]: https://docs.aws.amazon.com/STS/latest/APIReference/API_GetCallerIdentity.html
+pub async fn validate_credentials(
+    conn_info: ConnectInfo,
+    timeout: Duration,
+) -> Result<(), anyhow::Error> {
+    if let Some(creds) = conn_info.credentials {
+        let provider = StaticProvider::from(AwsCredentials::from(creds));
+        account(provider.clone(), conn_info.region, timeout)
+            .await
+            .context("Using statically provided credentials")?;
+    } else {
+        let mut provider = ChainProvider::new();
+        provider.set_timeout(Duration::from_secs(10));
+        let provider =
+            AutoRefreshingProvider::new(provider).context("generating AWS credentials")?;
+        account(provider.clone(), conn_info.region, timeout)
+            .await
+            .context("Looking through the environment for credentials")?;
+    }
+    Ok(())
 }

@@ -7,6 +7,8 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+use std::convert::TryFrom;
+
 use rusqlite::params;
 use rusqlite::types::{FromSql, FromSqlError, ToSql, ToSqlOutput, Value, ValueRef};
 use rusqlite::OptionalExtension;
@@ -90,6 +92,19 @@ const MIGRATIONS: &[&str] = &[
         name TEXT PRIMARY KEY,
         value TEXT
     );",
+    // Creates the roles table and a default "materialize" user.
+    //
+    // Introduced in v0.7.0.
+    "CREATE TABLE roles (
+        id   integer PRIMARY KEY,
+        name text NOT NULL UNIQUE
+    );
+    INSERT INTO roles VALUES (1, 'materialize');",
+    // Makes the mz_internal schema literal so it can store functions.
+    //
+    // Introduced in v0.7.0.
+    "INSERT INTO schemas (database_id, name) VALUES
+        (NULL, 'mz_internal');",
     // Add new migrations here.
     //
     // Migrations should be preceded with a comment of the following form:
@@ -114,10 +129,7 @@ pub struct Connection {
 
 impl Connection {
     pub fn open(config: &Config) -> Result<(Connection, bool, Uuid), Error> {
-        let mut sqlite = match &config.path {
-            Some(path) => rusqlite::Connection::open(path)?,
-            None => rusqlite::Connection::open_in_memory()?,
-        };
+        let mut sqlite = rusqlite::Connection::open(&config.path)?;
 
         // Validate application ID.
         let tx = sqlite.transaction()?;
@@ -138,7 +150,7 @@ impl Connection {
 
         // Run unapplied migrations. The `user_version` field stores the index
         // of the last migration that was run.
-        let version: i32 = sqlite.query_row("PRAGMA user_version", params![], |row| row.get(0))?;
+        let version: u32 = sqlite.query_row("PRAGMA user_version", params![], |row| row.get(0))?;
         for (i, sql) in MIGRATIONS
             .iter()
             .enumerate()
@@ -212,11 +224,8 @@ impl Connection {
             }
             // Reading existing catalog
             (Some(cs), None) => Ok(cs.parse::<usize>().unwrap() != 0),
-            // Shouldn't happen!
-            (None, None) => {
-                tx.commit()?;
-                panic!("experimental_mode not set in catalog and not provided on server init")
-            }
+            // Test code that doesn't care. Just disable experimental mode.
+            (None, None) => Ok(false),
         };
         tx.commit()?;
         res
@@ -251,6 +260,41 @@ impl Connection {
         res
     }
 
+    pub fn get_catalog_content_version(&mut self) -> Result<usize, Error> {
+        let tx = self.inner.transaction()?;
+        let current_setting: Option<u32> = tx
+            .query_row(
+                "SELECT CAST(value AS int) FROM settings WHERE name = 'catalog_content_version';",
+                params![],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let version = match current_setting {
+            Some(v) => v,
+            None => {
+                tx.execute(
+                    "INSERT INTO settings (name, value) VALUES ('catalog_content_version', 0);",
+                    params![],
+                )?;
+                0
+            }
+        };
+        tx.commit()?;
+        Ok(usize::cast_from(version))
+    }
+
+    pub fn set_catalog_content_version(&mut self, new_version: usize) -> Result<(), Error> {
+        let tx = self.inner.transaction()?;
+        tx.execute(
+            "UPDATE settings SET value = ? WHERE name = 'catalog_content_version'",
+            params![
+                u32::try_from(new_version).expect("fewer than u32::MAX catalog content migrations")
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn load_databases(&self) -> Result<Vec<(i64, String)>, Error> {
         self.inner
             .prepare("SELECT id, name FROM databases")?
@@ -274,6 +318,17 @@ impl Connection {
                 let database_name: Option<String> = row.get(1)?;
                 let schema_name: String = row.get(2)?;
                 Ok((id, database_name, schema_name))
+            })?
+            .collect()
+    }
+
+    pub fn load_roles(&self) -> Result<Vec<(i64, String)>, Error> {
+        self.inner
+            .prepare("SELECT id, name FROM roles")?
+            .query_and_then(params![], |row| -> Result<_, Error> {
+                let id: i64 = row.get(0)?;
+                let name: String = row.get(1)?;
+                Ok((id, name))
             })?
             .collect()
     }
@@ -390,6 +445,20 @@ impl Transaction<'_> {
         }
     }
 
+    pub fn insert_role(&mut self, role_name: &str) -> Result<i64, Error> {
+        match self
+            .inner
+            .prepare_cached("INSERT INTO roles (name) VALUES (?)")?
+            .execute(params![role_name])
+        {
+            Ok(_) => Ok(self.inner.last_insert_rowid()),
+            Err(err) if is_constraint_violation(&err) => Err(Error::new(
+                ErrorKind::RoleAlreadyExists(role_name.to_owned()),
+            )),
+            Err(err) => Err(err.into()),
+        }
+    }
+
     pub fn insert_item(
         &self,
         id: GlobalId,
@@ -435,6 +504,19 @@ impl Transaction<'_> {
             Ok(())
         } else {
             Err(SqlCatalogError::UnknownSchema(schema_name.to_owned()).into())
+        }
+    }
+
+    pub fn remove_role(&self, name: &str) -> Result<(), Error> {
+        let n = self
+            .inner
+            .prepare_cached("DELETE FROM roles WHERE name = ?")?
+            .execute(params![name])?;
+        assert!(n <= 1);
+        if n == 1 {
+            Ok(())
+        } else {
+            Err(SqlCatalogError::UnknownRole(name.to_owned()).into())
         }
     }
 

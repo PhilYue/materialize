@@ -1,29 +1,18 @@
 [package]
 name = "fuzz"
-description = "Fuzz testing for Materialize."
 version = "0.0.1"
-edition = "2018"
 publish = false
-
-[package.metadata]
-cargo-fuzz = true
-
-[[bin]]
-name = "fuzz_testdrive"
-path = "fuzz_targets/fuzz_testdrive.rs"
-
-[[bin]]
-name = "fuzz_sqllogictest"
-path = "fuzz_targets/fuzz_sqllogictest.rs"
-
-[[bin]]
-name = "build_corpus"
-path = "bin/build_corpus.rs"
+edition = "2018"
 
 [dependencies]
-libfuzzer-sys = "0.3"
-rand = { version = "0.7.3", features = ["small_rng"] }
-sqllogictest = { path = "../src/sqllogictest" }
-testdrive = { path = "../src/testdrive" }
-tokio = "0.2"
-walkdir = "2"
+honggfuzz = "0.5"
+repr = { path = "../src/repr" }
+sql-parser = { path = "../src/sql-parser" }
+
+[[bin]]
+name = "fuzz_parse_statements"
+path = "fuzz_targets/fuzz_parse_statements.rs"
+
+[[bin]]
+name = "fuzz_parse_time"
+path = "fuzz_targets/fuzz_parse_time.rs"

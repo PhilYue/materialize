@@ -75,9 +75,9 @@ impl SexpParser {
     }
 
     fn is_atom_char(ch: char) -> bool {
-        ch >= 'a' && ch <= 'z'
-            || ch >= 'A' && ch <= 'Z'
-            || ch >= '0' && ch <= '9'
+        ('a'..='z').contains(&ch)
+            || ('A'..='Z').contains(&ch)
+            || ('0'..='9').contains(&ch)
             || ch == '-'
             || ch == '_'
             || ch == '#'
@@ -128,13 +128,20 @@ impl SexpParser {
 
 #[cfg(test)]
 mod tests {
-    use super::{Sexp, SexpParser};
-    use anyhow::{anyhow, bail, Error};
-    use expr::{GlobalId, Id, IdHumanizer, JoinImplementation, LocalId, RelationExpr, ScalarExpr};
-    use repr::{ColumnType, Datum, RelationType, Row, ScalarType};
     use std::collections::HashMap;
     use std::fmt::Write;
+
+    use anyhow::{anyhow, bail, Error};
+
+    use expr::explain::ViewExplanation;
+    use expr::{
+        DummyHumanizer, ExprHumanizer, GlobalId, Id, JoinImplementation, LocalId, MirRelationExpr,
+        MirScalarExpr,
+    };
+    use repr::{ColumnType, Datum, RelationType, Row, ScalarType};
     use transform::{Optimizer, Transform, TransformArgs};
+
+    use super::{Sexp, SexpParser};
 
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
     enum TestType {
@@ -177,26 +184,34 @@ mod tests {
 
     #[derive(Debug)]
     struct TestCatalog {
-        objects: HashMap<String, (Id, RelationType)>,
-        names: HashMap<Id, String>,
+        objects: HashMap<String, (GlobalId, RelationType)>,
+        names: HashMap<GlobalId, String>,
     }
 
     impl<'a> TestCatalog {
         fn insert(&mut self, name: &str, typ: RelationType) {
             // TODO(justin): error on dup name?
-            let id = Id::Global(GlobalId::User(self.objects.len() as u64));
+            let id = GlobalId::User(self.objects.len() as u64);
             self.objects.insert(name.to_string(), (id, typ));
             self.names.insert(id, name.to_string());
         }
 
-        fn get(&'a self, name: &str) -> Option<&'a (Id, RelationType)> {
+        fn get(&'a self, name: &str) -> Option<&'a (GlobalId, RelationType)> {
             self.objects.get(name)
         }
     }
 
-    impl IdHumanizer for TestCatalog {
-        fn humanize_id(&self, id: Id) -> Option<String> {
+    impl ExprHumanizer for TestCatalog {
+        fn humanize_id(&self, id: GlobalId) -> Option<String> {
             self.names.get(&id).map(|s| s.to_string())
+        }
+
+        fn humanize_scalar_type(&self, ty: &ScalarType) -> String {
+            DummyHumanizer.humanize_scalar_type(ty)
+        }
+
+        fn humanize_column_type(&self, ty: &ColumnType) -> String {
+            DummyHumanizer.humanize_column_type(ty)
         }
     }
 
@@ -244,7 +259,11 @@ mod tests {
         }
     }
 
-    fn build_rel(s: Sexp, catalog: &TestCatalog, scope: &mut Scope) -> Result<RelationExpr, Error> {
+    fn build_rel(
+        s: Sexp,
+        catalog: &TestCatalog,
+        scope: &mut Scope,
+    ) -> Result<MirRelationExpr, Error> {
         // TODO(justin): cleaner destructuring of a sexp here: this is too lenient at the moment,
         // since extra arguments to an operator are ignored.
         match try_atom(&nth(&s, 0)?)?.as_str() {
@@ -252,11 +271,11 @@ mod tests {
             "get" => {
                 let name = try_atom(&nth(&s, 1)?)?;
                 match scope.get(&name) {
-                    Some((id, typ)) => Ok(RelationExpr::Get { id, typ }),
+                    Some((id, typ)) => Ok(MirRelationExpr::Get { id, typ }),
                     None => match catalog.get(&name) {
                         None => Err(anyhow!("no catalog object named {}", name)),
-                        Some((id, typ)) => Ok(RelationExpr::Get {
-                            id: id.clone(),
+                        Some((id, typ)) => Ok(MirRelationExpr::Get {
+                            id: Id::Global(*id),
                             typ: typ.clone(),
                         }),
                     },
@@ -277,19 +296,19 @@ mod tests {
                     scope.remove(&name)
                 }
 
-                Ok(RelationExpr::Let {
+                Ok(MirRelationExpr::Let {
                     id,
                     value: Box::new(value),
                     body: Box::new(body),
                 })
             }
             // (map <input> [expressions])
-            "map" => Ok(RelationExpr::Map {
+            "map" => Ok(MirRelationExpr::Map {
                 input: Box::new(build_rel(nth(&s, 1)?, catalog, scope)?),
                 scalars: build_scalar_list(nth(&s, 2)?)?,
             }),
             // (project <input> [<col refs>])
-            "project" => Ok(RelationExpr::Project {
+            "project" => Ok(MirRelationExpr::Project {
                 input: Box::new(build_rel(nth(&s, 1)?, catalog, scope)?),
                 outputs: try_list(nth(&s, 2)?)?
                     .into_iter()
@@ -299,7 +318,6 @@ mod tests {
             // (constant [<rows>] [<types>])
             "constant" => {
                 // TODO(justin): ...fix this.
-                let mut row_packer = repr::RowPacker::new();
                 let rows: Vec<(Row, isize)> = try_list(nth(&s, 1)?)?
                     .into_iter()
                     .map(try_list)
@@ -308,16 +326,16 @@ mod tests {
                     .map(|e| {
                         e.into_iter()
                             .map(build_scalar)
-                            .collect::<Result<Vec<ScalarExpr>, Error>>()
+                            .collect::<Result<Vec<MirScalarExpr>, Error>>()
                     })
-                    .collect::<Result<Vec<Vec<ScalarExpr>>, Error>>()?
+                    .collect::<Result<Vec<Vec<MirScalarExpr>>, Error>>()?
                     .iter()
                     .map(move |exprs| {
-                        Ok(row_packer.pack(
-                            exprs
+                        Ok(Row::pack_slice(
+                            &exprs
                                 .iter()
                                 .map(|e| match e {
-                                    ScalarExpr::Literal(r, _) => {
+                                    MirScalarExpr::Literal(r, _) => {
                                         Ok(r.as_ref().unwrap().iter().next().unwrap().clone())
                                     }
                                     _ => bail!("exprs in constant must be literals"),
@@ -330,8 +348,8 @@ mod tests {
                     .map(|r| (r.clone(), 1))
                     .collect::<Vec<(Row, isize)>>();
 
-                Ok(RelationExpr::Constant {
-                    rows,
+                Ok(MirRelationExpr::Constant {
+                    rows: Ok(rows),
                     typ: parse_type_list(nth(&s, 2)?)?,
                 })
             }
@@ -340,18 +358,18 @@ mod tests {
                 let inputs = try_list(nth(&s, 1)?)?
                     .into_iter()
                     .map(|r| build_rel(r, catalog, scope))
-                    .collect::<Result<Vec<RelationExpr>, Error>>()?;
+                    .collect::<Result<Vec<MirRelationExpr>, Error>>()?;
 
                 // TODO(justin): is there a way to make this more comprehensible?
-                let equivalences: Vec<Vec<ScalarExpr>> = try_list(nth(&s, 2)?)?
+                let equivalences: Vec<Vec<MirScalarExpr>> = try_list(nth(&s, 2)?)?
                     .into_iter()
                     .map(try_list)
                     .collect::<Result<Vec<Vec<Sexp>>, Error>>()?
                     .into_iter()
                     .map(|e| e.into_iter().map(build_scalar).collect())
-                    .collect::<Result<Vec<Vec<ScalarExpr>>, Error>>()?;
+                    .collect::<Result<Vec<Vec<MirScalarExpr>>, Error>>()?;
 
-                Ok(RelationExpr::Join {
+                Ok(MirRelationExpr::Join {
                     inputs,
                     equivalences,
                     demand: None,
@@ -363,75 +381,65 @@ mod tests {
                 let inputs = try_list(nth(&s, 1)?)?
                     .into_iter()
                     .map(|r| build_rel(r, catalog, scope))
-                    .collect::<Result<Vec<RelationExpr>, Error>>()?;
+                    .collect::<Result<Vec<MirRelationExpr>, Error>>()?;
 
-                Ok(RelationExpr::Union {
+                Ok(MirRelationExpr::Union {
                     base: Box::new(inputs[0].clone()),
                     inputs: inputs[1..].to_vec(),
                 })
             }
             // (negate <input>)
-            "negate" => Ok(RelationExpr::Negate {
+            "negate" => Ok(MirRelationExpr::Negate {
                 input: Box::new(build_rel(nth(&s, 1)?, catalog, scope)?),
             }),
             // (filter <input> <predicate>)
-            "filter" => Ok(RelationExpr::Filter {
+            "filter" => Ok(MirRelationExpr::Filter {
                 input: Box::new(build_rel(nth(&s, 1)?, catalog, scope)?),
                 predicates: build_scalar_list(nth(&s, 2)?)?,
             }),
             // (arrange-by <input> [<keys>])
-            "arrange-by" => Ok(RelationExpr::ArrangeBy {
+            "arrange-by" => Ok(MirRelationExpr::ArrangeBy {
                 input: Box::new(build_rel(nth(&s, 1)?, catalog, scope)?),
                 keys: try_list(nth(&s, 2)?)?
                     .into_iter()
                     .map(build_scalar_list)
-                    .collect::<Result<Vec<Vec<ScalarExpr>>, Error>>()?,
+                    .collect::<Result<Vec<Vec<MirScalarExpr>>, Error>>()?,
             }),
             // TODO(justin): add the rest of the operators.
             name => Err(anyhow!("expected {} to be a relational operator", name)),
         }
     }
 
-    fn build_scalar_list(s: Sexp) -> Result<Vec<ScalarExpr>, Error> {
+    fn build_scalar_list(s: Sexp) -> Result<Vec<MirScalarExpr>, Error> {
         try_list(s)?
             .into_iter()
             .map(build_scalar)
-            .collect::<Result<Vec<ScalarExpr>, Error>>()
+            .collect::<Result<Vec<MirScalarExpr>, Error>>()
     }
 
     // TODO(justin): is there some way to re-use the sql parser/builder for this?
-    fn build_scalar(s: Sexp) -> Result<ScalarExpr, Error> {
+    fn build_scalar(s: Sexp) -> Result<MirScalarExpr, Error> {
         match s {
             // TODO(justin): support more scalar exprs.
             Sexp::Atom(s) => match s.as_str() {
-                "true" => Ok(ScalarExpr::literal(
-                    Ok(Datum::True),
-                    ColumnType {
-                        nullable: false,
-                        scalar_type: ScalarType::Bool,
-                    },
-                )),
-                "false" => Ok(ScalarExpr::literal(
-                    Ok(Datum::False),
-                    ColumnType {
-                        nullable: false,
-                        scalar_type: ScalarType::Bool,
-                    },
-                )),
+                "true" => Ok(MirScalarExpr::literal(Ok(Datum::True), ScalarType::Bool)),
+                "false" => Ok(MirScalarExpr::literal(Ok(Datum::False), ScalarType::Bool)),
                 s => {
                     match s.chars().next() {
                         None => {
                             // It shouldn't have parsed as an atom originally.
                             unreachable!();
                         }
-                        Some('#') => {
-                            Ok(ScalarExpr::Column(extract_idx(Sexp::Atom(s.to_string()))?))
-                        }
+                        Some('#') => Ok(MirScalarExpr::Column(extract_idx(Sexp::Atom(
+                            s.to_string(),
+                        ))?)),
                         Some('0') | Some('1') | Some('2') | Some('3') | Some('4') | Some('5')
-                        | Some('6') | Some('7') | Some('8') | Some('9') => Ok(ScalarExpr::literal(
-                            Ok(Datum::Int64(s.parse::<i64>()?)),
-                            ScalarType::Int64.nullable(false),
-                        )),
+                        | Some('6') | Some('7') | Some('8') | Some('9') => {
+                            Ok(MirScalarExpr::literal(
+                                Ok(Datum::Int64(s.parse::<i64>()?)),
+                                ScalarType::Int64,
+                            ))
+                        }
                         _ => Err(anyhow!("couldn't parse scalar: {}", s)),
                     }
                 }
@@ -456,18 +464,50 @@ mod tests {
         Ok(RelationType::new(col_types))
     }
 
+    fn parse_key_list(s: Sexp) -> Result<Vec<Vec<usize>>, Error> {
+        let keys = try_list(s)?
+            .into_iter()
+            .map(|s2| {
+                let result = try_list_of_atoms(&s2)?
+                    .into_iter()
+                    .map(|e| Ok(e.parse::<usize>()?))
+                    .collect::<Result<Vec<usize>, Error>>();
+                result
+            })
+            .collect::<Result<Vec<Vec<usize>>, Error>>()?;
+
+        Ok(keys)
+    }
+
     fn handle_cat(s: Sexp, cat: &mut TestCatalog) -> Result<(), Error> {
         match try_atom(&nth(&s, 0)?)?.as_str() {
             "defsource" => {
                 let name = try_atom(&nth(&s, 1)?)?;
 
-                let typ = parse_type_list(nth(&s, 2)?)?;
+                let mut typ = parse_type_list(nth(&s, 2)?)?;
 
+                if let Ok(sexp) = nth(&s, 3) {
+                    typ.keys = parse_key_list(sexp)?;
+                }
                 cat.insert(&name, typ);
                 Ok(())
             }
             s => Err(anyhow!("not a valid catalog command: {}", s)),
         }
+    }
+
+    fn generate_explanation(
+        rel: &MirRelationExpr,
+        cat: &TestCatalog,
+        format: Option<&Vec<String>>,
+    ) -> String {
+        let mut explanation = ViewExplanation::new(rel, cat);
+        if let Some(format) = format {
+            if format.contains(&"types".to_string()) {
+                explanation.explain_types();
+            }
+        }
+        explanation.to_string()
     }
 
     fn run_testcase(
@@ -499,9 +539,9 @@ mod tests {
                 let mut opt: Optimizer = Default::default();
                 rel = opt.optimize(rel, &HashMap::new()).unwrap().into_inner();
 
-                Ok(rel.explain(cat).to_string())
+                Ok(generate_explanation(&rel, &cat, args.get("format")))
             }
-            TestType::Build => Ok(rel.explain(cat).to_string()),
+            TestType::Build => Ok(generate_explanation(&rel, &cat, args.get("format"))),
             TestType::Steps => {
                 // TODO(justin): this thing does not currently peek into fixpoints, so it's not
                 // that helpful for optimizations that involve those (which is most of them).
@@ -510,7 +550,11 @@ mod tests {
                 // Buffer of the names of the transformations that have been applied with no changes.
                 let mut no_change: Vec<String> = Vec::new();
 
-                writeln!(out, "{}", rel.explain(cat).to_string())?;
+                writeln!(
+                    out,
+                    "{}",
+                    generate_explanation(&rel, &cat, args.get("format"))
+                )?;
                 writeln!(out, "====")?;
 
                 for transform in opt.transforms.iter() {
@@ -536,7 +580,11 @@ mod tests {
                         no_change = vec![];
 
                         write!(out, "Applied {:?}:", transform)?;
-                        writeln!(out, "\n{}", rel.explain(cat).to_string())?;
+                        writeln!(
+                            out,
+                            "\n{}",
+                            generate_explanation(&rel, &cat, args.get("format"))
+                        )?;
                         writeln!(out, "====")?;
                     } else {
                         no_change.push(format!("{:?}", transform));
@@ -554,7 +602,11 @@ mod tests {
                 }
 
                 writeln!(out, "Final:")?;
-                writeln!(out, "{}", rel.explain(cat).to_string())?;
+                writeln!(
+                    out,
+                    "{}",
+                    generate_explanation(&rel, &cat, args.get("format"))
+                )?;
                 writeln!(out, "====")?;
 
                 Ok(out)
@@ -593,7 +645,12 @@ mod tests {
                         }
                     }
                     "build" => match run_testcase(&s.input, &catalog, &s.args, TestType::Build) {
-                        Ok(msg) => msg,
+                        // Generally, explanations for fully optimized queries
+                        // are not allowed to have whitespace at the end;
+                        // however, a partially optimized query can.
+                        // Since clippy rejects test results with trailing
+                        // whitespace, remove whitespace before comparing results.
+                        Ok(msg) => format!("{}\n", msg.trim_end().to_string()),
                         Err(err) => format!("error: {}\n", err),
                     },
                     "opt" => match run_testcase(&s.input, &catalog, &s.args, TestType::Opt) {

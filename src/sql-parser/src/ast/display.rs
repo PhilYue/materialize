@@ -62,7 +62,7 @@ pub enum FormatMode {
     // Simple is the normal way of printing for human consumption. Identifiers are quoted only if
     // necessary.
     Simple,
-    // Stable prints out the AST in a form more suitable for persistance. All identifiers are
+    // Stable prints out the AST in a form more suitable for persistence. All identifiers are
     // quoted, even if not necessary. This mode is used when persisting table information to the
     // catalog.
     Stable,
@@ -117,9 +117,20 @@ pub trait AstDisplay {
 }
 
 // Derive a fmt::Display implementation for types implementing AstDisplay.
+#[macro_export]
 macro_rules! impl_display {
     ($name:ident) => {
         impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(self.to_ast_string().as_str())
+            }
+        }
+    };
+}
+
+macro_rules! impl_display_t {
+    ($name:ident) => {
+        impl<T: AstInfo> std::fmt::Display for $name<T> {
             fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
                 f.write_str(self.to_ast_string().as_str())
             }
@@ -136,6 +147,13 @@ impl<T: AstDisplay> AstDisplay for &Box<T> {
 impl<T: AstDisplay> AstDisplay for Box<T> {
     fn fmt(&self, f: &mut AstFormatter) {
         (**self).fmt(f);
+    }
+}
+
+// u64 used directly to represent, e.g., type modifiers
+impl AstDisplay for u64 {
+    fn fmt(&self, f: &mut AstFormatter) {
+        f.write_str(self);
     }
 }
 

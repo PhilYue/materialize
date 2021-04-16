@@ -24,22 +24,32 @@
 //! should be considered a bug.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+use std::num::FpCategory;
 
-use chrono::offset::TimeZone;
-use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
-use ore::lex::LexBuf;
+use chrono::offset::{Offset, TimeZone};
+use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
+use dec::{Context, Decimal128, OrderedDecimal};
+use fast_float::FastFloat;
+use lazy_static::lazy_static;
+use num_traits::Float as NumFloat;
+use regex::bytes::Regex;
+use ryu::Float as RyuFloat;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use ore::fmt::FormatBuffer;
+use ore::lex::LexBuf;
+use ore::str::StrExt;
 
 use crate::adt::array::ArrayDimension;
 use crate::adt::datetime::{self, DateTimeField, ParsedDateTime};
 use crate::adt::decimal::Decimal;
 use crate::adt::interval::Interval;
 use crate::adt::jsonb::{Jsonb, JsonbRef};
+use crate::adt::rdn;
 
 macro_rules! bail {
     ($($arg:tt)*) => { return Err(format!($($arg)*)) };
@@ -61,7 +71,7 @@ pub fn parse_bool(s: &str) -> Result<bool, ParseError> {
     match s.trim().to_lowercase().as_str() {
         "t" | "tr" | "tru" | "true" | "y" | "ye" | "yes" | "on" | "1" => Ok(true),
         "f" | "fa" | "fal" | "fals" | "false" | "n" | "no" | "of" | "off" | "0" => Ok(false),
-        _ => Err(ParseError::new("bool", s)),
+        _ => Err(ParseError::invalid_input_syntax("boolean", s)),
     }
 }
 
@@ -90,12 +100,12 @@ where
 
 /// Parses an [`i32`] from `s`.
 ///
-/// Valid values are whatever the [`FromStr`] implementation on `i32` accepts,
+/// Valid values are whatever the [`std::str::FromStr`] implementation on `i32` accepts,
 /// plus leading and trailing whitespace.
 pub fn parse_int32(s: &str) -> Result<i32, ParseError> {
     s.trim()
         .parse()
-        .map_err(|e| ParseError::new("int4", s).with_details(e))
+        .map_err(|e| ParseError::invalid_input_syntax("integer", s).with_details(e))
 }
 
 /// Writes an [`i32`] to `buf`.
@@ -111,7 +121,7 @@ where
 pub fn parse_int64(s: &str) -> Result<i64, ParseError> {
     s.trim()
         .parse()
-        .map_err(|e| ParseError::new("int8", s).with_details(e))
+        .map_err(|e| ParseError::invalid_input_syntax("bigint", s).with_details(e))
 }
 
 /// Writes an `i64` to `buf`.
@@ -123,16 +133,88 @@ where
     Nestable::Yes
 }
 
+fn parse_float<Fl>(type_name: &'static str, s: &str) -> Result<Fl, ParseError>
+where
+    Fl: NumFloat + FastFloat,
+{
+    // Matching PostgreSQL's float parsing behavior is tricky. PostgreSQL's
+    // implementation delegates almost entirely to strtof(3)/strtod(3), which
+    // will report an out-of-range error if a number was rounded to zero or
+    // infinity. For example, parsing "1e70" as a 32-bit float will yield an
+    // out-of-range error because it is rounded to infinity, but parsing an
+    // explicitly-specified "inf" will yield infinity without an error.
+    //
+    // To @benesch's knowledge, there is no Rust implementation of float parsing
+    // that reports whether underflow or overflow occurred. So we figure it out
+    // ourselves after the fact. If fast_float returns infinity and the input
+    // was not an explicitly-specified infinity, then we know overflow occurred.
+    // If fast_float returns zero and the input was not an explicitly-specified
+    // zero, then we know underflow occurred.
+
+    lazy_static! {
+        // Matches `0`, `-0`, `+0`, `000000.00000`, `0.0e10`, et al.
+        static ref ZERO_RE: Regex = Regex::new("(?i-u)^[-+]?0+(\\.0+)?(e|$)").unwrap();
+        // Matches `inf`, `-inf`, `+inf`, `infinity`, et al.
+        static ref INF_RE: Regex = Regex::new("(?i-u)^[-+]?inf").unwrap();
+    }
+
+    let buf = s.trim().as_bytes();
+    let f: Fl =
+        fast_float::parse(buf).map_err(|_| ParseError::invalid_input_syntax(type_name, s))?;
+    match f.classify() {
+        FpCategory::Infinite if !INF_RE.is_match(buf) => {
+            Err(ParseError::out_of_range(type_name, s))
+        }
+        FpCategory::Zero if !ZERO_RE.is_match(buf) => Err(ParseError::out_of_range(type_name, s)),
+        _ => Ok(f),
+    }
+}
+
+fn format_float<F, Fl>(buf: &mut F, f: Fl) -> Nestable
+where
+    F: FormatBuffer,
+    Fl: NumFloat + RyuFloat,
+{
+    // Use ryu rather than the standard library. ryu uses scientific notation
+    // when possible, which better matches PostgreSQL. The standard library's
+    // `ToString` implementations print all available digits, which is rather
+    // verbose.
+    //
+    // Note that we have to fix up ryu's formatting in a few cases to match
+    // PostgreSQL. PostgreSQL spells out "Infinity" in full, never emits a
+    // trailing ".0", formats positive exponents as e.g. "1e+10" rather than
+    // "1e10", and emits a negative sign for negative zero. If we need to speed
+    // up float formatting, we can look into forking ryu and making these edits
+    // directly, but for now it doesn't seem worth it.
+
+    match f.classify() {
+        FpCategory::Infinite if f.is_sign_negative() => buf.write_str("-Infinity"),
+        FpCategory::Infinite => buf.write_str("Infinity"),
+        FpCategory::Nan => buf.write_str("NaN"),
+        FpCategory::Zero if f.is_sign_negative() => buf.write_str("-0"),
+        _ => {
+            debug_assert!(f.is_finite());
+            let mut ryu_buf = ryu::Buffer::new();
+            let mut s = ryu_buf.format_finite(f);
+            if let Some(trimmed) = s.strip_suffix(".0") {
+                s = trimmed;
+            }
+            let mut chars = s.chars().peekable();
+            while let Some(ch) = chars.next() {
+                buf.write_char(ch);
+                if ch == 'e' && chars.peek() != Some(&'-') {
+                    buf.write_char('+');
+                }
+            }
+        }
+    }
+
+    Nestable::Yes
+}
+
 /// Parses an `f32` from `s`.
 pub fn parse_float32(s: &str) -> Result<f32, ParseError> {
-    match s.trim().to_lowercase().as_str() {
-        "inf" | "infinity" | "+inf" | "+infinity" => Ok(f32::INFINITY),
-        "-inf" | "-infinity" => Ok(f32::NEG_INFINITY),
-        "nan" => Ok(f32::NAN),
-        s => s
-            .parse()
-            .map_err(|e| ParseError::new("float4", s).with_details(e)),
-    }
+    parse_float("real", s)
 }
 
 /// Writes an `f32` to `buf`.
@@ -140,28 +222,12 @@ pub fn format_float32<F>(buf: &mut F, f: f32) -> Nestable
 where
     F: FormatBuffer,
 {
-    if f.is_infinite() {
-        if f.is_sign_negative() {
-            buf.write_str("-Infinity")
-        } else {
-            buf.write_str("Infinity")
-        }
-    } else {
-        write!(buf, "{}", f)
-    }
-    Nestable::Yes
+    format_float(buf, f)
 }
 
 /// Parses an `f64` from `s`.
 pub fn parse_float64(s: &str) -> Result<f64, ParseError> {
-    match s.trim().to_lowercase().as_str() {
-        "inf" | "infinity" | "+inf" | "+infinity" => Ok(f64::INFINITY),
-        "-inf" | "-infinity" => Ok(f64::NEG_INFINITY),
-        "nan" => Ok(f64::NAN),
-        s => s
-            .parse()
-            .map_err(|e| ParseError::new("float8", s).with_details(e)),
-    }
+    parse_float("double precision", s)
 }
 
 /// Writes an `f64` to `buf`.
@@ -169,16 +235,7 @@ pub fn format_float64<F>(buf: &mut F, f: f64) -> Nestable
 where
     F: FormatBuffer,
 {
-    if f.is_infinite() {
-        if f.is_sign_negative() {
-            buf.write_str("-Infinity")
-        } else {
-            buf.write_str("Infinity")
-        }
-    } else {
-        write!(buf, "{}", f)
-    }
-    Nestable::Yes
+    format_float(buf, f)
 }
 
 /// Use the following grammar to parse `s` into:
@@ -199,7 +256,7 @@ where
 /// <time zone interval> ::=
 ///     <sign> <hours value> <colon> <minutes value>
 /// ```
-fn parse_timestamp_string(s: &str) -> Result<(NaiveDate, NaiveTime, i64), String> {
+fn parse_timestamp_string(s: &str) -> Result<(NaiveDate, NaiveTime, datetime::Timezone), String> {
     if s.is_empty() {
         return Err("timestamp string is empty".into());
     }
@@ -212,7 +269,7 @@ fn parse_timestamp_string(s: &str) -> Result<(NaiveDate, NaiveTime, i64), String
         return Ok((
             NaiveDate::from_ymd(1970, 1, 1),
             NaiveTime::from_hms(0, 0, 0),
-            0,
+            Default::default(),
         ));
     }
 
@@ -223,9 +280,9 @@ fn parse_timestamp_string(s: &str) -> Result<(NaiveDate, NaiveTime, i64), String
     let t: NaiveTime = pdt.compute_time()?;
 
     let offset = if tz_string.is_empty() {
-        0
+        Default::default()
     } else {
-        datetime::parse_timezone_offset_second(tz_string)?
+        tz_string.parse()?
     };
 
     Ok((d, t, offset))
@@ -235,7 +292,7 @@ fn parse_timestamp_string(s: &str) -> Result<(NaiveDate, NaiveTime, i64), String
 pub fn parse_date(s: &str) -> Result<NaiveDate, ParseError> {
     match parse_timestamp_string(s) {
         Ok((date, _, _)) => Ok(date),
-        Err(e) => Err(ParseError::new("date", s).with_details(e)),
+        Err(e) => Err(ParseError::invalid_input_syntax("date", s).with_details(e)),
     }
 }
 
@@ -258,7 +315,7 @@ where
 pub fn parse_time(s: &str) -> Result<NaiveTime, ParseError> {
     ParsedDateTime::build_parsed_datetime_time(&s)
         .and_then(|pdt| pdt.compute_time())
-        .map_err(|e| ParseError::new("time", s).with_details(e))
+        .map_err(|e| ParseError::invalid_input_syntax("time", s).with_details(e))
 }
 
 /// Writes a [`NaiveDateTime`] timestamp to `buf`.
@@ -275,7 +332,7 @@ where
 pub fn parse_timestamp(s: &str) -> Result<NaiveDateTime, ParseError> {
     match parse_timestamp_string(s) {
         Ok((date, time, _)) => Ok(date.and_time(time)),
-        Err(e) => Err(ParseError::new("timestamp", s).with_details(e)),
+        Err(e) => Err(ParseError::invalid_input_syntax("timestamp", s).with_details(e)),
     }
 }
 
@@ -290,17 +347,30 @@ where
     Nestable::MayNeedEscaping
 }
 
-/// Parses a `DateTime<Utc>` from `s`.
+/// Parses a `DateTime<Utc>` from `s`. See `expr::scalar::func::timezone_timestamp` for timezone anomaly considerations.
 pub fn parse_timestamptz(s: &str) -> Result<DateTime<Utc>, ParseError> {
     parse_timestamp_string(s)
-        .and_then(|(date, time, offset)| {
-            let offset = FixedOffset::east(offset as i32)
-                .from_local_datetime(&date.and_time(time))
-                .earliest()
-                .ok_or_else(|| "invalid timezone conversion".to_owned())?;
-            Ok(DateTime::<Utc>::from_utc(offset.naive_utc(), Utc))
+        .and_then(|(date, time, timezone)| {
+            use datetime::Timezone::*;
+            let mut dt = date.and_time(time);
+            let offset = match timezone {
+                FixedOffset(offset) => offset,
+                Tz(tz) => match tz.offset_from_local_datetime(&dt).latest() {
+                    Some(offset) => offset.fix(),
+                    None => {
+                        dt += Duration::hours(1);
+                        tz.offset_from_local_datetime(&dt)
+                            .latest()
+                            .ok_or_else(|| "invalid timezone conversion".to_owned())?
+                            .fix()
+                    }
+                },
+            };
+            Ok(DateTime::from_utc(dt - offset, Utc))
         })
-        .map_err(|e| ParseError::new("timestamptz", s).with_details(e))
+        .map_err(|e| {
+            ParseError::invalid_input_syntax("timestamp with time zone", s).with_details(e)
+        })
 }
 
 /// Writes a [`DateTime<Utc>`] timestamp to `buf`.
@@ -344,7 +414,7 @@ pub fn parse_interval(s: &str) -> Result<Interval, ParseError> {
 pub fn parse_interval_w_disambiguator(s: &str, d: DateTimeField) -> Result<Interval, ParseError> {
     ParsedDateTime::build_parsed_datetime_interval(&s, d)
         .and_then(|pdt| pdt.compute_interval())
-        .map_err(|e| ParseError::new("interval", s).with_details(e))
+        .map_err(|e| ParseError::invalid_input_syntax("interval", s).with_details(e))
 }
 
 pub fn format_interval<F>(buf: &mut F, iv: Interval) -> Nestable
@@ -358,7 +428,7 @@ where
 pub fn parse_decimal(s: &str) -> Result<Decimal, ParseError> {
     s.trim()
         .parse()
-        .map_err(|e| ParseError::new("decimal", s).with_details(e))
+        .map_err(|e| ParseError::invalid_input_syntax("numeric", s).with_details(e))
 }
 
 pub fn format_decimal<F>(buf: &mut F, d: &Decimal) -> Nestable
@@ -366,6 +436,36 @@ where
     F: FormatBuffer,
 {
     write!(buf, "{}", d);
+    Nestable::Yes
+}
+
+pub fn parse_numeric(s: &str) -> Result<OrderedDecimal<Decimal128>, ParseError> {
+    let mut cx = Context::<Decimal128>::default();
+    let n = match cx.parse(s) {
+        Ok(n) => OrderedDecimal(n),
+        Err(e) => {
+            return Err(ParseError::invalid_input_syntax("rdn", s).with_details(e));
+        }
+    };
+
+    if rdn::check_max_precision_strict(&cx, &n).is_err() {
+        return Err(ParseError::out_of_range("rdn", s).with_details(format!(
+            "exceeds maximum precision {}",
+            rdn::RDN_MAX_PRECISION
+        )));
+    }
+
+    // Inexact status is caught above
+    assert!(!cx.status().any());
+
+    Ok(n)
+}
+
+pub fn format_numeric<F>(buf: &mut F, n: &OrderedDecimal<Decimal128>) -> Nestable
+where
+    F: FormatBuffer,
+{
+    write!(buf, "{}", n.0.to_standard_notation_string());
     Nestable::Yes
 }
 
@@ -383,14 +483,42 @@ pub fn parse_bytes(s: &str) -> Result<Vec<u8>, ParseError> {
     //
     // [0]: https://www.postgresql.org/docs/current/datatype-binary.html#id-1.5.7.12.9
     // [1]: https://www.postgresql.org/docs/current/datatype-binary.html#id-1.5.7.12.10
-    if s.starts_with("\\x") {
-        hex::decode(&s[2..]).map_err(|e| ParseError::new("bytea", s).with_details(e))
+    if let Some(remainder) = s.strip_prefix(r"\x") {
+        parse_bytes_hex(remainder)
+            .map_err(|e| ParseError::invalid_input_syntax("bytea", s).with_details(e.to_string()))
     } else {
         parse_bytes_traditional(s)
     }
 }
 
-fn parse_bytes_traditional(s: &str) -> Result<Vec<u8>, ParseError> {
+pub fn parse_bytes_hex(s: &str) -> Result<Vec<u8>, ParseHexError> {
+    // Can't use `hex::decode` here, as it doesn't tolerate whitespace
+    // between encoded bytes.
+
+    let decode_nibble = |b| match b {
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        b'0'..=b'9' => Ok(b - b'0'),
+        _ => Err(ParseHexError::InvalidHexDigit(char::from(b))),
+    };
+
+    let mut buf = vec![];
+    let mut nibbles = s.as_bytes().iter().copied();
+    while let Some(n) = nibbles.next() {
+        if let b' ' | b'\n' | b'\t' | b'\r' = n {
+            continue;
+        }
+        let n = decode_nibble(n)?;
+        let n2 = match nibbles.next() {
+            None => return Err(ParseHexError::OddLength),
+            Some(n2) => decode_nibble(n2)?,
+        };
+        buf.push((n << 4) | n2);
+    }
+    Ok(buf)
+}
+
+pub fn parse_bytes_traditional(s: &str) -> Result<Vec<u8>, ParseError> {
     // Bytes are interpreted literally, save for the special escape sequences
     // "\\", which represents a single backslash, and "\NNN", where each N
     // is an octal digit, which represents the byte whose octal value is NNN.
@@ -403,7 +531,8 @@ fn parse_bytes_traditional(s: &str) -> Result<Vec<u8>, ParseError> {
         }
         match bytes.next() {
             None => {
-                return Err(ParseError::new("bytea", s).with_details("ends with escape character"))
+                return Err(ParseError::invalid_input_syntax("bytea", s)
+                    .with_details("ends with escape character"))
             }
             Some(b'\\') => out.push(b'\\'),
             b => match (b, bytes.next(), bytes.next()) {
@@ -411,7 +540,8 @@ fn parse_bytes_traditional(s: &str) -> Result<Vec<u8>, ParseError> {
                     out.push(((d2 - b'0') << 6) + ((d1 - b'0') << 3) + (d0 - b'0'));
                 }
                 _ => {
-                    return Err(ParseError::new("bytea", s).with_details("invalid escape sequence"))
+                    return Err(ParseError::invalid_input_syntax("bytea", s)
+                        .with_details("invalid escape sequence"))
                 }
             },
         }
@@ -430,7 +560,7 @@ where
 pub fn parse_jsonb(s: &str) -> Result<Jsonb, ParseError> {
     s.trim()
         .parse()
-        .map_err(|e| ParseError::new("jsonb", s).with_details(e))
+        .map_err(|e| ParseError::invalid_input_syntax("jsonb", s).with_details(e))
 }
 
 pub fn format_jsonb<F>(buf: &mut F, jsonb: JsonbRef) -> Nestable
@@ -451,7 +581,7 @@ where
 pub fn parse_uuid(s: &str) -> Result<Uuid, ParseError> {
     s.trim()
         .parse()
-        .map_err(|e| ParseError::new("uuid", s).with_details(e))
+        .map_err(|e| ParseError::invalid_input_syntax("uuid", s).with_details(e))
 }
 
 pub fn format_uuid<F>(buf: &mut F, uuid: Uuid) -> Nestable
@@ -492,7 +622,7 @@ where
     E: fmt::Display,
 {
     parse_list_inner(s, is_element_type_list, make_null, gen_elem)
-        .map_err(|details| ParseError::new("list", s).with_details(details))
+        .map_err(|details| ParseError::invalid_input_syntax("list", s).with_details(details))
 }
 
 // `parse_list_inner`'s separation from `parse_list` simplifies error handling
@@ -522,6 +652,8 @@ where
 
     // Simplifies calls to `gen_elem` by handling errors
     let mut gen = |elem| gen_elem(elem).map_err(|e| e.to_string());
+    let is_special_char = |c| matches!(c, '{' | '}' | ',' | '\\' | '"');
+    let is_end_of_literal = |c| matches!(c, ',' | '}');
 
     // Consume elements.
     loop {
@@ -542,7 +674,7 @@ where
         buf.take_while(|ch| ch.is_ascii_whitespace());
         // Get elements.
         let elem = match buf.peek() {
-            Some('"') => gen(list_lex_quoted_element(buf)?)?,
+            Some('"') => gen(lex_quoted_element(buf)?)?,
             Some('{') => {
                 if !is_element_type_list {
                     bail!(
@@ -550,9 +682,9 @@ where
                         want a nested list, e.g. '{{a}}'::text list list"
                     )
                 }
-                gen(list_lex_embedded_list(buf)?)?
+                gen(lex_embedded_element(buf)?)?
             }
-            Some(_) => match list_lex_unquoted_element(buf)? {
+            Some(_) => match lex_unquoted_element(buf, is_special_char, is_end_of_literal)? {
                 Some(elem) => gen(elem)?,
                 None => make_null(),
             },
@@ -572,7 +704,7 @@ where
     Ok(elems)
 }
 
-fn list_lex_quoted_element<'a>(buf: &mut LexBuf<'a>) -> Result<Cow<'a, str>, String> {
+fn lex_quoted_element<'a>(buf: &mut LexBuf<'a>) -> Result<Cow<'a, str>, String> {
     assert!(buf.consume('"'));
     let s = buf.take_while(|ch| !matches!(ch, '"' | '\\'));
 
@@ -597,7 +729,7 @@ fn list_lex_quoted_element<'a>(buf: &mut LexBuf<'a>) -> Result<Cow<'a, str>, Str
     Ok(s.into())
 }
 
-fn list_lex_embedded_list<'a>(buf: &mut LexBuf<'a>) -> Result<Cow<'a, str>, String> {
+fn lex_embedded_element<'a>(buf: &mut LexBuf<'a>) -> Result<Cow<'a, str>, String> {
     let pos = buf.pos();
     assert!(matches!(buf.next(), Some('{')));
     let mut depth = 1;
@@ -611,7 +743,7 @@ fn list_lex_embedded_list<'a>(buf: &mut LexBuf<'a>) -> Result<Cow<'a, str>, Stri
             Some('{') if !in_escape => depth += 1,
             Some('}') if !in_escape => depth -= 1,
             Some(_) => (),
-            None => bail!("unterminated embedded list"),
+            None => bail!("unterminated embedded element"),
         }
     }
     let s = &buf.inner()[pos..buf.pos()];
@@ -619,13 +751,13 @@ fn list_lex_embedded_list<'a>(buf: &mut LexBuf<'a>) -> Result<Cow<'a, str>, Stri
 }
 
 // Result of `None` indicates element is NULL.
-fn list_lex_unquoted_element<'a>(buf: &mut LexBuf<'a>) -> Result<Option<Cow<'a, str>>, String> {
+fn lex_unquoted_element<'a>(
+    buf: &mut LexBuf<'a>,
+    is_special_char: impl Fn(char) -> bool,
+    is_end_of_literal: impl Fn(char) -> bool,
+) -> Result<Option<Cow<'a, str>>, String> {
     // first char is guaranteed to be non-whitespace
     assert!(!buf.peek().unwrap().is_ascii_whitespace());
-
-    fn is_special_char(c: char) -> bool {
-        matches!(c, '{' | '}' | ',' | '\\' | '"')
-    }
 
     let s = buf.take_while(|ch| !is_special_char(ch) && !ch.is_ascii_whitespace());
 
@@ -660,20 +792,18 @@ fn list_lex_unquoted_element<'a>(buf: &mut LexBuf<'a>) -> Result<Option<Cow<'a, 
                 }
                 None => return Err("unterminated element".into()),
             },
-            // End of element/list
-            Some(',') | Some('}') => {
-                // Commas or closing brackets as first character indicates
-                // missing element definition.
+            Some(c) if is_end_of_literal(c) => {
+                // End of literal characters as the first character indicates
+                // a missing element definition.
                 if s.is_empty() {
-                    bail!("malformed list literal; missing element")
+                    bail!("malformed literal; missing element")
                 }
                 buf.prev();
                 break;
             }
-            Some(c) if is_special_char(c) => bail!(
-                "malformed list literal; must escape special character '{}'",
-                c
-            ),
+            Some(c) if is_special_char(c) => {
+                bail!("malformed literal; must escape special character '{}'", c)
+            }
             Some(c) => {
                 s.push(c);
                 if !c.is_ascii_whitespace() {
@@ -689,6 +819,136 @@ fn list_lex_unquoted_element<'a>(buf: &mut LexBuf<'a>) -> Result<Option<Cow<'a, 
     } else {
         Some(Cow::Owned(s))
     })
+}
+
+pub fn parse_map<'a, V, E>(
+    s: &'a str,
+    is_value_type_map: bool,
+    gen_elem: impl FnMut(Cow<'a, str>) -> Result<V, E>,
+) -> Result<BTreeMap<String, V>, ParseError>
+where
+    E: fmt::Display,
+{
+    parse_map_inner(s, is_value_type_map, gen_elem)
+        .map_err(|details| ParseError::invalid_input_syntax("map", s).with_details(details))
+}
+
+pub fn parse_map_inner<'a, V, E>(
+    s: &'a str,
+    is_value_type_map: bool,
+    mut gen_elem: impl FnMut(Cow<'a, str>) -> Result<V, E>,
+) -> Result<BTreeMap<String, V>, String>
+where
+    E: fmt::Display,
+{
+    let mut map = BTreeMap::new();
+    let buf = &mut LexBuf::new(s);
+
+    // Consume opening paren.
+    if !buf.consume('{') {
+        bail!(
+            "expected '{{', found {}",
+            match buf.next() {
+                Some(c) => format!("{}", c),
+                None => "empty string".to_string(),
+            }
+        )
+    }
+
+    // Simplifies calls to generators by handling errors
+    let gen_key = |key: Option<Cow<'a, str>>| -> Result<String, String> {
+        match key {
+            Some(Cow::Owned(s)) => Ok(s),
+            Some(Cow::Borrowed(s)) => Ok(s.to_owned()),
+            None => Err("expected key".to_owned()),
+        }
+    };
+    let mut gen_value = |elem| gen_elem(elem).map_err(|e| e.to_string());
+    let is_special_char = |c| matches!(c, '{' | '}' | ',' | '"' | '=' | '>' | '\\');
+    let is_end_of_literal = |c| matches!(c, ',' | '}' | '=');
+
+    loop {
+        // Check for terminals.
+        buf.take_while(|ch| ch.is_ascii_whitespace());
+        match buf.next() {
+            Some('}') => break,
+            _ if map.len() == 0 => {
+                buf.prev();
+            }
+            Some(',') => {}
+            Some(c) => bail!("expected ',' or end of input, got '{}'", c),
+            None => bail!("unexpected end of input"),
+        }
+
+        // Get key.
+        buf.take_while(|ch| ch.is_ascii_whitespace());
+        let key = match buf.peek() {
+            Some('"') => Some(lex_quoted_element(buf)?),
+            Some(_) => lex_unquoted_element(buf, is_special_char, is_end_of_literal)?,
+            None => bail!("unexpected end of input"),
+        };
+        let key = gen_key(key)?;
+
+        // Assert mapping arrow (=>) is present.
+        buf.take_while(|ch| ch.is_ascii_whitespace());
+        if !buf.consume('=') || !buf.consume('>') {
+            bail!("expected =>")
+        }
+
+        // Get value.
+        buf.take_while(|ch| ch.is_ascii_whitespace());
+        let value = match buf.peek() {
+            Some('"') => Some(lex_quoted_element(buf)?),
+            Some('{') => {
+                if !is_value_type_map {
+                    bail!(
+                        "unescaped '{{' at beginning of value; perhaps you \
+                           want a nested map, e.g. '{{a=>{{a=>1}}}}'::map[text=>map[text=>int]]"
+                    )
+                }
+                Some(lex_embedded_element(buf)?)
+            }
+            Some(_) => lex_unquoted_element(buf, is_special_char, is_end_of_literal)?,
+            None => bail!("unexpected end of input"),
+        };
+        let value = gen_value(value.unwrap())?;
+
+        // Insert elements.
+        map.insert(key, value);
+    }
+    Ok(map)
+}
+
+pub fn format_map<F, T>(
+    buf: &mut F,
+    elems: impl IntoIterator<Item = (impl AsRef<str>, T)>,
+    mut format_elem: impl FnMut(MapValueWriter<F>, T) -> Nestable,
+) -> Nestable
+where
+    F: FormatBuffer,
+{
+    buf.write_char('{');
+    let mut elems = elems.into_iter().peekable();
+    while let Some((key, value)) = elems.next() {
+        // Map key values are always Strings, which always evaluate to
+        // Nestable::MayNeedEscaping.
+        let key_start = buf.len();
+        buf.write_str(key.as_ref());
+        escape_elem::<_, MapElementEscaper>(buf, key_start);
+
+        buf.write_str("=>");
+
+        let value_start = buf.len();
+        if let Nestable::MayNeedEscaping = format_elem(MapValueWriter(buf), value) {
+            escape_elem::<_, MapElementEscaper>(buf, value_start);
+        }
+
+        if elems.peek().is_some() {
+            buf.write_char(',');
+        }
+    }
+    buf.write_char('}');
+    Nestable::Yes
 }
 
 pub fn format_array<F, T>(
@@ -712,6 +972,11 @@ pub fn format_array_inner<F, T>(
 ) where
     F: FormatBuffer,
 {
+    if dims.is_empty() {
+        buf.write_str("{}");
+        return;
+    }
+
     buf.write_char('{');
     for j in 0..dims[0].length {
         if j > 0 {
@@ -774,6 +1039,23 @@ impl ElementEscaper for ListElementEscaper {
     }
 }
 
+struct MapElementEscaper;
+
+impl ElementEscaper for MapElementEscaper {
+    fn needs_escaping(elem: &[u8]) -> bool {
+        elem.is_empty()
+            || elem == b"NULL"
+            || elem.iter().any(|c| {
+                matches!(c, b'{' | b'}' | b',' | b'"' | b'=' | b'>' | b'\\')
+                    || c.is_ascii_whitespace()
+            })
+    }
+
+    fn escape_char(_: u8) -> u8 {
+        b'\\'
+    }
+}
+
 struct RecordElementEscaper;
 
 impl ElementEscaper for RecordElementEscaper {
@@ -793,7 +1075,7 @@ impl ElementEscaper for RecordElementEscaper {
     }
 }
 
-/// Escapes a list or record element in place.
+/// Escapes a list, record, or map element in place.
 ///
 /// The element must start at `start` and extend to the end of the buffer. The
 /// buffer will be resized if escaping is necessary to account for the
@@ -872,6 +1154,27 @@ where
     }
 }
 
+/// A helper for `format_map` that formats a single map value.
+#[derive(Debug)]
+pub struct MapValueWriter<'a, F>(&'a mut F);
+
+impl<'a, F> MapValueWriter<'a, F>
+where
+    F: FormatBuffer,
+{
+    /// Marks this value element as null.
+    pub fn write_null(self) -> Nestable {
+        self.0.write_str("NULL");
+        Nestable::Yes
+    }
+
+    /// Returns a [`FormatBuffer`] into which a non-null element can be
+    /// written.
+    pub fn nonnull_buffer(self) -> &'a mut F {
+        self.0
+    }
+}
+
 pub fn format_record<F, T>(
     buf: &mut F,
     elems: impl IntoIterator<Item = T>,
@@ -915,27 +1218,49 @@ where
     }
 }
 
-/// An error while parsing input as a type.
+/// An error while parsing an input as a type.
 #[derive(Ord, PartialOrd, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash)]
 pub struct ParseError {
+    kind: ParseErrorKind,
     type_name: String,
     input: String,
     details: Option<String>,
+}
+
+#[derive(Ord, PartialOrd, Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Hash)]
+pub enum ParseErrorKind {
+    OutOfRange,
+    InvalidInputSyntax,
 }
 
 impl ParseError {
     // To ensure that reversing the parameters causes a compile-time error, we
     // require that `type_name` be a string literal, even though `ParseError`
     // itself stores the type name as a `String`.
-    fn new<S>(type_name: &'static str, input: S) -> ParseError
+    fn new<S>(kind: ParseErrorKind, type_name: &'static str, input: S) -> ParseError
     where
         S: Into<String>,
     {
         ParseError {
+            kind,
             type_name: type_name.into(),
             input: input.into(),
             details: None,
         }
+    }
+
+    fn out_of_range<S>(type_name: &'static str, input: S) -> ParseError
+    where
+        S: Into<String>,
+    {
+        ParseError::new(ParseErrorKind::OutOfRange, type_name, input)
+    }
+
+    fn invalid_input_syntax<S>(type_name: &'static str, input: S) -> ParseError
+    where
+        S: Into<String>,
+    {
+        ParseError::new(ParseErrorKind::InvalidInputSyntax, type_name, input)
     }
 
     fn with_details<D>(mut self, details: D) -> ParseError
@@ -949,12 +1274,49 @@ impl ParseError {
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "invalid input syntax for {}: ", self.type_name)?;
-        if let Some(details) = &self.details {
-            write!(f, "{}: ", details)?;
+        match self.kind {
+            ParseErrorKind::OutOfRange => {
+                write!(
+                    f,
+                    "{} is out of range for type {}",
+                    self.input.quoted(),
+                    self.type_name
+                )?;
+                if let Some(details) = &self.details {
+                    write!(f, ": {}", details)?;
+                }
+                Ok(())
+            }
+            ParseErrorKind::InvalidInputSyntax => {
+                write!(f, "invalid input syntax for type {}: ", self.type_name)?;
+                if let Some(details) = &self.details {
+                    write!(f, "{}: ", details)?;
+                }
+                write!(f, "{}", self.input.quoted())
+            }
         }
-        write!(f, "\"{}\"", self.input)
     }
 }
 
 impl Error for ParseError {}
+
+#[derive(Ord, PartialOrd, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash)]
+pub enum ParseHexError {
+    InvalidHexDigit(char),
+    OddLength,
+}
+
+impl fmt::Display for ParseHexError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            ParseHexError::InvalidHexDigit(c) => {
+                write!(f, "invalid hexadecimal digit: \"{}\"", c.escape_default())
+            }
+            ParseHexError::OddLength => {
+                f.write_str("invalid hexadecimal data: odd number of digits")
+            }
+        }
+    }
+}
+
+impl Error for ParseHexError {}

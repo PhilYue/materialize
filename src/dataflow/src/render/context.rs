@@ -23,13 +23,14 @@ use differential_dataflow::trace::BatchReader;
 use differential_dataflow::trace::{Cursor, TraceReader};
 use differential_dataflow::Collection;
 use differential_dataflow::Data;
+use timely::communication::message::RefOrMut;
 use timely::dataflow::channels::pact::Pipeline;
 use timely::dataflow::{Scope, ScopeParent};
 use timely::progress::timestamp::Refines;
 use timely::progress::{Antichain, Timestamp};
 
 use dataflow_types::{DataflowDesc, DataflowError};
-use expr::{GlobalId, ScalarExpr};
+use expr::{GlobalId, MirScalarExpr};
 
 use crate::source::SourceToken;
 
@@ -39,17 +40,17 @@ pub type TraceKeyHandle<K, T, R> = TraceAgent<OrdKeySpine<K, T, R>>;
 /// A trace handle for key-value data.
 pub type TraceValHandle<K, V, T, R> = TraceAgent<OrdValSpine<K, V, T, R>>;
 
-type Diff = isize;
+pub type Diff = isize;
 
 // Local type definition to avoid the horror in signatures.
 pub type Arrangement<S, V> = Arranged<S, TraceValHandle<V, V, <S as ScopeParent>::Timestamp, Diff>>;
 pub type ErrArrangement<S> =
     Arranged<S, TraceKeyHandle<DataflowError, <S as ScopeParent>::Timestamp, Diff>>;
-type ArrangementImport<S, V, T> = Arranged<
+pub type ArrangementImport<S, V, T> = Arranged<
     S,
     TraceEnter<TraceFrontier<TraceValHandle<V, V, T, Diff>>, <S as ScopeParent>::Timestamp>,
 >;
-type ErrArrangementImport<S, T> = Arranged<
+pub type ErrArrangementImport<S, T> = Arranged<
     S,
     TraceEnter<
         TraceFrontier<TraceKeyHandle<DataflowError, T, Diff>>,
@@ -91,13 +92,13 @@ where
     /// Dataflow local collections.
     pub collections: HashMap<P, (Collection<S, V, Diff>, Collection<S, DataflowError, Diff>)>,
     /// Dataflow local arrangements.
-    pub local: HashMap<P, BTreeMap<Vec<ScalarExpr>, (Arrangement<S, V>, ErrArrangement<S>)>>,
+    pub local: HashMap<P, BTreeMap<Vec<MirScalarExpr>, (Arrangement<S, V>, ErrArrangement<S>)>>,
     /// Imported arrangements.
     #[allow(clippy::type_complexity)] // TODO(fms): fix or ignore lint globally.
     pub trace: HashMap<
         P,
         BTreeMap<
-            Vec<ScalarExpr>,
+            Vec<MirScalarExpr>,
             (
                 GlobalId,
                 ArrangementImport<S, V, T>,
@@ -196,11 +197,14 @@ where
     where
         I: IntoIterator,
         I::Item: Data,
-        L: FnMut(&V) -> I + 'static,
-        K: FnMut(&[ScalarExpr]) -> Option<V>,
+        L: FnMut(RefOrMut<V>) -> I + 'static,
+        K: FnMut(&[MirScalarExpr]) -> Option<V>,
     {
         if let Some((oks, err)) = self.collections.get(relation_expr) {
-            Some((oks.flat_map(move |v| logic(&v)), err.clone()))
+            Some((
+                oks.flat_map(move |mut v| logic(RefOrMut::Mut(&mut v))),
+                err.clone(),
+            ))
         } else if let Some(local) = self.local.get(relation_expr) {
             // Determine a key that is constrained to a literal value.
             let mut constrained_keys = local
@@ -218,7 +222,7 @@ where
             } else {
                 let (oks, errs) = local.values().next().expect("Empty arrangement");
                 Some((
-                    oks.flat_map_ref(move |_k, v| logic(v)),
+                    oks.flat_map_ref(move |_k, v| logic(RefOrMut::Ref(&v))),
                     errs.as_collection(|k, _v| k.clone()),
                 ))
             }
@@ -239,7 +243,7 @@ where
             } else {
                 let (_id, oks, errs) = trace.values().next().expect("Empty arrangement");
                 Some((
-                    oks.flat_map_ref(move |_k, v| logic(v)),
+                    oks.flat_map_ref(move |_k, v| logic(RefOrMut::Ref(&v))),
                     errs.as_collection(|k, _v| k.clone()),
                 ))
             }
@@ -263,7 +267,7 @@ where
         Tr::Cursor: Cursor<V, Tr::Val, S::Timestamp, repr::Diff> + 'static,
         I: IntoIterator,
         I::Item: Data,
-        L: FnMut(&V) -> I + 'static,
+        L: FnMut(RefOrMut<V>) -> I + 'static,
     {
         use differential_dataflow::AsCollection;
         use timely::dataflow::operators::Operator;
@@ -279,7 +283,7 @@ where
                             cursor.seek_key(batch, &row);
                             if cursor.get_key(batch) == Some(&row) {
                                 while let Some(val) = cursor.get_val(batch) {
-                                    for datum in logic(val) {
+                                    for datum in logic(RefOrMut::Ref(val)) {
                                         cursor.map_times(batch, |time, diff| {
                                             session.give((
                                                 datum.clone(),
@@ -306,7 +310,7 @@ where
     ) -> Option<ArrangementFlavor<S, V, T>> {
         let mut keys = Vec::new();
         for column in columns {
-            keys.push(ScalarExpr::Column(*column));
+            keys.push(MirScalarExpr::Column(*column));
         }
         self.arrangement(relation_expr, &keys)
     }
@@ -318,7 +322,7 @@ where
     pub fn arrangement(
         &self,
         relation_expr: &P,
-        keys: &[ScalarExpr],
+        keys: &[MirScalarExpr],
     ) -> Option<ArrangementFlavor<S, V, T>> {
         if let Some(local) = self.get_local(relation_expr, keys) {
             let (oks, errs) = local.clone();
@@ -334,7 +338,7 @@ where
     pub fn get_local(
         &self,
         relation_expr: &P,
-        keys: &[ScalarExpr],
+        keys: &[MirScalarExpr],
     ) -> Option<&(Arrangement<S, V>, ErrArrangement<S>)> {
         self.local.get(relation_expr).and_then(|x| x.get(keys))
     }
@@ -348,7 +352,7 @@ where
     ) {
         let mut keys = Vec::new();
         for column in columns {
-            keys.push(ScalarExpr::Column(*column));
+            keys.push(MirScalarExpr::Column(*column));
         }
         self.set_local(relation_expr, &keys, arranged);
     }
@@ -357,7 +361,7 @@ where
     pub fn set_local(
         &mut self,
         relation_expr: &P,
-        keys: &[ScalarExpr],
+        keys: &[MirScalarExpr],
         arranged: (Arrangement<S, V>, ErrArrangement<S>),
     ) {
         self.local
@@ -370,7 +374,7 @@ where
     pub fn get_trace(
         &self,
         relation_expr: &P,
-        keys: &[ScalarExpr],
+        keys: &[MirScalarExpr],
     ) -> Option<&(
         GlobalId,
         ArrangementImport<S, V, T>,
@@ -384,7 +388,7 @@ where
         &mut self,
         gid: GlobalId,
         relation_expr: &P,
-        keys: &[ScalarExpr],
+        keys: &[MirScalarExpr],
         arranged: (ArrangementImport<S, V, T>, ErrArrangementImport<S, T>),
     ) {
         self.trace

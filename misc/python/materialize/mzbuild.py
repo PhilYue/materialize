@@ -56,13 +56,6 @@ from materialize import ui
 
 announce = ui.speaker("==> ")
 
-# BUILD_MODE enables building Rust binaries without the --release flag.
-# TODO(mjibson): Make this not an environment variable, instead pass it around
-# like a regular argument to things that need it.
-BUILD_MODE = os.environ.get("BUILD_MODE", "release").lower()
-if BUILD_MODE not in ["debug", "release"]:
-    raise ValueError("unknown BUILD_MODE")
-
 
 class Fingerprint(bytes):
     """A SHA-1 hash of the inputs to an `Image`.
@@ -93,11 +86,13 @@ class RepositoryDetails:
 
     Attributes:
         root: The path to the root of the repository.
+        release_mode: Whether the repository is being built in release mode.
         cargo_workspace: The `cargo.Workspace` associated with the repository.
     """
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, release_mode: bool):
         self.root = root
+        self.release_mode = release_mode
         self.cargo_workspace = cargo.Workspace(root)
 
     def xcargo(self) -> str:
@@ -125,7 +120,7 @@ def docker_images() -> Set[str]:
     """List the Docker images available on the local machine."""
     return set(
         spawn.capture(
-            ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"], unicode=True,
+            ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"], unicode=True
         )
         .strip()
         .split("\n")
@@ -158,6 +153,45 @@ class PreImage:
 
     def inputs(self) -> Set[str]:
         """Return the files which are considered inputs to the action."""
+        raise NotImplementedError
+
+    def extra(self) -> str:
+        """Returns additional data for incorporation in the fingerprint."""
+        return ""
+
+
+class Copy(PreImage):
+    """A `PreImage` action which copies files from a directory.
+
+    The contents of the specified `source` directory are copied into the
+    `destination` directory. The `source` directory is relative to the
+    repository root. The `destination` directory is relative to the mzbuild
+    context. Files in the `source` directory are matched against the glob
+    specified by the `matching` argument.
+    """
+
+    def __init__(self, rd: RepositoryDetails, path: Path, config: Dict[str, Any]):
+        super().__init__(rd, path)
+
+        self.source = config.pop("source", None)
+        if self.source is None:
+            raise ValueError("mzbuild config is missing 'source' argument")
+
+        self.destination = config.pop("destination", None)
+        if self.destination is None:
+            raise ValueError("mzbuild config is missing 'destination' argument")
+
+        self.matching = config.pop("matching", "*")
+
+    def run(self) -> None:
+        super().run()
+        for src in self.inputs():
+            dst = self.path / self.destination / Path(src).relative_to(self.source)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(self.rd.root / src, dst)
+
+    def inputs(self) -> Set[str]:
+        return set(git.expand_globs(self.rd.root, f"{self.source}/{self.matching}"))
 
 
 class CargoPreImage(PreImage):
@@ -175,6 +209,10 @@ class CargoPreImage(PreImage):
             ".cargo/config",
         }
 
+    def extra(self) -> str:
+        # Cargo images depend on the release mode.
+        return str(self.rd.release_mode)
+
 
 class CargoBuild(CargoPreImage):
     """A pre-image action that builds a single binary with Cargo."""
@@ -189,18 +227,17 @@ class CargoBuild(CargoPreImage):
 
     def build(self) -> None:
         cargo_build = [self.rd.xcargo(), "build", "--bin", self.bin]
-        if BUILD_MODE == "release":
+        if self.rd.release_mode:
             cargo_build.append("--release")
-        spawn.runv(
-            cargo_build, cwd=self.rd.root,
-        )
-        shutil.copy(self.rd.xcargo_target_dir() / BUILD_MODE / self.bin, self.path)
+        spawn.runv(cargo_build, cwd=self.rd.root)
+        cargo_profile = "release" if self.rd.release_mode else "debug"
+        shutil.copy(self.rd.xcargo_target_dir() / cargo_profile / self.bin, self.path)
         if self.strip:
             # NOTE(benesch): the debug information is large enough that it slows
             # down CI, since we're packaging these binaries up into Docker
             # images and shipping them around. A bit unfortunate, since it'd be
             # nice to have useful backtraces if the binary crashes.
-            spawn.runv([xstrip, self.path / self.bin])
+            spawn.runv([xstrip, "--strip-debug", self.path / self.bin])
         else:
             # Even if we've been asked not to strip the binary, remove the
             # `.debug_pubnames` and `.debug_pubtypes` sections. These are just
@@ -311,10 +348,6 @@ class CargoTest(CargoPreImage):
                 manifest.write(f"{slug} {crate_path}\n")
         shutil.move(str(self.path / "materialized"), self.path / "tests")
         shutil.move(str(self.path / "testdrive"), self.path / "tests")
-        shutil.copy(
-            self.rd.xcargo_target_dir() / "debug" / "examples" / "pingpong",
-            self.path / "tests" / "examples",
-        )
         shutil.copytree(self.rd.root / "misc" / "shlib", self.path / "shlib")
 
     def inputs(self) -> Set[str]:
@@ -337,7 +370,6 @@ class Image:
             configuration file.
         pre_image: An optional action to perform before running `docker build`.
         build_args: An optional list of --build-arg to pass to the dockerfile
-        is_cargo: Whether the image uses Cargo to build itself.
     """
 
     _DOCKERFILE_MZFROM_RE = re.compile(rb"^MZFROM\s*(\S+)")
@@ -346,7 +378,6 @@ class Image:
         self.rd = rd
         self.path = path
         self.pre_image: Optional[PreImage] = None
-        self.is_cargo = False
         with open(self.path / "mzbuild.yml") as f:
             data = yaml.safe_load(f)
             self.name: str = data.pop("name")
@@ -354,11 +385,12 @@ class Image:
             pre_image = data.pop("pre-image", None)
             if pre_image is not None:
                 typ = pre_image.pop("type", None)
-                self.is_cargo = typ.startswith("cargo")
                 if typ == "cargo-build":
                     self.pre_image = CargoBuild(self.rd, self.path, pre_image)
                 elif typ == "cargo-test":
                     self.pre_image = CargoTest(self.rd, self.path, pre_image)
+                elif typ == "copy":
+                    self.pre_image = Copy(self.rd, self.path, pre_image)
                 else:
                     raise ValueError(
                         f"mzbuild config in {self.path} has unknown pre-image type"
@@ -528,6 +560,13 @@ class ResolvedImage:
                 repository.
         """
         paths = set(git.expand_globs(self.image.rd.root, f"{self.image.path}/**"))
+        if not paths:
+            # While we could find an `mzbuild.yml` file for this service, expland_globs didn't
+            # return any files that matched this service. At the very least, the `mzbuild.yml`
+            # file itself should have been returned. We have a bug if paths is empty.
+            raise AssertionError(
+                f"{self.image.name} mzbuild exists but its files are unknown to git"
+            )
         if self.image.pre_image is not None:
             paths |= self.image.pre_image.inputs()
         if transitive:
@@ -569,11 +608,10 @@ class ResolvedImage:
             self_hash.update(file_hash.digest())
             self_hash.update(b"\0")
 
+        if self.image.pre_image is not None:
+            self_hash.update(self.image.pre_image.extra().encode())
+
         full_hash = hashlib.sha1()
-        # For images using Cargo, add the BUILD_MODE to the hash so
-        # debug and release binaries have different hashes.
-        if self.image.is_cargo:
-            full_hash.update(BUILD_MODE.encode())
         full_hash.update(self_hash.digest())
         for dep in sorted(self.dependencies.values(), key=lambda d: d.name):
             full_hash.update(dep.name.encode())
@@ -652,10 +690,10 @@ class Repository:
         compose_dirs: The set of directories containing an `mzcompose.yml` file.
     """
 
-    def __init__(self, root: Path):
-        self.rd = RepositoryDetails(root)
+    def __init__(self, root: Path, release_mode: bool = True):
+        self.rd = RepositoryDetails(root, release_mode)
         self.images: Dict[str, Image] = {}
-        self.compose_dirs = set()
+        self.compositions: Dict[str, Path] = {}
         for (path, dirs, files) in os.walk(self.root, topdown=True):
             # Filter out some particularly massive ignored directories to keep
             # things snappy. Not required for correctness.
@@ -668,7 +706,10 @@ class Repository:
                     raise ValueError(f"image {image.name} exists twice")
                 self.images[image.name] = image
             if "mzcompose.yml" in files:
-                self.compose_dirs.add(Path(path))
+                name = Path(path).name
+                if name in self.compositions:
+                    raise ValueError(f"composition {name} exists twice")
+                self.compositions[name] = Path(path) / "mzcompose.yml"
 
         # Validate dependencies.
         for image in self.images.values():
@@ -686,14 +727,14 @@ class Repository:
     def resolve_dependencies(self, targets: Iterable[Image]) -> DependencySet:
         """Compute the dependency set necessary to build target images.
 
-         The dependencies of `targets` will be crawled recursively until the
-         complete set of transitive dependencies is determined or a circular
-         dependency is discovered. The returned dependency set will be sorted
-         in topological order.
+        The dependencies of `targets` will be crawled recursively until the
+        complete set of transitive dependencies is determined or a circular
+        dependency is discovered. The returned dependency set will be sorted
+        in topological order.
 
-         Raises:
-            ValueError: A circular dependency was discovered in the images
-                in the repository.
+        Raises:
+           ValueError: A circular dependency was discovered in the images
+               in the repository.
         """
         resolved = OrderedDict()
         visiting = set()

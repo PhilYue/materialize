@@ -15,6 +15,8 @@ Detail | Info
 **Quick Syntax** | `TRUE` or `FALSE`
 **Size** | 1 byte
 **Aliases** | `bool`
+**Catalog name** | `pg_catalog.bool`
+**OID** | 16
 
 ## Syntax
 
@@ -26,17 +28,18 @@ Detail | Info
 
 #### From `boolean`
 
-You can [cast](../../functions/cast) `boolean` to:
+You can [cast](../../functions/cast) from `boolean` to:
 
-- [`text`](../text)
-- [`int`](../int)
+- [`int`](../int) (explicitly)
+- [`text`](../text) (by assignment)
 
 #### To `boolean`
 
 You can [cast](../../functions/cast) the following types to `boolean`:
 
-- [`int`](../int)
-- [`text`](../text)
+- [`int`](../int) (explicitly)
+- [`jsonb`](../jsonb) (explicitly)
+- [`text`](../text) (explicitly)
 
 ## Examples
 
@@ -48,11 +51,9 @@ SELECT TRUE AS t_val;
 -------
  t
 ```
-<hr/>
+
 ```sql
 SELECT FALSE AS f_val;
-```
-```nofmt
  f_val
 -------
  f

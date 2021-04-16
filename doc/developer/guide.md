@@ -21,8 +21,6 @@ Note that local file sources are intended only for ad-hoc experimentation and
 analysis. Production use cases are expected to use Kafka sources, which have a
 better availability and durability story.
 
-[Rust]: https://www.rust-lang.org
-
 ## Installing
 
 ### C components
@@ -47,8 +45,6 @@ sudo apt install build-essential cmake
 
 On other platforms, you'll have to figure out how to get these tools yourself.
 
-[CMake]: https://cmake.org
-
 ### Rust
 
 Install Rust via [rustup]:
@@ -64,83 +60,69 @@ We recommend that you do _not_ install Rust via your system's package manager.
 We closely track the most recent version of Rust. The version of Rust in your
 package manager is likely too old to build Materialize.
 
-[rustup]: https://www.rust-lang.org/tools/install
-
 ### Confluent Platform
 
 The [Confluent Platform] bundles [Apache ZooKeeper] and [Apache Kafka] with
 several non-free Confluent tools, like the [Confluent Schema Registry] and
 [Control Center]. For local development, the [Confluent CLI] allows easy
-management of these services
+management of these services.
 
-#### macOS
+**Confluent Platform is not be required for changes that don't need
+Kafka integration**. If your changes don't affect integration with external systems
+and can be fully exercised by SQL logic tests, we recommend not installing
+the Confluent Platform, as it is a rather heavy dependency. Most Materialize employees,
+or other major contributors, will probably need to run the full test suite and
+should therefore install the Confluent Platform.
 
-You will need JDK 8 or 11. The easiest way to install this is via homebrew:
+#### All platforms
 
-```shell
-brew cask install homebrew/cask-versions/adoptopenjdk8
-```
-
-Homebrew no longer contains confluent packages, so you'll need to follow the
-[manual instructions][confluent-install].
-
-At the time of this writing, that means:
-
-```shell
-curl -O http://packages.confluent.io/archive/6.0/confluent-6.0.0.tar.gz
-tar -xf confluent-6.0.0.tar.gz
-CONFLUENT_HOME=./confluent-6.0.0 ./confluent-6.0.0/bin/confluent local services start
-```
-
-#### Linux
-
-On Debian-based Linux variants, it's a tad more involved:
-
-```shell
-curl http://packages.confluent.io/deb/5.2/archive.key | sudo apt-key add -
-sudo add-apt-repository "deb [arch=amd64] https://packages.confluent.io/deb/5.2 stable main"
-sudo apt update
-sudo apt install openjdk-8-jre-headless confluent-community-2.12
-```
-
-On other Linux variants, you'll need to make your own way through [Confluent's
-installation instructions][confluent-install]. Note that, at the time of
-writing, only Java 8 and 11 are supported.
-
-On Linux, you might want to consider using [nix]. It is a purely functional
-package manager, which is appealing because bits and pieces of state usually
-are to blame when package management goes wrong. Plus, getting started is easy:
-
-```shell
-cd materialize
-nix-shell
-```
-
-This will start a new shell with all the necessary dependencies available and
-pinned to the correct version.
-
-[Homebrew]: https://brew.sh
-[confluent-install]: https://docs.confluent.io/current/installation/installing_cp/index.html
-[nix]: https://nixos.org/nix/
-
-### Confluent CLI
-
-As of Feb 24, 2020 you can run:
+First, install the CLI. As of January 2021 you can run this command on
+macOS and Linux:
 
 ```shell
 curl -L --http1.1 https://cnfl.io/cli | sh -s -- -b /usr/local/bin
 ```
 
-However, if this ever stops working, check out these great docs on the
-[Confluent CLI].
+If this no longer works, follow the instructions in the [Confluent CLI]
+documentation. Then please update this guide with the new instructions!
 
+#### macOS
 
-[Apache ZooKeeper]: https://zookeeper.apache.org
-[Apache Kafka]: https://kafka.apache.org
-[Confluent Schema Registry]: https://www.confluent.io/confluent-schema-registry/
-[Confluent Platform]: https://www.confluent.io/product/confluent-platform/
-[Control Center]: https://www.confluent.io/confluent-control-center/
-[Confluent CLI]: https://docs.confluent.io/current/cli/installing.html#scripted-installation
+You will need JDK 8 or 11. The easiest way to install this is via Homebrew:
+
+```shell
+brew install --cask homebrew/cask-versions/adoptopenjdk8
+```
+
+Then, download and extract the Confluent Platform tarball:
+
+```shell
+INSTALL_DIR=$HOME/confluent  # You can choose somewhere else if you like.
+mkdir $INSTALL_DIR
+curl http://packages.confluent.io/archive/6.0/confluent-6.0.1.tar.gz | tar -xC $INSTALL_DIR --strip-components=1
+echo export CONFLUENT_HOME=(cd $INSTALL_DIR && pwd) >> ~/.bashrc
+source ~/.bashrc
+confluent local services start
+```
+
+#### Linux
+
+On Debian-based Linux variants, you can use APT to install Java and the
+Confluent Platform:
+
+```shell
+curl http://packages.confluent.io/deb/6.0/archive.key | sudo apt-key add -
+sudo add-apt-repository "deb [arch=amd64] https://packages.confluent.io/deb/6.0 stable main"
+sudo apt update
+sudo apt install openjdk-8-jre-headless confluent-community-2.13
+echo export CONFLUENT_HOME=/ >> ~/.bashrc
+source ~/.bashrc
+confluent local services start
+```
+
+On other Linux variants, you'll need to make your own way through [Confluent's
+installation instructions][confluent-install]. Note that, at the time of
+writing, only Java 8 and 11 are supported.
 
 ## Building Materialize
 
@@ -156,33 +138,36 @@ Because the MaterializeInc organization requires two-factor authentication
 (2FA), you'll need to clone via SSH as indicated above, or [configure a personal
 access token for use with HTTPS][github-https].
 
-[MaterializeInc/sqlparser]: https://github.com/MaterializeInc/sqlparser.git
-[github-https]: https://help.github.com/en/github/authenticating-to-github/creating-a-personal-access-token-for-the-command-line
-
 ## Prepping Confluent
 
-Like we mentioned above, you need to have a few Confluent services running to
-get Materialize to work. To prep what you need, run the following:
+As mentioned above, **Confluent Platform is only required need to test Kafka
+sources and sinks against a *local* Kafka installation.** If possible, we
+recommend that you don't run the Confluent Platform if you don't need it, as it
+is very memory hungry.
+
+If you do need the Confluent Platform running locally, execute the following
+commands:
 
 ```shell
-confluent local start kafka     # Also starts zookeeper
-confluent local start schema-registry
+confluent local services kafka start     # Also starts Zookeeper.
+confluent local services schema-registry start
 ```
 
 You can also use the included `confluent` CLI command to start and stop
 individual services. For example:
 
 ```shell
-confluent local status        # View what services are currently running.
-confluent local start kafka   # Start Kafka and any services it depends upon.
-confluent local log kafka     # View Kafka log file.
+confluent local services status        # View what services are currently running.
+confluent local services kafka start   # Start Kafka and any services it depends upon.
+confluent local services kafka log     # View Kafka log file.
 ```
 
 Beware that the CLI is fairly buggy, especially around service management.
 Putting your computer to sleep often causes the service status to get out of
-sync. In other words, trust the output of `confluent local log` and `ps ... |
-grep` over the output of `confluent local status`. Still, it's reliable enough
-to be more convenient than managing each service manually.
+sync. In other words, trust the output of `confluent local services <service>
+log` and `ps ... | grep` over the output of `confluent local services status`.
+Still, it's reliable enough to be more convenient than managing each service
+manually.
 
 ## Symbiosis mode
 
@@ -238,6 +223,9 @@ Note that `dev-web` can only hot-reload the the files in
 `src/materialized/src/templates` use a compile-time templating library called
 [`askama`], and so changes to those templates necessarily require a recompile.
 
+For details about adding a new JavaScript/CSS dependency, see the comment in
+[`src/materialized/build/npm.rs`](/src/materialized/build/npm.rs).
+
 ## Testing
 
 Materialize's testing philosophy is sufficiently complex that it warrants its
@@ -257,34 +245,68 @@ Linter    | General formatting nits | `./bin/lint`
 See also the [style guide](style.md) for some additional soft
 recommendations.
 
-[Clippy]: https://github.com/rust-lang/rust-clippy
-[rustfmt]: https://github.com/rust-lang/rustfmt
-
 ## Submitting and reviewing changes
 
 See [Developer guide: submitting and reviewing changes](guide-changes.md).
 
+## Publishing code changes
+
+### crates.io
+
+Before publishing internal Rust crates to `crates.io`(https://crates.io/), be sure to
+indicate that `MaterializeInc` is the reponsible maintainer by running the following
+command:
+```shell
+cargo owner --rm <your personal login>
+cargo owner --add github:MaterializeInc:crate-owners
+```
+
+### PyPI
+
+Use the [`materializeinc`](https://pypi.org/user/materializeinc/) PyPI user to upload
+and update Materialize's Python packages on PyPI. Login information can be found in the
+shared 1Password account.
+
 ## Other repositories
 
-Several components of Materialize are maintained in separate Git repositories.
 Where possible, we prefer to keep things in the main repository (a "monorepo"
-approach), but when forking existing packages, maintaining a separate repository
-makes it easier to integrate changes from upstream.
+approach). There are a few notable exceptions:
 
-Some notable repositories include:
-
-  * **[mtrlz-setup]**, containing automatic development environment setup
-    scripts;
   * **[rust-sasl]**, Cyrus SASL bindings for Rust
   * **[rust-krb5-src]**, Rust build system integration for libkrb5, MIT's
     Kerberos implementation.
+  * **[dbt-materialize]**, data build tool (dbt) adapter for Materialize
 
-As mentioned before, because the MaterializeInc organization requires two-factor
-authentication (2FA), to clone these repositories you'll need to use either SSH
-or [configure a personal access token for use with HTTPS][github-https].
+Don't add to this list without good reason! Separate repositories are
+acceptable for:
 
+  * Rapid iteration on new Materialize plugins or integrations, where the CI
+    time or code quality requirements in the main repository would be
+    burdensome. When the code is more stable, the repository should be
+    integrated into the main Materialize repository.
+
+  * Stable foundational components where community contribution is desirable.
+    For example, rust-sasl is a very small package, and asking contributors
+    to clone the entire Materialize repository would be a large barrier to
+    entry. Changes to Materialize very rarely require changes in rust-sasl, so
+    maintaining the two separately does not introduce much overhead.
+
+[Apache Kafka]: https://kafka.apache.org
+[Apache ZooKeeper]: https://zookeeper.apache.org
 [askama]: https://github.com/djc/askama
-[mtrlz-setup]: https://github.com/MaterializeInc/mtrlz-setup
-[rust-sasl]: https://github.com/MaterializeInc/rust-sasl
+[Clippy]: https://github.com/rust-lang/rust-clippy
+[CMake]: https://cmake.org
+[Confluent CLI]: https://docs.confluent.io/current/cli/installing.html#scripted-installation
+[Confluent Platform]: https://www.confluent.io/product/confluent-platform/
+[Confluent Schema Registry]: https://www.confluent.io/confluent-schema-registry/
+[confluent-install]: https://docs.confluent.io/current/installation/installing_cp/index.html
+[Control Center]: https://www.confluent.io/confluent-control-center/
+[dbt-materialize]: https://github.com/materializeInc/dbt-materialize
+[github-https]: https://help.github.com/en/github/authenticating-to-github/creating-a-personal-access-token-for-the-command-line
+[Homebrew]: https://brew.sh
 [rust-krb5-src]: https://github.com/MaterializeInc/rust-krb5-src
+[rust-sasl]: https://github.com/MaterializeInc/rust-sasl
+[Rust]: https://www.rust-lang.org
+[rustfmt]: https://github.com/rust-lang/rustfmt
+[rustup]: https://www.rust-lang.org/tools/install
 [sqlparser]: https://github.com/MaterializeInc/sqlparser

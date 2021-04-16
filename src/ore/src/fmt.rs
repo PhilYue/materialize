@@ -1,19 +1,13 @@
 // Copyright Materialize, Inc. All rights reserved.
 //
-// Use of this software is governed by the Business Source License
-// included in the LICENSE file.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0.
+// Use of this software is governed by the Apache license, Version 2.0
 
 //! Formatting utilities.
 
 use std::fmt;
 use std::io;
 
-use bytes::buf::{BufMut, BufMutExt};
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 
 /// A trait for objects that can be infallibly written to.
 ///

@@ -19,24 +19,25 @@ use ore::collections::CollectionExt;
 use repr::{ColumnType, Datum, RelationType, Row};
 
 use self::func::{AggregateFunc, TableFunc};
-use crate::id::DummyHumanizer;
-use crate::{GlobalId, Id, IdHumanizer, LocalId, ScalarExpr};
+use crate::explain::ViewExplanation;
+use crate::{DummyHumanizer, EvalError, ExprHumanizer, GlobalId, Id, LocalId, MirScalarExpr};
 
+pub mod canonicalize;
 pub mod func;
 pub mod join_input_mapper;
 
 /// An abstract syntax tree which defines a collection.
 ///
-/// The AST is meant reflect the capabilities of the [`differential_dataflow::Collection`] type,
+/// The AST is meant reflect the capabilities of the `differential_dataflow::Collection` type,
 /// written generically enough to avoid run-time compilation work.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash)]
-pub enum RelationExpr {
+pub enum MirRelationExpr {
     /// A constant relation containing specified rows.
     ///
     /// The runtime memory footprint of this operator is zero.
     Constant {
         /// Rows of the constant collection and their multiplicities.
-        rows: Vec<(Row, isize)>,
+        rows: Result<Vec<(Row, isize)>, EvalError>,
         /// Schema of the collection.
         typ: RelationType,
     },
@@ -56,16 +57,16 @@ pub enum RelationExpr {
         /// The identifier to be used in `Get` variants to retrieve `value`.
         id: LocalId,
         /// The collection to be bound to `name`.
-        value: Box<RelationExpr>,
+        value: Box<MirRelationExpr>,
         /// The result of the `Let`, evaluated with `name` bound to `value`.
-        body: Box<RelationExpr>,
+        body: Box<MirRelationExpr>,
     },
     /// Project out some columns from a dataflow
     ///
     /// The runtime memory footprint of this operator is zero.
     Project {
         /// The source collection.
-        input: Box<RelationExpr>,
+        input: Box<MirRelationExpr>,
         /// Indices of columns to retain.
         outputs: Vec<usize>,
     },
@@ -74,29 +75,29 @@ pub enum RelationExpr {
     /// The runtime memory footprint of this operator is zero.
     Map {
         /// The source collection.
-        input: Box<RelationExpr>,
+        input: Box<MirRelationExpr>,
         /// Expressions which determine values to append to each row.
         /// An expression may refer to columns in `input` or
         /// expressions defined earlier in the vector
-        scalars: Vec<ScalarExpr>,
+        scalars: Vec<MirScalarExpr>,
     },
     /// Like Map, but yields zero-or-more output rows per input row
     ///
     /// The runtime memory footprint of this operator is zero.
     FlatMap {
         /// The source collection
-        input: Box<RelationExpr>,
+        input: Box<MirRelationExpr>,
         /// The table func to apply
         func: TableFunc,
         /// The argument to the table func
-        exprs: Vec<ScalarExpr>,
+        exprs: Vec<MirScalarExpr>,
         /// Output columns demanded by the surrounding expression.
         ///
         /// The input columns are often discarded and can be very
         /// expensive to reproduce, so restricting what we produce
         /// as output can be a substantial win.
         ///
-        /// See [`expr::transform::Demand`] for more details.
+        /// See `transform::Demand` for more details.
         demand: Option<Vec<usize>>,
     },
     /// Keep rows from a dataflow where all the predicates are true
@@ -104,20 +105,20 @@ pub enum RelationExpr {
     /// The runtime memory footprint of this operator is zero.
     Filter {
         /// The source collection.
-        input: Box<RelationExpr>,
+        input: Box<MirRelationExpr>,
         /// Predicates, each of which must be true.
-        predicates: Vec<ScalarExpr>,
+        predicates: Vec<MirScalarExpr>,
     },
     /// Join several collections, where some columns must be equal.
     ///
-    /// For further details consult the documentation for [`RelationExpr::join`].
+    /// For further details consult the documentation for [`MirRelationExpr::join`].
     ///
     /// The runtime memory footprint of this operator can be proportional to
     /// the sizes of all inputs and the size of all joins of prefixes.
     /// This may be reduced due to arrangements available at rendering time.
     Join {
         /// A sequence of input relations.
-        inputs: Vec<RelationExpr>,
+        inputs: Vec<MirRelationExpr>,
         /// A sequence of equivalence classes of expressions on the cross product of inputs.
         ///
         /// Each equivalence class is a list of scalar expressions, where for each class the
@@ -127,14 +128,14 @@ pub enum RelationExpr {
         /// from all inputs. In many cases this may just be column selection from specific
         /// inputs, but more general cases exist (e.g. complex functions of multiple columns
         /// from multiple inputs, or just constant literals).
-        equivalences: Vec<Vec<ScalarExpr>>,
+        equivalences: Vec<Vec<MirScalarExpr>>,
         /// This optional field is a hint for which columns are
         /// actually used by operators that use this collection. Although the
         /// join does not have permission to change the schema, it can introduce
         /// dummy values at the end of its computation, avoiding the maintenance of values
         /// not present in this list (when it is non-None).
         ///
-        /// See [`expr::transform::Demand`] for more details.
+        /// See `transform::Demand` for more details.
         demand: Option<Vec<usize>>,
         /// Join implementation information.
         implementation: JoinImplementation,
@@ -148,20 +149,22 @@ pub enum RelationExpr {
     /// builds the associated dataflow.
     Reduce {
         /// The source collection.
-        input: Box<RelationExpr>,
+        input: Box<MirRelationExpr>,
         /// Column indices used to form groups.
-        group_key: Vec<ScalarExpr>,
+        group_key: Vec<MirScalarExpr>,
         /// Expressions which determine values to append to each row, after the group keys.
         aggregates: Vec<AggregateExpr>,
         /// True iff the input is known to monotonically increase (only addition of records).
         monotonic: bool,
+        /// User hint: expected number of values per group key. Used to optimize physical rendering.
+        expected_group_size: Option<usize>,
     },
     /// Groups and orders within each group, limiting output.
     ///
     /// The runtime memory footprint of this operator is proportional to its input and output.
     TopK {
         /// The source collection.
-        input: Box<RelationExpr>,
+        input: Box<MirRelationExpr>,
         /// Column indices used to form groups.
         group_key: Vec<usize>,
         /// Column indices used to order rows within groups.
@@ -178,23 +181,23 @@ pub enum RelationExpr {
     /// The runtime memory footprint of this operator is zero.
     Negate {
         /// The source collection.
-        input: Box<RelationExpr>,
+        input: Box<MirRelationExpr>,
     },
     /// Keep rows from a dataflow where the row counts are positive
     ///
     /// The runtime memory footprint of this operator is proportional to its input and output.
     Threshold {
         /// The source collection.
-        input: Box<RelationExpr>,
+        input: Box<MirRelationExpr>,
     },
     /// Adds the frequencies of elements in contained sets.
     ///
     /// The runtime memory footprint of this operator is zero.
     Union {
         /// A source collection.
-        base: Box<RelationExpr>,
+        base: Box<MirRelationExpr>,
         /// Source collections to union.
-        inputs: Vec<RelationExpr>,
+        inputs: Vec<MirRelationExpr>,
     },
     /// Technically a no-op. Used to render an index. Will be used to optimize queries
     /// on finer grain
@@ -202,13 +205,25 @@ pub enum RelationExpr {
     /// The runtime memory footprint of this operator is proportional to its input.
     ArrangeBy {
         /// The source collection
-        input: Box<RelationExpr>,
+        input: Box<MirRelationExpr>,
         /// Columns to arrange `input` by, in order of decreasing primacy
-        keys: Vec<Vec<ScalarExpr>>,
+        keys: Vec<Vec<MirScalarExpr>>,
+    },
+    /// Declares that `keys` are primary keys for `input`.
+    /// Should be used *very* sparingly, and only if there's no plausible
+    /// way to derive the key information from the underlying expression.
+    /// The result of declaring a key that isn't actually a key for the underlying expression is undefined.
+    ///
+    /// There is no operator rendered for this IR node; thus, its runtime memory footprint is zero.
+    DeclareKeys {
+        /// The source collection
+        input: Box<MirRelationExpr>,
+        /// The set of columns in the source collection that form a key.
+        keys: Vec<Vec<usize>>,
     },
 }
 
-impl RelationExpr {
+impl MirRelationExpr {
     /// Reports the schema of the relation.
     ///
     /// This method determines the type through recursive traversal of the
@@ -217,30 +232,33 @@ impl RelationExpr {
     /// judiciously.
     pub fn typ(&self) -> RelationType {
         match self {
-            RelationExpr::Constant { rows, typ } => {
-                for (row, _diff) in rows {
-                    for (datum, column_typ) in row.iter().zip(typ.column_types.iter()) {
-                        // If the record will be observed, we should validate its type.
-                        if datum != Datum::Dummy {
-                            assert!(
-                                datum.is_instance_of(column_typ),
-                                "Expected datum of type {:?}, got value {:?}",
-                                column_typ,
-                                datum
-                            );
+            MirRelationExpr::Constant { rows, typ } => {
+                if let Ok(rows) = rows {
+                    for (row, _diff) in rows {
+                        for (datum, column_typ) in row.iter().zip(typ.column_types.iter()) {
+                            // If the record will be observed, we should validate its type.
+                            if datum != Datum::Dummy {
+                                assert!(
+                                    datum.is_instance_of(column_typ),
+                                    "Expected datum of type {:?}, got value {:?}",
+                                    column_typ,
+                                    datum
+                                );
+                            }
                         }
                     }
-                }
-                let result = typ.clone();
-                if rows.len() == 0 || (rows.len() == 1 && rows[0].1 == 1) {
-                    result.with_key(Vec::new())
+                    if rows.len() == 0 || (rows.len() == 1 && rows[0].1 == 1) {
+                        typ.clone().with_key(Vec::new())
+                    } else {
+                        typ.clone()
+                    }
                 } else {
-                    result
+                    typ.clone()
                 }
             }
-            RelationExpr::Get { typ, .. } => typ.clone(),
-            RelationExpr::Let { body, .. } => body.typ(),
-            RelationExpr::Project { input, outputs } => {
+            MirRelationExpr::Get { typ, .. } => typ.clone(),
+            MirRelationExpr::Let { body, .. } => body.typ(),
+            MirRelationExpr::Project { input, outputs } => {
                 let input_typ = input.typ();
                 let mut output_typ = RelationType::new(
                     outputs
@@ -259,7 +277,7 @@ impl RelationExpr {
                 }
                 output_typ
             }
-            RelationExpr::Map { input, scalars } => {
+            MirRelationExpr::Map { input, scalars } => {
                 let mut typ = input.typ();
                 let arity = typ.column_types.len();
 
@@ -269,16 +287,16 @@ impl RelationExpr {
                     // assess whether the scalar preserves uniqueness,
                     // and could participate in a key!
 
-                    fn uniqueness(expr: &ScalarExpr) -> Option<usize> {
+                    fn uniqueness(expr: &MirScalarExpr) -> Option<usize> {
                         match expr {
-                            ScalarExpr::CallUnary { func, expr } => {
+                            MirScalarExpr::CallUnary { func, expr } => {
                                 if func.preserves_uniqueness() {
                                     uniqueness(expr)
                                 } else {
                                     None
                                 }
                             }
-                            ScalarExpr::Column(c) => Some(*c),
+                            MirScalarExpr::Column(c) => Some(*c),
                             _ => None,
                         }
                     }
@@ -311,19 +329,22 @@ impl RelationExpr {
 
                 typ
             }
-            RelationExpr::FlatMap {
+            MirRelationExpr::FlatMap {
                 input,
                 func,
                 exprs: _,
                 demand: _,
             } => {
-                let mut typ = input.typ();
-                typ.column_types.extend(func.output_type().column_types);
+                let mut input_typ = input.typ();
+                input_typ
+                    .column_types
+                    .extend(func.output_type().column_types);
                 // FlatMap can add duplicate rows, so input keys are no longer valid
-                RelationType::new(typ.column_types)
+                let typ = RelationType::new(input_typ.column_types);
+                typ
             }
-            RelationExpr::Filter { input, .. } => input.typ(),
-            RelationExpr::Join {
+            MirRelationExpr::Filter { input, .. } => input.typ(),
+            MirRelationExpr::Join {
                 inputs,
                 equivalences,
                 ..
@@ -357,11 +378,11 @@ impl RelationExpr {
                 }
                 typ
             }
-            RelationExpr::Reduce {
+            MirRelationExpr::Reduce {
                 input,
                 group_key,
                 aggregates,
-                monotonic: _,
+                ..
             } => {
                 let input_typ = input.typ();
                 let mut column_types = group_key
@@ -379,14 +400,14 @@ impl RelationExpr {
                 for key in input_typ.keys.iter() {
                     if key
                         .iter()
-                        .all(|k| group_key.contains(&ScalarExpr::Column(*k)))
+                        .all(|k| group_key.contains(&MirScalarExpr::Column(*k)))
                     {
                         keys.push(
                             key.iter()
                                 .map(|i| {
                                     group_key
                                         .iter()
-                                        .position(|k| k == &ScalarExpr::Column(*i))
+                                        .position(|k| k == &MirScalarExpr::Column(*i))
                                         .unwrap()
                                 })
                                 .collect::<Vec<_>>(),
@@ -401,8 +422,21 @@ impl RelationExpr {
                 }
                 result
             }
-            RelationExpr::TopK { input, .. } => input.typ(),
-            RelationExpr::Negate { input } => {
+            MirRelationExpr::TopK {
+                input,
+                group_key,
+                limit,
+                ..
+            } => {
+                // If `limit` is `Some(1)` then the group key will become
+                // a unique key, as there will be only one record with that key.
+                let mut typ = input.typ();
+                if limit == &Some(1) {
+                    typ = typ.with_key(group_key.clone())
+                }
+                typ
+            }
+            MirRelationExpr::Negate { input } => {
                 // Although negate may have distinct records for each key,
                 // the multiplicity is -1 rather than 1. This breaks many
                 // of the optimization uses of "keys".
@@ -410,8 +444,8 @@ impl RelationExpr {
                 typ.keys.clear();
                 typ
             }
-            RelationExpr::Threshold { input } => input.typ(),
-            RelationExpr::Union { base, inputs } => {
+            MirRelationExpr::Threshold { input } => input.typ(),
+            MirRelationExpr::Union { base, inputs } => {
                 let mut base_cols = base.typ().column_types;
                 for input in inputs {
                     for (base_col, col) in base_cols.iter_mut().zip_eq(input.typ().column_types) {
@@ -421,10 +455,75 @@ impl RelationExpr {
                             .unwrap();
                     }
                 }
-                RelationType::new(base_cols)
+
+                // Generally, unions do not have any unique keys, because
+                // each input might duplicate some. However, there is at
+                // least one idiomatic structure that does preserve keys,
+                // which results from SQL aggregations that must populate
+                // absent records with default values. In that pattern,
+                // the union of one GET with its negation, which has first
+                // been subjected to a projection and map, we can remove
+                // their influence on the key structure.
+                //
+                // If there are A, B, each with a unique `key` such that
+                // we are looking at
+                //
+                //     A + (B - A.proj(key)).map(stuff)
+                //
+                // Then we can report `key` as a unique key.
+                //
+                // TODO: make unique key structure an optimization analysis
+                // rather than part of the type information.
+                // TODO: perhaps ensure that (above) A.proj(key) is a
+                // subset of B, as otherwise there are negative records
+                // and who knows what is true (not expected, but again
+                // who knows what the query plan might look like).
+                let mut keys = Vec::new();
+                if let MirRelationExpr::Get {
+                    id: first_id,
+                    typ: _,
+                } = &**base
+                {
+                    if inputs.len() == 1 {
+                        if let MirRelationExpr::Map { input, .. } = &inputs[0] {
+                            if let MirRelationExpr::Union { base, inputs } = &**input {
+                                if inputs.len() == 1 {
+                                    if let MirRelationExpr::Project { input, outputs } = &**base {
+                                        if let MirRelationExpr::Negate { input } = &**input {
+                                            if let MirRelationExpr::Get {
+                                                id: second_id,
+                                                typ: _,
+                                            } = &**input
+                                            {
+                                                if first_id == second_id {
+                                                    keys.extend(
+                                                        inputs[0].typ().keys.drain(..).filter(
+                                                            |key| {
+                                                                key.iter().all(|c| {
+                                                                    outputs.get(*c) == Some(c)
+                                                                })
+                                                            },
+                                                        ),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let mut result = RelationType::new(base_cols);
+                for key in keys {
+                    result = result.with_key(key);
+                }
+                result
                 // Important: do not inherit keys of either input, as not unique.
             }
-            RelationExpr::ArrangeBy { input, .. } => input.typ(),
+            MirRelationExpr::ArrangeBy { input, .. } => input.typ(),
+            MirRelationExpr::DeclareKeys { input, keys } => input.typ().with_keys(keys.clone()),
         }
     }
 
@@ -440,7 +539,7 @@ impl RelationExpr {
     /// each row will have a multiplicity of one.
     pub fn constant(rows: Vec<Vec<Datum>>, typ: RelationType) -> Self {
         let rows = rows.into_iter().map(|row| (row, 1)).collect();
-        RelationExpr::constant_diff(rows, typ)
+        MirRelationExpr::constant_diff(rows, typ)
     }
 
     /// Constructs a constant collection from specific rows and schema, where
@@ -456,17 +555,16 @@ impl RelationExpr {
                 );
             }
         }
-        let mut row_packer = repr::RowPacker::new();
-        let rows = rows
+        let rows = Ok(rows
             .into_iter()
-            .map(move |(row, diff)| (row_packer.pack(row), diff))
-            .collect();
-        RelationExpr::Constant { rows, typ }
+            .map(move |(row, diff)| (Row::pack_slice(&row), diff))
+            .collect());
+        MirRelationExpr::Constant { rows, typ }
     }
 
     /// Constructs the expression for getting a global collection
     pub fn global_get(id: GlobalId, typ: RelationType) -> Self {
-        RelationExpr::Get {
+        MirRelationExpr::Get {
             id: Id::Global(id),
             typ,
         }
@@ -474,23 +572,23 @@ impl RelationExpr {
 
     /// Retains only the columns specified by `output`.
     pub fn project(self, outputs: Vec<usize>) -> Self {
-        RelationExpr::Project {
+        MirRelationExpr::Project {
             input: Box::new(self),
             outputs,
         }
     }
 
     /// Append to each row the results of applying elements of `scalar`.
-    pub fn map(self, scalars: Vec<ScalarExpr>) -> Self {
-        RelationExpr::Map {
+    pub fn map(self, scalars: Vec<MirScalarExpr>) -> Self {
+        MirRelationExpr::Map {
             input: Box::new(self),
             scalars,
         }
     }
 
     /// Like `map`, but yields zero-or-more output rows per input row
-    pub fn flat_map(self, func: TableFunc, exprs: Vec<ScalarExpr>) -> Self {
-        RelationExpr::FlatMap {
+    pub fn flat_map(self, func: TableFunc, exprs: Vec<MirScalarExpr>) -> Self {
+        MirRelationExpr::FlatMap {
             input: Box::new(self),
             func,
             exprs,
@@ -501,9 +599,9 @@ impl RelationExpr {
     /// Retain only the rows satisifying each of several predicates.
     pub fn filter<I>(self, predicates: I) -> Self
     where
-        I: IntoIterator<Item = ScalarExpr>,
+        I: IntoIterator<Item = MirScalarExpr>,
     {
-        RelationExpr::Filter {
+        MirRelationExpr::Filter {
             input: Box::new(self),
             predicates: predicates.into_iter().collect(),
         }
@@ -511,7 +609,7 @@ impl RelationExpr {
 
     /// Form the Cartesian outer-product of rows in both inputs.
     pub fn product(self, right: Self) -> Self {
-        RelationExpr::join(vec![self, right], vec![])
+        MirRelationExpr::join(vec![self, right], vec![])
     }
 
     /// Performs a relational equijoin among the input collections.
@@ -527,7 +625,7 @@ impl RelationExpr {
     ///
     /// ```rust
     /// use repr::{Datum, ColumnType, RelationType, ScalarType};
-    /// use expr::RelationExpr;
+    /// use expr::MirRelationExpr;
     ///
     /// // A common schema for each input.
     /// let schema = RelationType::new(vec![
@@ -539,14 +637,14 @@ impl RelationExpr {
     /// let data = vec![Datum::Int32(0), Datum::Int32(1)];
     ///
     /// // Three collections that could have been different.
-    /// let input0 = RelationExpr::constant(vec![data.clone()], schema.clone());
-    /// let input1 = RelationExpr::constant(vec![data.clone()], schema.clone());
-    /// let input2 = RelationExpr::constant(vec![data.clone()], schema.clone());
+    /// let input0 = MirRelationExpr::constant(vec![data.clone()], schema.clone());
+    /// let input1 = MirRelationExpr::constant(vec![data.clone()], schema.clone());
+    /// let input2 = MirRelationExpr::constant(vec![data.clone()], schema.clone());
     ///
     /// // Join the three relations looking for triangles, like so.
     /// //
     /// //     Output(A,B,C) := Input0(A,B), Input1(B,C), Input2(A,C)
-    /// let joined = RelationExpr::join(
+    /// let joined = MirRelationExpr::join(
     ///     vec![input0, input1, input2],
     ///     vec![
     ///         vec![(0,0), (2,0)], // fields A of inputs 0 and 2.
@@ -559,14 +657,14 @@ impl RelationExpr {
     /// // A projection resolves this and produces the correct output.
     /// let result = joined.project(vec![0, 1, 3]);
     /// ```
-    pub fn join(inputs: Vec<RelationExpr>, variables: Vec<Vec<(usize, usize)>>) -> Self {
+    pub fn join(inputs: Vec<MirRelationExpr>, variables: Vec<Vec<(usize, usize)>>) -> Self {
         let input_mapper = join_input_mapper::JoinInputMapper::new(&inputs);
 
         let equivalences = variables
             .into_iter()
             .map(|vs| {
                 vs.into_iter()
-                    .map(|(r, c)| input_mapper.map_expr_to_global(ScalarExpr::Column(c), r))
+                    .map(|(r, c)| input_mapper.map_expr_to_global(MirScalarExpr::Column(c), r))
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
@@ -575,8 +673,11 @@ impl RelationExpr {
     }
 
     /// Constructs a join operator from inputs and required-equal scalar expressions.
-    pub fn join_scalars(inputs: Vec<RelationExpr>, equivalences: Vec<Vec<ScalarExpr>>) -> Self {
-        RelationExpr::Join {
+    pub fn join_scalars(
+        inputs: Vec<MirRelationExpr>,
+        equivalences: Vec<Vec<MirScalarExpr>>,
+    ) -> Self {
+        MirRelationExpr::Join {
             inputs,
             equivalences,
             demand: None,
@@ -589,12 +690,18 @@ impl RelationExpr {
     /// The `group_key` argument indicates columns in the input collection that should
     /// be grouped, and `aggregates` lists aggregation functions each of which produces
     /// one output column in addition to the keys.
-    pub fn reduce(self, group_key: Vec<usize>, aggregates: Vec<AggregateExpr>) -> Self {
-        RelationExpr::Reduce {
+    pub fn reduce(
+        self,
+        group_key: Vec<usize>,
+        aggregates: Vec<AggregateExpr>,
+        expected_group_size: Option<usize>,
+    ) -> Self {
+        MirRelationExpr::Reduce {
             input: Box::new(self),
-            group_key: group_key.into_iter().map(ScalarExpr::Column).collect(),
+            group_key: group_key.into_iter().map(MirScalarExpr::Column).collect(),
             aggregates,
             monotonic: false,
+            expected_group_size,
         }
     }
 
@@ -611,7 +718,7 @@ impl RelationExpr {
         limit: Option<usize>,
         offset: usize,
     ) -> Self {
-        RelationExpr::TopK {
+        MirRelationExpr::TopK {
             input: Box::new(self),
             group_key,
             order_key,
@@ -623,7 +730,7 @@ impl RelationExpr {
 
     /// Negates the occurrences of each row.
     pub fn negate(self) -> Self {
-        RelationExpr::Negate {
+        MirRelationExpr::Negate {
             input: Box::new(self),
         }
     }
@@ -637,12 +744,12 @@ impl RelationExpr {
     /// Removes all but the first occurrence of each key. Columns not included
     /// in the `group_key` are discarded.
     pub fn distinct_by(self, group_key: Vec<usize>) -> Self {
-        self.reduce(group_key, vec![])
+        self.reduce(group_key, vec![], None)
     }
 
     /// Discards rows with a negative frequency.
     pub fn threshold(self) -> Self {
-        RelationExpr::Threshold {
+        MirRelationExpr::Threshold {
             input: Box::new(self),
         }
     }
@@ -653,11 +760,14 @@ impl RelationExpr {
     /// constructed.
     pub fn union_many(mut inputs: Vec<Self>, typ: RelationType) -> Self {
         if inputs.len() == 0 {
-            RelationExpr::Constant { rows: vec![], typ }
+            MirRelationExpr::Constant {
+                rows: Ok(vec![]),
+                typ,
+            }
         } else if inputs.len() == 1 {
             inputs.into_element()
         } else {
-            RelationExpr::Union {
+            MirRelationExpr::Union {
                 base: Box::new(inputs.remove(0)),
                 inputs,
             }
@@ -666,15 +776,15 @@ impl RelationExpr {
 
     /// Produces one collection where each row is present with the sum of its frequencies in each input.
     pub fn union(self, other: Self) -> Self {
-        RelationExpr::Union {
+        MirRelationExpr::Union {
             base: Box::new(self),
             inputs: vec![other],
         }
     }
 
     /// Arranges the collection by the specified columns
-    pub fn arrange_by(self, keys: &[Vec<ScalarExpr>]) -> Self {
-        RelationExpr::ArrangeBy {
+    pub fn arrange_by(self, keys: &[Vec<MirScalarExpr>]) -> Self {
+        MirRelationExpr::ArrangeBy {
             input: Box::new(self),
             keys: keys.to_owned(),
         }
@@ -685,7 +795,7 @@ impl RelationExpr {
     /// A false value does not mean the collection is known to be non-empty,
     /// only that we cannot currently determine that it is statically empty.
     pub fn is_empty(&self) -> bool {
-        if let RelationExpr::Constant { rows, .. } = self {
+        if let MirRelationExpr::Constant { rows: Ok(rows), .. } = self {
             rows.is_empty()
         } else {
             false
@@ -695,7 +805,7 @@ impl RelationExpr {
     /// Returns the distinct global identifiers on which this expression
     /// depends.
     ///
-    /// See [`Relationexpr::global_uses_into`] to reuse an existing vector.
+    /// See [`MirRelationExpr::global_uses_into`] to reuse an existing vector.
     pub fn global_uses(&self) -> Vec<GlobalId> {
         let mut out = vec![];
         self.global_uses_into(&mut out);
@@ -706,10 +816,10 @@ impl RelationExpr {
 
     /// Appends global identifiers on which this expression depends to `out`.
     ///
-    /// Unlike [`RelationExpr::global_uses`], this method does not deduplicate
+    /// Unlike [`MirRelationExpr::global_uses`], this method does not deduplicate
     /// the global identifiers.
     pub fn global_uses_into(&self, out: &mut Vec<GlobalId>) {
-        if let RelationExpr::Get {
+        if let MirRelationExpr::Get {
             id: Id::Global(id), ..
         } = self
         {
@@ -718,56 +828,59 @@ impl RelationExpr {
         self.visit1(|expr| expr.global_uses_into(out))
     }
 
-    /// Applies a fallible `f` to each child `RelationExpr`.
+    /// Applies a fallible `f` to each child `MirRelationExpr`.
     pub fn try_visit1<'a, F, E>(&'a self, mut f: F) -> Result<(), E>
     where
         F: FnMut(&'a Self) -> Result<(), E>,
     {
         match self {
-            RelationExpr::Constant { .. } | RelationExpr::Get { .. } => (),
-            RelationExpr::Let { value, body, .. } => {
+            MirRelationExpr::Constant { .. } | MirRelationExpr::Get { .. } => (),
+            MirRelationExpr::Let { value, body, .. } => {
                 f(value)?;
                 f(body)?;
             }
-            RelationExpr::Project { input, .. } => {
+            MirRelationExpr::Project { input, .. } => {
                 f(input)?;
             }
-            RelationExpr::Map { input, .. } => {
+            MirRelationExpr::Map { input, .. } => {
                 f(input)?;
             }
-            RelationExpr::FlatMap { input, .. } => {
+            MirRelationExpr::FlatMap { input, .. } => {
                 f(input)?;
             }
-            RelationExpr::Filter { input, .. } => {
+            MirRelationExpr::Filter { input, .. } => {
                 f(input)?;
             }
-            RelationExpr::Join { inputs, .. } => {
+            MirRelationExpr::Join { inputs, .. } => {
                 for input in inputs {
                     f(input)?;
                 }
             }
-            RelationExpr::Reduce { input, .. } => {
+            MirRelationExpr::Reduce { input, .. } => {
                 f(input)?;
             }
-            RelationExpr::TopK { input, .. } => {
+            MirRelationExpr::TopK { input, .. } => {
                 f(input)?;
             }
-            RelationExpr::Negate { input } => f(input)?,
-            RelationExpr::Threshold { input } => f(input)?,
-            RelationExpr::Union { base, inputs } => {
+            MirRelationExpr::Negate { input } => f(input)?,
+            MirRelationExpr::Threshold { input } => f(input)?,
+            MirRelationExpr::Union { base, inputs } => {
                 f(base)?;
                 for input in inputs {
                     f(input)?;
                 }
             }
-            RelationExpr::ArrangeBy { input, .. } => {
+            MirRelationExpr::ArrangeBy { input, .. } => {
+                f(input)?;
+            }
+            MirRelationExpr::DeclareKeys { input, .. } => {
                 f(input)?;
             }
         }
         Ok(())
     }
 
-    /// Applies an infallible `f` to each child `RelationExpr`.
+    /// Applies an infallible `f` to each child `MirRelationExpr`.
     pub fn visit1<'a, F>(&'a self, mut f: F)
     where
         F: FnMut(&'a Self),
@@ -779,7 +892,7 @@ impl RelationExpr {
         .unwrap()
     }
 
-    /// Post-order fallible visitor for each `RelationExpr`.
+    /// Post-order fallible visitor for each `MirRelationExpr`.
     pub fn try_visit<'a, F, E>(&'a self, f: &mut F) -> Result<(), E>
     where
         F: FnMut(&'a Self) -> Result<(), E>,
@@ -788,7 +901,7 @@ impl RelationExpr {
         f(self)
     }
 
-    /// Post-order infallible visitor for each `RelationExpr`.
+    /// Post-order infallible visitor for each `MirRelationExpr`.
     pub fn visit<'a, F>(&'a self, f: &mut F)
     where
         F: FnMut(&'a Self),
@@ -797,56 +910,59 @@ impl RelationExpr {
         f(self)
     }
 
-    /// Applies fallible `f` to each child `RelationExpr`.
+    /// Applies fallible `f` to each child `MirRelationExpr`.
     pub fn try_visit1_mut<'a, F, E>(&'a mut self, mut f: F) -> Result<(), E>
     where
         F: FnMut(&'a mut Self) -> Result<(), E>,
     {
         match self {
-            RelationExpr::Constant { .. } | RelationExpr::Get { .. } => (),
-            RelationExpr::Let { value, body, .. } => {
+            MirRelationExpr::Constant { .. } | MirRelationExpr::Get { .. } => (),
+            MirRelationExpr::Let { value, body, .. } => {
                 f(value)?;
                 f(body)?;
             }
-            RelationExpr::Project { input, .. } => {
+            MirRelationExpr::Project { input, .. } => {
                 f(input)?;
             }
-            RelationExpr::Map { input, .. } => {
+            MirRelationExpr::Map { input, .. } => {
                 f(input)?;
             }
-            RelationExpr::FlatMap { input, .. } => {
+            MirRelationExpr::FlatMap { input, .. } => {
                 f(input)?;
             }
-            RelationExpr::Filter { input, .. } => {
+            MirRelationExpr::Filter { input, .. } => {
                 f(input)?;
             }
-            RelationExpr::Join { inputs, .. } => {
+            MirRelationExpr::Join { inputs, .. } => {
                 for input in inputs {
                     f(input)?;
                 }
             }
-            RelationExpr::Reduce { input, .. } => {
+            MirRelationExpr::Reduce { input, .. } => {
                 f(input)?;
             }
-            RelationExpr::TopK { input, .. } => {
+            MirRelationExpr::TopK { input, .. } => {
                 f(input)?;
             }
-            RelationExpr::Negate { input } => f(input)?,
-            RelationExpr::Threshold { input } => f(input)?,
-            RelationExpr::Union { base, inputs } => {
+            MirRelationExpr::Negate { input } => f(input)?,
+            MirRelationExpr::Threshold { input } => f(input)?,
+            MirRelationExpr::Union { base, inputs } => {
                 f(base)?;
                 for input in inputs {
                     f(input)?;
                 }
             }
-            RelationExpr::ArrangeBy { input, .. } => {
+            MirRelationExpr::ArrangeBy { input, .. } => {
+                f(input)?;
+            }
+            MirRelationExpr::DeclareKeys { input, .. } => {
                 f(input)?;
             }
         }
         Ok(())
     }
 
-    /// Applies infallible `f` to each child `RelationExpr`.
+    /// Applies infallible `f` to each child `MirRelationExpr`.
     pub fn visit1_mut<'a, F>(&'a mut self, mut f: F)
     where
         F: FnMut(&'a mut Self),
@@ -858,7 +974,7 @@ impl RelationExpr {
         .unwrap()
     }
 
-    /// Post-order fallible visitor for each `RelationExpr`.
+    /// Post-order fallible visitor for each `MirRelationExpr`.
     pub fn try_visit_mut<F, E>(&mut self, f: &mut F) -> Result<(), E>
     where
         F: FnMut(&mut Self) -> Result<(), E>,
@@ -867,7 +983,7 @@ impl RelationExpr {
         f(self)
     }
 
-    /// Post-order infallible visitor for each `RelationExpr`.
+    /// Post-order infallible visitor for each `MirRelationExpr`.
     pub fn visit_mut<F>(&mut self, f: &mut F)
     where
         F: FnMut(&mut Self),
@@ -876,7 +992,7 @@ impl RelationExpr {
         f(self)
     }
 
-    /// Pre-order fallible visitor for each `RelationExpr`.
+    /// Pre-order fallible visitor for each `MirRelationExpr`.
     pub fn try_visit_mut_pre<F, E>(&mut self, f: &mut F) -> Result<(), E>
     where
         F: FnMut(&mut Self) -> Result<(), E>,
@@ -885,7 +1001,7 @@ impl RelationExpr {
         self.try_visit1_mut(|e| e.try_visit_mut_pre(f))
     }
 
-    /// Pre-order fallible visitor for each `RelationExpr`.
+    /// Pre-order fallible visitor for each `MirRelationExpr`.
     pub fn visit_mut_pre<F>(&mut self, f: &mut F)
     where
         F: FnMut(&mut Self),
@@ -894,18 +1010,27 @@ impl RelationExpr {
         self.visit1_mut(|e| e.visit_mut_pre(f))
     }
 
-    /// Fallible visitor for the [`ScalarExpr`]s in the relation expression.
-    /// Note that this does not recurse into the `ScalarExpr`s themselves.
+    /// Fallible visitor for the [`MirScalarExpr`]s in the relation expression.
+    /// Note that this does not recurse into the `MirScalarExpr`s themselves.
     pub fn try_visit_scalars_mut<F, E>(&mut self, f: &mut F) -> Result<(), E>
     where
-        F: FnMut(&mut ScalarExpr) -> Result<(), E>,
+        F: FnMut(&mut MirScalarExpr) -> Result<(), E>,
     {
         // Match written out explicitly to reduce the possibility of adding a
-        // new field with a `ScalarExpr` within and forgetting to account for it
+        // new field with a `MirScalarExpr` within and forgetting to account for it
         // here.
-        self.try_visit_mut(&mut |e| match e {
-            RelationExpr::Map { scalars, input: _ }
-            | RelationExpr::Filter {
+        self.try_visit_mut(&mut |e| e.try_visit_scalars_mut1(f))
+    }
+
+    /// Fallible visitor for the [`MirScalarExpr`]s directly owned by this relation expression.
+    /// This does not recursively descend into owned [`MirRelationExpr`]s.
+    pub fn try_visit_scalars_mut1<F, E>(&mut self, f: &mut F) -> Result<(), E>
+    where
+        F: FnMut(&mut MirScalarExpr) -> Result<(), E>,
+    {
+        match self {
+            MirRelationExpr::Map { scalars, input: _ }
+            | MirRelationExpr::Filter {
                 predicates: scalars,
                 input: _,
             } => {
@@ -914,7 +1039,7 @@ impl RelationExpr {
                 }
                 Ok(())
             }
-            RelationExpr::FlatMap {
+            MirRelationExpr::FlatMap {
                 exprs,
                 input: _,
                 func: _,
@@ -925,13 +1050,13 @@ impl RelationExpr {
                 }
                 Ok(())
             }
-            RelationExpr::Join {
+            MirRelationExpr::Join {
                 equivalences: keys,
                 inputs: _,
                 demand: _,
                 implementation: _,
             }
-            | RelationExpr::ArrangeBy { input: _, keys } => {
+            | MirRelationExpr::ArrangeBy { input: _, keys } => {
                 for key in keys {
                     for s in key {
                         f(s)?;
@@ -939,11 +1064,10 @@ impl RelationExpr {
                 }
                 Ok(())
             }
-            RelationExpr::Reduce {
+            MirRelationExpr::Reduce {
                 group_key,
                 aggregates,
-                input: _,
-                monotonic: _,
+                ..
             } => {
                 for s in group_key {
                     f(s)?;
@@ -953,18 +1077,18 @@ impl RelationExpr {
                 }
                 Ok(())
             }
-            RelationExpr::Constant { rows: _, typ: _ }
-            | RelationExpr::Get { id: _, typ: _ }
-            | RelationExpr::Let {
+            MirRelationExpr::Constant { rows: _, typ: _ }
+            | MirRelationExpr::Get { id: _, typ: _ }
+            | MirRelationExpr::Let {
                 id: _,
                 value: _,
                 body: _,
             }
-            | RelationExpr::Project {
+            | MirRelationExpr::Project {
                 input: _,
                 outputs: _,
             }
-            | RelationExpr::TopK {
+            | MirRelationExpr::TopK {
                 input: _,
                 group_key: _,
                 order_key: _,
@@ -972,16 +1096,17 @@ impl RelationExpr {
                 offset: _,
                 monotonic: _,
             }
-            | RelationExpr::Negate { input: _ }
-            | RelationExpr::Threshold { input: _ }
-            | RelationExpr::Union { base: _, inputs: _ } => Ok(()),
-        })
+            | MirRelationExpr::Negate { input: _ }
+            | MirRelationExpr::Threshold { input: _ }
+            | MirRelationExpr::DeclareKeys { input: _, keys: _ }
+            | MirRelationExpr::Union { base: _, inputs: _ } => Ok(()),
+        }
     }
 
     /// Like `try_visit_scalars_mut`, but the closure must be infallible.
     pub fn visit_scalars_mut<F>(&mut self, f: &mut F)
     where
-        F: FnMut(&mut ScalarExpr),
+        F: FnMut(&mut MirScalarExpr),
     {
         self.try_visit_scalars_mut(&mut |s| {
             f(s);
@@ -990,31 +1115,36 @@ impl RelationExpr {
         .unwrap()
     }
 
-    /// Pretty-print this RelationExpr to a string.
+    /// Pretty-print this MirRelationExpr to a string.
     ///
-    /// This method allows an additional IdHumanizer which can annotate
-    /// identifiers with additional information, perhaps human-meaningful names
-    /// for the identifiers.
-    pub fn pretty_humanized(&self, id_humanizer: &impl IdHumanizer) -> String {
-        self.explain(id_humanizer).to_string()
+    /// This method allows an additional `ExprHumanizer` which can annotate
+    /// identifiers with human-meaningful names for the identifiers.
+    pub fn pretty_humanized(&self, id_humanizer: &impl ExprHumanizer) -> String {
+        ViewExplanation::new(self, id_humanizer).to_string()
     }
 
-    /// Pretty-print this RelationExpr to a string.
+    /// Pretty-print this MirRelationExpr to a string.
     pub fn pretty(&self) -> String {
-        self.explain(&DummyHumanizer).to_string()
+        ViewExplanation::new(self, &DummyHumanizer).to_string()
     }
 
-    /// Take ownership of `self`, leaving an empty `RelationExpr::Constant` with the correct type.
-    pub fn take_safely(&mut self) -> RelationExpr {
+    /// Take ownership of `self`, leaving an empty `MirRelationExpr::Constant` with the correct type.
+    pub fn take_safely(&mut self) -> MirRelationExpr {
         let typ = self.typ();
-        std::mem::replace(self, RelationExpr::Constant { rows: vec![], typ })
+        std::mem::replace(
+            self,
+            MirRelationExpr::Constant {
+                rows: Ok(vec![]),
+                typ,
+            },
+        )
     }
-    /// Take ownership of `self`, leaving an empty `RelationExpr::Constant` with an **incorrect** type.
+    /// Take ownership of `self`, leaving an empty `MirRelationExpr::Constant` with an **incorrect** type.
     ///
     /// This should only be used if `self` is about to be dropped or otherwise overwritten.
-    pub fn take_dangerous(&mut self) -> RelationExpr {
-        let empty = RelationExpr::Constant {
-            rows: vec![],
+    pub fn take_dangerous(&mut self) -> MirRelationExpr {
+        let empty = MirRelationExpr::Constant {
+            rows: Ok(vec![]),
             typ: RelationType::new(Vec::new()),
         };
         std::mem::replace(self, empty)
@@ -1023,10 +1153,10 @@ impl RelationExpr {
     /// Replaces `self` with some logic applied to `self`.
     pub fn replace_using<F>(&mut self, logic: F)
     where
-        F: FnOnce(RelationExpr) -> RelationExpr,
+        F: FnOnce(MirRelationExpr) -> MirRelationExpr,
     {
-        let empty = RelationExpr::Constant {
-            rows: vec![],
+        let empty = MirRelationExpr::Constant {
+            rows: Ok(vec![]),
             typ: RelationType::new(Vec::new()),
         };
         let expr = std::mem::replace(self, empty);
@@ -1034,21 +1164,21 @@ impl RelationExpr {
     }
 
     /// Store `self` in a `Let` and pass the corresponding `Get` to `body`
-    pub fn let_in<Body>(self, id_gen: &mut IdGen, body: Body) -> super::RelationExpr
+    pub fn let_in<Body>(self, id_gen: &mut IdGen, body: Body) -> super::MirRelationExpr
     where
-        Body: FnOnce(&mut IdGen, RelationExpr) -> super::RelationExpr,
+        Body: FnOnce(&mut IdGen, MirRelationExpr) -> super::MirRelationExpr,
     {
-        if let RelationExpr::Get { .. } = self {
+        if let MirRelationExpr::Get { .. } = self {
             // already done
             body(id_gen, self)
         } else {
             let id = LocalId::new(id_gen.allocate_id());
-            let get = RelationExpr::Get {
+            let get = MirRelationExpr::Get {
                 id: Id::Local(id),
                 typ: self.typ(),
             };
             let body = (body)(id_gen, get);
-            RelationExpr::Let {
+            MirRelationExpr::Let {
                 id,
                 value: Box::new(self),
                 body: Box::new(body),
@@ -1061,12 +1191,12 @@ impl RelationExpr {
     pub fn anti_lookup(
         self,
         id_gen: &mut IdGen,
-        keys_and_values: RelationExpr,
+        keys_and_values: MirRelationExpr,
         default: Vec<(Datum, ColumnType)>,
-    ) -> RelationExpr {
+    ) -> MirRelationExpr {
         assert_eq!(keys_and_values.arity() - self.arity(), default.len());
         self.let_in(id_gen, |_id_gen, get_keys| {
-            RelationExpr::join(
+            MirRelationExpr::join(
                 vec![
                     // all the missing keys (with count 1)
                     keys_and_values
@@ -1086,7 +1216,7 @@ impl RelationExpr {
             // `.map(<default_expr>)`, but using a join allows for
             // potential predicate pushdown and elision in the
             // optimizer.
-            .product(RelationExpr::constant(
+            .product(MirRelationExpr::constant(
                 vec![default.iter().map(|(datum, _)| *datum).collect()],
                 RelationType::new(default.iter().map(|(_, typ)| typ.clone()).collect()),
             ))
@@ -1100,9 +1230,9 @@ impl RelationExpr {
     pub fn lookup(
         self,
         id_gen: &mut IdGen,
-        keys_and_values: RelationExpr,
+        keys_and_values: MirRelationExpr,
         default: Vec<(Datum<'static>, ColumnType)>,
-    ) -> RelationExpr {
+    ) -> MirRelationExpr {
         keys_and_values.let_in(id_gen, |id_gen, get_keys_and_values| {
             get_keys_and_values.clone().union(self.anti_lookup(
                 id_gen,
@@ -1110,6 +1240,25 @@ impl RelationExpr {
                 default,
             ))
         })
+    }
+
+    /// Passes the collection through unchanged, but informs the optimizer that `keys` are primary keys.
+    pub fn declare_keys(self, keys: Vec<Vec<usize>>) -> Self {
+        Self::DeclareKeys {
+            input: Box::new(self),
+            keys,
+        }
+    }
+
+    /// Returns whether this collection is just a `Get` wrapping an underlying bare source.
+    pub fn is_trivial_source(&self) -> bool {
+        matches!(
+            self,
+            MirRelationExpr::Get {
+                id: Id::LocalBareSource,
+                ..
+            }
+        )
     }
 }
 
@@ -1133,7 +1282,7 @@ impl fmt::Display for ColumnOrder {
     }
 }
 
-/// Manages the allocation of locally unique IDs when building a [`RelationExpr`].
+/// Manages the allocation of locally unique IDs when building a [`MirRelationExpr`].
 #[derive(Debug, Default)]
 pub struct IdGen {
     id: u64,
@@ -1154,7 +1303,7 @@ pub struct AggregateExpr {
     /// Names the aggregation function.
     pub func: AggregateFunc,
     /// An expression which extracts from each row the input to `func`.
-    pub expr: ScalarExpr,
+    pub expr: MirScalarExpr,
     /// Should the aggregation be applied only to distinct results in each group.
     pub distinct: bool,
 }
@@ -1163,6 +1312,18 @@ impl AggregateExpr {
     /// Computes the type of this `AggregateExpr`.
     pub fn typ(&self, relation_type: &RelationType) -> ColumnType {
         self.func.output_type(self.expr.typ(relation_type))
+    }
+}
+
+impl fmt::Display for AggregateExpr {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        write!(
+            f,
+            "{}({}{})",
+            self.func,
+            if self.distinct { "distinct " } else { "" },
+            self.expr
+        )
     }
 }
 
@@ -1179,15 +1340,15 @@ pub enum JoinImplementation {
     /// Each collection index should occur exactly once, either in the first
     /// position or somewhere in the list.
     Differential(
-        (usize, Option<Vec<ScalarExpr>>),
-        Vec<(usize, Vec<ScalarExpr>)>,
+        (usize, Option<Vec<MirScalarExpr>>),
+        Vec<(usize, Vec<MirScalarExpr>)>,
     ),
     /// Perform independent delta query dataflows for each input.
     ///
     /// The argument is a sequence of plans, for the input collections in order.
     /// Each plan starts from the corresponding index, and then in sequence joins
     /// against collections identified by index and with the specified arrangement key.
-    DeltaQuery(Vec<Vec<(usize, Vec<ScalarExpr>)>>),
+    DeltaQuery(Vec<Vec<(usize, Vec<MirScalarExpr>)>>),
     /// No implementation yet selected.
     Unimplemented,
 }
@@ -1242,11 +1403,11 @@ impl RowSetFinishing {
                 rows.drain(..offset);
             }
             rows.sort_by(&mut sort_by);
-            let mut row_packer = repr::RowPacker::new();
+            let mut row_packer = Row::default();
             for row in rows {
                 let datums = row.unpack();
-                let new_row = row_packer.pack(self.project.iter().map(|i| &datums[*i]));
-                *row = new_row;
+                row_packer.extend(self.project.iter().map(|i| &datums[*i]));
+                *row = row_packer.finish_and_reuse();
             }
         }
     }

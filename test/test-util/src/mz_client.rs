@@ -7,16 +7,15 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::time::Duration;
-
 use anyhow::Result;
+use tokio::time::{self, Duration};
 use tokio_postgres::{Client, Error, NoTls, Row};
 
 /// Create and return a new PostgreSQL client, spawning off the connection
 /// object along the way.
 pub async fn client(host: &str, port: u16) -> Result<Client> {
     let (mz_client, conn) = tokio_postgres::Config::new()
-        .user("mzd")
+        .user("materialize")
         .host(host)
         .port(port)
         .connect(NoTls)
@@ -79,7 +78,7 @@ fn check_error(e: Error) -> Result<()> {
 /// Limit the queries per second against a view in Materialize.
 async fn delay_for(elapsed: Duration, delay: Duration) {
     if elapsed < delay {
-        tokio::time::delay_for(delay - elapsed).await;
+        time::sleep(delay - elapsed).await;
     } else {
         log::info!(
             "Expected to query for records in {:#?}, took {:#?}",

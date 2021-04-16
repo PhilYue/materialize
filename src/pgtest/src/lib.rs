@@ -19,9 +19,13 @@
 //! - `until`: Waits until input messages have been received from the
 //! server. Additional messages are accumulated and returned as well.
 //!
+//! During debugging, set the environment variable `PGTEST_VERBOSE=1` to see
+//! messages sent and received.
+//!
 //! Supported `send` types:
 //! - [`Query`](struct.Query.html)
 //! - [`Parse`](struct.Parse.html)
+//! - [`Describe`](struct.Describe.html)
 //! - [`Bind`](struct.Bind.html)
 //! - [`Execute`](struct.Execute.html)
 //! - `Sync`
@@ -71,6 +75,7 @@ pub struct PgTest {
     recv_buf: BytesMut,
     send_buf: BytesMut,
     timeout: Duration,
+    verbose: bool,
 }
 
 impl PgTest {
@@ -80,7 +85,9 @@ impl PgTest {
             recv_buf: BytesMut::new(),
             send_buf: BytesMut::new(),
             timeout,
+            verbose: std::env::var_os("PGTEST_VERBOSE").is_some(),
         };
+        pgtest.stream.set_read_timeout(Some(timeout))?;
         pgtest.send(|buf| frontend::startup_message(vec![("user", user)], buf).unwrap())?;
         match pgtest.recv()?.1 {
             Message::AuthenticationOk => {}
@@ -105,7 +112,7 @@ impl PgTest {
             loop {
                 let (ch, msg) = match self.recv() {
                     Ok((ch, msg)) => (ch, msg),
-                    Err(err) => bail!("{}: waiting for {}, saw {:?}", err, expect, msgs),
+                    Err(err) => bail!("{}: waiting for {}, saw {:#?}", err, expect, msgs),
                 };
                 let (typ, args) = match msg {
                     Message::ReadyForQuery(body) => (
@@ -137,9 +144,14 @@ impl PgTest {
                                     .ranges()
                                     .map(|range| {
                                         let range = range.unwrap();
-                                        // TODO(mjibson): support not strings.
+                                        // Attempt to convert to a String. If not utf8, print as array of bytes instead.
                                         Ok(String::from_utf8(buf[range.start..range.end].to_vec())
-                                            .unwrap())
+                                            .unwrap_or_else(|_| {
+                                                format!(
+                                                    "{:?}",
+                                                    buf[range.start..range.end].to_vec()
+                                                )
+                                            }))
                                     })
                                     .collect()
                                     .unwrap(),
@@ -157,6 +169,26 @@ impl PgTest {
                     Message::PortalSuspended => ("PortalSuspended", "".to_string()),
                     Message::ErrorResponse(body) => (
                         "ErrorResponse",
+                        serde_json::to_string(&ErrorResponse {
+                            fields: body
+                                .fields()
+                                .filter_map(|f| {
+                                    let typ = f.type_() as char;
+                                    if err_field_typs.contains(&typ) {
+                                        Ok(Some(ErrorField {
+                                            typ,
+                                            value: f.value().to_string(),
+                                        }))
+                                    } else {
+                                        Ok(None)
+                                    }
+                                })
+                                .collect()
+                                .unwrap(),
+                        })?,
+                    ),
+                    Message::NoticeResponse(body) => (
+                        "NoticeResponse",
                         serde_json::to_string(&ErrorResponse {
                             fields: body
                                 .fields()
@@ -205,6 +237,9 @@ impl PgTest {
                     Message::NoData => ("NoData", "".to_string()),
                     _ => ("UNKNOWN", format!("'{}'", ch)),
                 };
+                if self.verbose {
+                    println!("RECV {}: {:?}", ch, typ);
+                }
                 let mut s = typ.to_string();
                 if !args.is_empty() {
                     s.push(' ');
@@ -316,6 +351,9 @@ pub fn run_test(tf: &mut datadriven::TestFile, addr: &str, user: &str, timeout: 
         match tc.directive.as_str() {
             "send" => {
                 for line in lines {
+                    if pgt.verbose {
+                        println!("SEND {}", line);
+                    }
                     let mut line = line.splitn(2, ' ');
                     let typ = line.next().unwrap_or("");
                     let args = line.next().unwrap_or("{}");
@@ -324,28 +362,30 @@ pub fn run_test(tf: &mut datadriven::TestFile, addr: &str, user: &str, timeout: 
                             let v: Query = serde_json::from_str(args).unwrap();
                             frontend::query(&v.query, buf).unwrap();
                         }
-                        "ReadyForQuery" => {
-                            let v: Query = serde_json::from_str(args).unwrap();
-                            frontend::query(&v.query, buf).unwrap();
-                        }
                         "Parse" => {
                             let v: Parse = serde_json::from_str(args).unwrap();
-                            frontend::parse("", &v.query, vec![], buf).unwrap();
+                            frontend::parse(
+                                &v.name.unwrap_or_else(|| "".into()),
+                                &v.query,
+                                vec![],
+                                buf,
+                            )
+                            .unwrap();
                         }
                         "Sync" => frontend::sync(buf),
                         "Bind" => {
                             let v: Bind = serde_json::from_str(args).unwrap();
                             let values = v.values.unwrap_or_default();
                             if frontend::bind(
-                                "",     // portal
-                                "",     // statement
+                                &v.portal.unwrap_or_else(|| "".into()),
+                                &v.statement.unwrap_or_else(|| "".into()),
                                 vec![], // formats
                                 values, // values
                                 |t, buf| {
                                     buf.put_slice(t.as_bytes());
                                     Ok(IsNull::No)
                                 }, // serializer
-                                vec![], // result_formats
+                                v.result_formats.unwrap_or_default(),
                                 buf,
                             )
                             .is_err()
@@ -354,11 +394,22 @@ pub fn run_test(tf: &mut datadriven::TestFile, addr: &str, user: &str, timeout: 
                             }
                         }
                         "Describe" => {
-                            frontend::describe(b'S', "", buf).unwrap();
+                            let v: Describe = serde_json::from_str(args).unwrap();
+                            frontend::describe(
+                                v.variant.unwrap_or_else(|| "S".into()).as_bytes()[0],
+                                &v.name.unwrap_or_else(|| "".into()),
+                                buf,
+                            )
+                            .unwrap();
                         }
                         "Execute" => {
                             let v: Execute = serde_json::from_str(args).unwrap();
-                            frontend::execute("", v.max_rows.unwrap_or(0), buf).unwrap();
+                            frontend::execute(
+                                &v.portal.unwrap_or_else(|| "".into()),
+                                v.max_rows.unwrap_or(0),
+                                buf,
+                            )
+                            .unwrap();
                         }
                         _ => panic!("unknown message type {}", typ),
                     })
@@ -401,17 +452,29 @@ pub struct Query {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Parse {
+    pub name: Option<String>,
     pub query: String,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Bind {
+    pub portal: Option<String>,
+    pub statement: Option<String>,
     pub values: Option<Vec<String>>,
+    pub result_formats: Option<Vec<i16>>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Execute {
+    pub portal: Option<String>,
     pub max_rows: Option<i32>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Describe {
+    pub variant: Option<String>,
+    pub name: Option<String>,
 }

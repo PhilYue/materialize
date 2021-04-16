@@ -6,6 +6,7 @@ a {
   }
 }
 
+
 .content {
   h1, h2, h3, h4, h5, h6 {
     font-weight: 500;
@@ -22,6 +23,7 @@ a {
 
   h1 {
     font-weight: bold;
+    font-size: 2.2rem;
     margin: 16px 0;
 
     + h2 {
@@ -30,7 +32,7 @@ a {
   }
 
   h2 {
-    font-size: 22px;
+    font-size: 1.8rem;
     margin: 32px 0 8px;
 
     + h3 {
@@ -40,7 +42,8 @@ a {
 
   h3 {
     color: $off-black;
-    font-size: 18px;
+    font-size: 1.6rem;
+    font-weight: lighter;
     margin: 32px 0 8px;
 
     + h4 {
@@ -54,12 +57,19 @@ a {
 
   h4 {
     color: $grey-dark;
-    font-size: 16px;
+    font-size: 1.4rem;
     margin: 32px 0 8px;
 
     a {
       color: $grey-dark;
     }
+  }
+
+  h5 {
+    font-size: 1.2rem;
+    font-style: italic;
+    font-weight: lighter;
+    margin: 32px 0px 8px 0px;
   }
 
   p, ul > li:first-child > p:first-child {
@@ -247,5 +257,46 @@ a {
 
   .symbol {
     color: $purple;
+  }
+
+  .breadcrumb {
+    margin-top: 1rem;
+    font-size: .9rem;
+    a {
+      color: $grey-dark;
+      font-weight: lighter;
+
+      &:hover {
+        color: $black;
+        opacity: 1.0;
+      }
+    }
+  }
+}
+
+#helpful {
+  border-top: 1px solid $grey;
+  margin-top: 3rem;
+  max-width: 40%;
+  padding-top: .5rem;
+  text-align: center;
+
+  table {
+    table-layout: fixed;
+    width: 100%;
+  }
+  tr {
+    border-style : hidden;
+  }
+  .helpful-vote {
+    border: 3px solid $purple;
+    color: $purple;
+    display: inline-block;
+    font-weight: bold;
+    padding: .7rem 0;
+    width:100%;
+  }
+  #got-feedback {
+    display: none;
   }
 }

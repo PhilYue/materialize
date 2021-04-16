@@ -1,23 +1,41 @@
+[advisories]
+ignore = [
+    # See: https://github.com/MaterializeInc/materialize/issues/6244
+    #
+    # The "vulnerability" here is just a DoS via excessive CPU and memory usage
+    # on large inputs, which is not a concern for our threat model.
+    "RUSTSEC-2021-0041"
+]
+
 [bans]
 multiple-versions = "deny"
 skip = [
     # Do not add to this list without good reason! Duplicate dependencies slow
     # down compilation and bloat the binary.
 
-    # Waiting for approximately the entire Rust ecosystem to upgrade to
-    # v1.0.0.
+    # Waiting for clap to upgrade to v0.12.
+    { name = "ansi_term", version = "0.11.0" },
+    # Waiting for clap to upgrade to v0.10.
+    { name = "strsim", version = "0.8.0" },
+
+    # Waiting on:
+    #   - Upgrade to rand v0.8.
+    #   - https://github.com/Alexhuszagh/rust-lexical/pull/54
     { name = "cfg-if", version = "0.1.0" },
 
-    # Waiting on mio 0.7: https://github.com/tokio-rs/tokio/issues/1190.
-    { name = "miow", version = "0.2.1" },
-    { name = "winapi", version = "0.2.8" },
+    # Waiting on phf to upgrade to rand v0.8.
+    { name = "getrandom", version = "0.1" },
+    { name = "rand", version = "0.7.3" },
+    { name = "rand_chacha", version = "0.2.2" },
+    { name = "rand_core", version = "0.5.1" },
+    { name = "rand_hc", version = "0.2.0" },
+    { name = "wasi", version = "0.10.0+wasi-snapshot-preview1" },
 
-    # Waiting on chrono to migrate to time v0.2.
-    { name = "time", version = "0.1.42" },
+    # Waiting on parse_duration.
+    { name = "num-bigint", version = "0.2.6" },
 
-    # Waiting on Rusoto to upgrade to pin-project v1.0
-    { name = "pin-project", version = "0.4.22" },
-    { name = "pin-project-internal", version = "0.4.22" }
+    # Waiting on https://github.com/hyperium/headers/pull/83.
+    { name = "time", version = "0.1.44" },
 ]
 deny = [
     # Strum has suspect code quality and includes many unneeded features. Use
@@ -32,6 +50,7 @@ allow = [
     "CC0-1.0",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    "ICU",
     "ISC",
     "MIT",
     "Zlib",
@@ -42,9 +61,14 @@ private = { ignore = true }
 unknown-git = "deny"
 unknown-registry = "deny"
 allow-git = [
+    "https://github.com/MaterializeInc/pubnub-rust.git",
+    # Until https://github.com/sfackler/rust-postgres/pull/752 is merged and released
+    "https://github.com/MaterializeInc/rust-postgres.git",
+    "https://github.com/MaterializeInc/rust-postgres-array.git",
     "https://github.com/MaterializeInc/rust-prometheus.git",
     "https://github.com/MaterializeInc/serde-protobuf.git",
     "https://github.com/TimelyDataflow/timely-dataflow",
     "https://github.com/TimelyDataflow/differential-dataflow.git",
     "https://github.com/fede1024/rust-rdkafka.git",
+    "https://github.com/rusoto/rusoto.git"
 ]

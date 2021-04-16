@@ -156,9 +156,12 @@ tests=(
     test/sqllogictest/cockroach/window.slt
     test/sqllogictest/cockroach/with.slt
     # test/sqllogictest/cockroach/zero.slt
+    test/sqllogictest/postgres/float4.slt
+    test/sqllogictest/postgres/float8.slt
     test/sqllogictest/postgres/join-lateral.slt
     test/sqllogictest/postgres/regex.slt
     test/sqllogictest/postgres/subselect.slt
+    test/sqllogictest/postgres/pgcrypto/*.slt
 )
 
 if [[ "${BUILDKITE-}" ]]; then

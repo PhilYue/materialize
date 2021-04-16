@@ -7,10 +7,12 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::io;
 
 use bytes::BytesMut;
+use coord::{CoordError, StartupMessage};
 use itertools::Itertools;
 use postgres::error::SqlState;
 
@@ -48,11 +50,12 @@ pub const VERSIONS: &[i32] = &[
 
 /// Like [`FrontendMessage`], but only the messages that can occur during
 /// startup protocol negotiation.
+#[derive(Debug)]
 pub enum FrontendStartupMessage {
     /// Begin a connection.
     Startup {
         version: i32,
-        params: Vec<(String, String)>,
+        params: HashMap<String, String>,
     },
 
     /// Request SSL encryption for the connection.
@@ -227,6 +230,12 @@ pub enum BackendMessage {
     CopyDone,
 }
 
+impl From<ErrorResponse> for BackendMessage {
+    fn from(err: ErrorResponse) -> BackendMessage {
+        BackendMessage::ErrorResponse(err)
+    }
+}
+
 /// A local representation of [`CoordTransactionStatus`]
 #[derive(Debug, Clone, Copy)]
 pub enum TransactionStatus {
@@ -238,21 +247,16 @@ pub enum TransactionStatus {
     Failed,
 }
 
-impl From<CoordTransactionStatus> for TransactionStatus {
-    /// Convert from the Session's version
-    fn from(status: CoordTransactionStatus) -> TransactionStatus {
-        match status {
-            CoordTransactionStatus::Idle => TransactionStatus::Idle,
-            CoordTransactionStatus::InTransaction => TransactionStatus::InTransaction,
-            CoordTransactionStatus::Failed => TransactionStatus::Failed,
-        }
-    }
-}
-
 impl From<&CoordTransactionStatus> for TransactionStatus {
     /// Convert from the Session's version
     fn from(status: &CoordTransactionStatus) -> TransactionStatus {
-        TransactionStatus::from(*status)
+        match status {
+            CoordTransactionStatus::Default => TransactionStatus::Idle,
+            CoordTransactionStatus::Started(_) => TransactionStatus::InTransaction,
+            CoordTransactionStatus::InTransaction(_) => TransactionStatus::InTransaction,
+            CoordTransactionStatus::InTransactionImplicit(_) => TransactionStatus::InTransaction,
+            CoordTransactionStatus::Failed => TransactionStatus::Failed,
+        }
     }
 }
 
@@ -288,6 +292,13 @@ impl ErrorResponse {
         ErrorResponse::new(Severity::Notice, code, message)
     }
 
+    pub fn warning<S>(code: SqlState, message: S) -> ErrorResponse
+    where
+        S: Into<String>,
+    {
+        ErrorResponse::new(Severity::Warning, code, message)
+    }
+
     fn new<S>(severity: Severity, code: SqlState, message: S) -> ErrorResponse
     where
         S: Into<String>,
@@ -302,21 +313,59 @@ impl ErrorResponse {
         }
     }
 
-    pub fn with_hint<S>(mut self, hint: S) -> ErrorResponse
-    where
-        S: Into<String>,
-    {
-        self.hint = Some(hint.into());
-        self
+    pub fn from_coord(severity: Severity, e: CoordError) -> ErrorResponse {
+        // TODO(benesch): we should only use `SqlState::INTERNAL_ERROR` for
+        // those errors that are truly internal errors. At the moment we have
+        // a various classes of uncategorized errors that use this error code
+        // inappropriately.
+        let code = match e {
+            CoordError::Catalog(_) => SqlState::INTERNAL_ERROR,
+            CoordError::ConstrainedParameter(_) => SqlState::INVALID_PARAMETER_VALUE,
+            CoordError::DuplicateCursor(_) => SqlState::DUPLICATE_CURSOR,
+            CoordError::Eval(_) => SqlState::INTERNAL_ERROR,
+            CoordError::IdExhaustionError => SqlState::INTERNAL_ERROR,
+            CoordError::InvalidParameterType(_) => SqlState::INVALID_PARAMETER_VALUE,
+            CoordError::OperationProhibitsTransaction(_) => SqlState::ACTIVE_SQL_TRANSACTION,
+            CoordError::OperationRequiresTransaction(_) => SqlState::NO_ACTIVE_SQL_TRANSACTION,
+            CoordError::ReadOnlyTransaction => SqlState::READ_ONLY_SQL_TRANSACTION,
+            CoordError::ReadOnlyParameter(_) => SqlState::CANT_CHANGE_RUNTIME_PARAM,
+            CoordError::SafeModeViolation(_) => SqlState::INTERNAL_ERROR,
+            CoordError::SqlCatalog(_) => SqlState::INTERNAL_ERROR,
+            CoordError::Transform(_) => SqlState::INTERNAL_ERROR,
+            CoordError::UnknownCursor(_) => SqlState::INVALID_CURSOR_NAME,
+            CoordError::UnknownParameter(_) => SqlState::UNDEFINED_OBJECT,
+            CoordError::UnknownLoginRole(_) => SqlState::INVALID_AUTHORIZATION_SPECIFICATION,
+            CoordError::Unstructured(_) => SqlState::INTERNAL_ERROR,
+            // It's not immediately clear which error code to use here because a
+            // "write-only transaction" is not a thing in Postgres. This error
+            // code is the generic "bad txn thing" code, so it's probably the
+            // best choice.
+            CoordError::WriteOnlyTransaction => SqlState::INVALID_TRANSACTION_STATE,
+        };
+        ErrorResponse {
+            severity,
+            code,
+            message: e.to_string(),
+            detail: e.detail(),
+            hint: e.hint(),
+            position: None,
+        }
+    }
+
+    pub fn from_startup_message(message: StartupMessage) -> ErrorResponse {
+        ErrorResponse {
+            severity: Severity::Notice,
+            code: SqlState::SUCCESSFUL_COMPLETION,
+            message: message.to_string(),
+            detail: message.detail(),
+            hint: message.hint(),
+            position: None,
+        }
     }
 
     pub fn with_position(mut self, position: usize) -> ErrorResponse {
         self.position = Some(position);
         self
-    }
-
-    pub fn into_message(self) -> BackendMessage {
-        BackendMessage::ErrorResponse(self)
     }
 }
 

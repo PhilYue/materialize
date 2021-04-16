@@ -12,6 +12,8 @@ Detail | Info
 -------|------
 **Quick Syntax** | `UUID 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'`
 **Size** | 16 bytes
+**Catalog name** | `pg_catalog.uuid`
+**OID** | 2950
 
 The `uuid` type is more space efficient than representing UUIDs as
 [`text`](../text). A UUID stored as `text` requires either 32 or 36 bytes,
@@ -45,17 +47,7 @@ Materialize will always output UUIDs in the standard form.
 
 ### Valid casts
 
-#### From `uuid`
-
-You can [cast](../../functions/cast) `uuid` to:
-
-- [`text`](../text)
-
-#### To `uuid`
-
-You can [cast](../../functions/cast) the following types to `uuid`:
-
-- [`text`](../text)
+You can [cast](../../functions/cast) `uuid` to [`text`](../text) by assignment and from [`text`](../text) explicitly.
 
 ## Examples
 

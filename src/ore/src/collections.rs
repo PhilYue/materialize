@@ -1,16 +1,13 @@
 // Copyright Materialize, Inc. All rights reserved.
 //
-// Use of this software is governed by the Business Source License
-// included in the LICENSE file.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0.
+// Use of this software is governed by the Apache license, Version 2.0
 
 //! Collection utilities.
 
+use std::fmt::Display;
+
 /// Extension methods for collections.
-pub trait CollectionExt<T>
+pub trait CollectionExt<T>: Sized
 where
     T: IntoIterator,
 {
@@ -27,7 +24,14 @@ where
     /// Consumes the collection and returns its only element.
     ///
     /// This method panics if the collection does not have exactly one element.
-    fn into_element(self) -> T::Item;
+    fn into_element(self) -> T::Item {
+        self.expect_element("into_element called on collection with more than one element")
+    }
+
+    /// Consumes the collection and returns its only element.
+    ///
+    /// This method panics with the given error message if the collection does not have exactly one element.
+    fn expect_element<Err: Display>(self, msg: Err) -> T::Item;
 }
 
 impl<T> CollectionExt<T> for T
@@ -42,11 +46,11 @@ where
         self.into_iter().last().unwrap()
     }
 
-    fn into_element(self) -> T::Item {
+    fn expect_element<Err: Display>(self, msg: Err) -> T::Item {
         let mut iter = self.into_iter();
         match (iter.next(), iter.next()) {
             (Some(el), None) => el,
-            _ => panic!("into_element called on collection with more than one element"),
+            _ => panic!("{}", msg),
         }
     }
 }

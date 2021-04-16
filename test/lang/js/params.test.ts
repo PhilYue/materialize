@@ -12,6 +12,7 @@ import { Client } from "pg";
 const client = new Client({
   port: parseInt(process.env.PGPORT, 10) || 6875,
   database: process.env.PGDATABASE || "materialize",
+  user: process.env.PGUSER || "materialize",
 });
 
 beforeAll(async () => await client.connect());
@@ -39,9 +40,9 @@ describe("query api", () => {
   });
 
   it("should include the prepared statement name in the error message", async () => {
-    await expect(
-      client.query({ text: "SELECT $1", name: "foo" }),
-    ).rejects.toThrow(bindError({ expected: 1, actual: 0, name: "foo" }));
+    await expect(client.query({ text: "SELECT $1", name: "foo" })).rejects.toThrow(
+      bindError({ expected: 1, actual: 0, name: "foo" }),
+    );
   });
 
   it("should allow queries with the correct number of parameters", async () => {

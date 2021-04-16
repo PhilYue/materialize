@@ -23,5 +23,7 @@ pub mod logging;
 pub mod source;
 
 pub use server::{
-    serve, BroadcastToken, CacheMessage, SequencedCommand, WorkerFeedback, WorkerFeedbackWithMeta,
+    serve, CacheMessage, Config, SequencedCommand, WorkerFeedback, WorkerFeedbackWithMeta,
 };
+
+pub use render::filter::FilterPlan;

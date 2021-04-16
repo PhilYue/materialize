@@ -11,18 +11,22 @@
 
 use std::collections::{HashMap, HashSet};
 
+use ore::str::StrExt;
+use sql_parser::ast::RawName;
+
 use crate::ast::visit::{self, Visit};
 use crate::ast::visit_mut::{self, VisitMut};
 use crate::ast::{
-    CreateIndexStatement, CreateSinkStatement, CreateSourceStatement, CreateTableStatement,
-    CreateViewStatement, Expr, Ident, ObjectName, Query, Statement,
+    AstInfo, CreateIndexStatement, CreateSinkStatement, CreateSourceStatement,
+    CreateTableStatement, CreateViewStatement, Expr, Ident, Query, Raw, Statement,
+    UnresolvedObjectName,
 };
 use crate::names::FullName;
 
 /// Changes the `name` used in an item's `CREATE` statement. To complete a
 /// rename operation, you must also call `create_stmt_rename_refs` on all dependent
 /// items.
-pub fn create_stmt_rename(create_stmt: &mut Statement, to_item_name: String) {
+pub fn create_stmt_rename(create_stmt: &mut Statement<Raw>, to_item_name: String) {
     // TODO(sploiselle): Support renaming schemas and databases.
     match create_stmt {
         Statement::CreateIndex(CreateIndexStatement { name, .. }) => {
@@ -32,7 +36,11 @@ pub fn create_stmt_rename(create_stmt: &mut Statement, to_item_name: String) {
         | Statement::CreateSource(CreateSourceStatement { name, .. })
         | Statement::CreateView(CreateViewStatement { name, .. })
         | Statement::CreateTable(CreateTableStatement { name, .. }) => {
-            name.0[2] = Ident::new(to_item_name);
+            // The last name in an ObjectName is the item name. The item name
+            // does not have a fixed index.
+            // TODO: https://github.com/MaterializeInc/materialize/issues/5591
+            let object_name_len = name.0.len() - 1;
+            name.0[object_name_len] = Ident::new(to_item_name);
         }
         _ => unreachable!("Internal error: only catalog items can be renamed"),
     }
@@ -51,14 +59,18 @@ pub fn create_stmt_rename(create_stmt: &mut Statement, to_item_name: String) {
 ///   the rename. Right now, given the first condition, this is just a coherence
 ///   check, but will be more meaningful once the first restriction is lifted.
 pub fn create_stmt_rename_refs(
-    create_stmt: &mut Statement,
+    create_stmt: &mut Statement<Raw>,
     from_name: FullName,
     to_item_name: String,
 ) -> Result<(), String> {
-    let from_object = ObjectName::from(from_name.clone());
-    let maybe_update_object_name = |object_name: &mut ObjectName| {
+    let from_object = UnresolvedObjectName::from(from_name.clone());
+    let maybe_update_object_name = |object_name: &mut UnresolvedObjectName| {
         if object_name.0 == from_object.0 {
-            object_name.0[2] = Ident::new(to_item_name.clone());
+            // The last name in an ObjectName is the item name. The item name
+            // does not have a fixed index.
+            // TODO: https://github.com/MaterializeInc/materialize/issues/5591
+            let object_name_len = object_name.0.len() - 1;
+            object_name.0[object_name_len] = Ident::new(to_item_name.clone());
         }
     };
 
@@ -81,7 +93,7 @@ pub fn create_stmt_rename_refs(
 }
 
 /// Rewrites `query`'s references of `from` to `to` or errors if too ambiguous.
-fn rewrite_query(from: FullName, to: String, query: &mut Query) -> Result<(), String> {
+fn rewrite_query(from: FullName, to: String, query: &mut Query<Raw>) -> Result<(), String> {
     let from_ident = Ident::new(from.item.clone());
     let to_ident = Ident::new(to);
     let qual_depth =
@@ -96,7 +108,11 @@ fn rewrite_query(from: FullName, to: String, query: &mut Query) -> Result<(), St
 }
 
 fn ambiguous_err(n: &Ident, t: &str) -> String {
-    format!("\"{}\" potentially used ambiguously as item and {}", n, t)
+    format!(
+        "{} potentially used ambiguously as item and {}",
+        n.as_str().quoted(),
+        t
+    )
 }
 
 /// Visits a [`Query`], assessing catalog item [`Ident`]s' use of a specified `Ident`.
@@ -129,7 +145,7 @@ impl<'a> QueryIdentAgg<'a> {
     fn determine_qual_depth(
         name: &Ident,
         fail_on: Option<Ident>,
-        query: &Query,
+        query: &Query<Raw>,
     ) -> Result<usize, String> {
         let mut v = QueryIdentAgg {
             qualifiers: HashMap::new(),
@@ -162,8 +178,8 @@ impl<'a> QueryIdentAgg<'a> {
 
         if v.min_qual_depth < req_depth {
             Err(format!(
-                "\"{}\" is not sufficiently qualified to support renaming",
-                name
+                "{} is not sufficiently qualified to support renaming",
+                name.as_str().quoted()
             ))
         } else {
             Ok(req_depth)
@@ -176,9 +192,10 @@ impl<'a> QueryIdentAgg<'a> {
         if let Some(f) = &self.fail_on {
             if v.iter().any(|i| i == f) {
                 self.err = Some(format!(
-                    "found reference to \"{}\"; cannot rename \"{}\" to any identity \
+                    "found reference to {}; cannot rename {} to any identity \
                     used in any existing view definitions",
-                    f, self.name
+                    f.as_str().quoted(),
+                    self.name.as_str().quoted()
                 ));
                 return;
             }
@@ -186,8 +203,8 @@ impl<'a> QueryIdentAgg<'a> {
     }
 }
 
-impl<'a, 'ast> Visit<'ast> for QueryIdentAgg<'a> {
-    fn visit_expr(&mut self, e: &'ast Expr) {
+impl<'a, 'ast> Visit<'ast, Raw> for QueryIdentAgg<'a> {
+    fn visit_expr(&mut self, e: &'ast Expr<Raw>) {
         match e {
             Expr::Identifier(i) => {
                 self.check_failure(i);
@@ -220,8 +237,8 @@ impl<'a, 'ast> Visit<'ast> for QueryIdentAgg<'a> {
         }
     }
 
-    fn visit_object_name(&mut self, object_name: &'ast ObjectName) {
-        let names = &object_name.0;
+    fn visit_unresolved_object_name(&mut self, unresolved_object_name: &'ast UnresolvedObjectName) {
+        let names = &unresolved_object_name.0;
         self.check_failure(names);
         // Every item is used as an `ObjectName` at least once, which
         // lets use track all items named `self.name`.
@@ -239,6 +256,12 @@ impl<'a, 'ast> Visit<'ast> for QueryIdentAgg<'a> {
             }
         }
     }
+
+    fn visit_object_name(&mut self, object_name: &'ast <Raw as AstInfo>::ObjectName) {
+        match object_name {
+            RawName::Name(n) | RawName::Id(_, n) => self.visit_unresolved_object_name(n),
+        }
+    }
 }
 
 struct CreateSqlRewriter {
@@ -251,7 +274,7 @@ impl CreateSqlRewriter {
         from_name: FullName,
         to_name: Ident,
         qual_depth: usize,
-        query: &mut Query,
+        query: &mut Query<Raw>,
     ) {
         let from = match qual_depth {
             1 => vec![Ident::new(from_name.item)],
@@ -274,8 +297,8 @@ impl CreateSqlRewriter {
     }
 }
 
-impl<'ast> VisitMut<'ast> for CreateSqlRewriter {
-    fn visit_expr_mut(&mut self, e: &'ast mut Expr) {
+impl<'ast> VisitMut<'ast, Raw> for CreateSqlRewriter {
+    fn visit_expr_mut(&mut self, e: &'ast mut Expr<Raw>) {
         match e {
             Expr::Identifier(id) => {
                 // The last ID component is a column name that should not be
@@ -289,7 +312,18 @@ impl<'ast> VisitMut<'ast> for CreateSqlRewriter {
             _ => visit_mut::visit_expr_mut(self, e),
         }
     }
-    fn visit_object_name_mut(&mut self, object_name: &'ast mut ObjectName) {
-        self.maybe_rewrite_idents(&mut object_name.0);
+    fn visit_unresolved_object_name_mut(
+        &mut self,
+        unresolved_object_name: &'ast mut UnresolvedObjectName,
+    ) {
+        self.maybe_rewrite_idents(&mut unresolved_object_name.0);
+    }
+    fn visit_object_name_mut(
+        &mut self,
+        object_name: &'ast mut <sql_parser::ast::Raw as AstInfo>::ObjectName,
+    ) {
+        match object_name {
+            RawName::Name(n) | RawName::Id(_, n) => self.maybe_rewrite_idents(&mut n.0),
+        }
     }
 }

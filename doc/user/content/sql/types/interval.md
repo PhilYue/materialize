@@ -12,6 +12,8 @@ Detail | Info
 -------|-----
 **Quick Syntax** | `INTERVAL '1' MINUTE` <br/> `INTERVAL '1-2 3 4:5:6.7'` <br/>`INTERVAL '1 year 2.3 days 4.5 seconds'`
 **Size** | 20 bytes
+**Catalog name** | `pg_catalog.interval`
+**OID** | 1186
 **Min value** | -178956970 years -7 months -2236962132 days -07:59:59.999999
 **Max value** | 178956970 years 7 months 2236962132 days 07:59:59.999999
 
@@ -64,9 +66,9 @@ stipulations:
     writes to all other `time_units` in the same group, even if that `time_unit`
     is not explicitly referenced.
 
-    For example, the `time_expr` `'1:2'` (1 hour, 2 minutes) also writes a value of
-    0 seconds. You cannot then include another `time_expr` which writes to the
-    seconds `time_unit`.
+    For example, the `time_expr` `'1:2'` (1 hour, 2 minutes) also writes a value
+    of 0 seconds. You cannot then include another `time_expr` which writes to
+    the seconds `time_unit`.
 
 - Only PostgreSQL `time_expr`s support non-second fractional `time_units`, e.g.
     `1.2 days`. Materialize only supports 9 places of decimal precision.
@@ -77,22 +79,22 @@ stipulations:
 
 You can [cast](../../functions/cast) `interval` to:
 
-- [`text`](../text)
-- [`time`](../time)
+- [`text`](../text) (by assignment)
+- [`time`](../time)  (by assignment)
 
-#### To `time`
+#### To `interval`
 
-You can [cast](../../functions/cast) the following types to `interval`:
+You can [cast](../../functions/cast) from the following types to `interval`:
 
-- [`text`](../text)
-- [`time`](../time)
+- [`text`](../text) (explicitly)
+- [`time`](../time)  (explicity)
 
 ### Valid operations
 
 `interval` data supports the following operations with other types.
 
-Operation | Computes
-----------|---------
+Operation | Computes | Notes
+----------|----------|-------
 [`date`](../date) `+` [`interval`](../interval) | [`timestamp`](../timestamp)
 [`date`](../date) `-` [`interval`](../interval) | [`timestamp`](../timestamp)
 [`date`](../date) `-` [`date`](../date) | [`interval`](../interval)
@@ -102,6 +104,8 @@ Operation | Computes
 [`time`](../time) `+` [`interval`](../interval) | `time`
 [`time`](../time) `-` [`interval`](../interval) | `time`
 [`time`](../time) `-` [`time`](../time) | [`interval`](../interval)
+[`interval`](../interval) `*` [`double precision`](../float) | [`interval`](../interval) | {{< version-added v0.6.1 />}}
+[`interval`](../interval) `/` [`double precision`](../float) | [`interval`](../interval) | {{< version-added v0.6.1 />}}
 
 ## Examples
 

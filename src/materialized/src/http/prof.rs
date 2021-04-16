@@ -9,29 +9,30 @@
 
 //! Profiling HTTP endpoints.
 
+use std::borrow::Cow;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt::Write;
-use std::{borrow::Cow, cell::RefCell, collections::HashMap, future::Future, time::Duration};
+use std::time::Duration;
 
 use askama::Template;
 use cfg_if::cfg_if;
 use hyper::{Body, Request, Response};
 
-use prof::{collate_stacks, time::prof_time, ProfStartTime, StackProfile};
+use prof::{ProfStartTime, StackProfile};
 
-use super::util;
-use crate::http::Server;
+use crate::http::util;
+use crate::BUILD_INFO;
 
-impl Server {
-    pub fn handle_prof(
-        &self,
-        req: Request<Body>,
-    ) -> impl Future<Output = anyhow::Result<Response<Body>>> {
-        cfg_if! {
-            if #[cfg(target_os = "macos")] {
-                disabled::handle(req)
-            } else {
-                enabled::handle(req)
-            }
+pub async fn handle_prof(
+    req: Request<Body>,
+    _: &mut coord::SessionClient,
+) -> Result<Response<Body>, anyhow::Error> {
+    cfg_if! {
+        if #[cfg(target_os = "macos")] {
+            disabled::handle(req).await
+        } else {
+            enabled::handle(req).await
         }
     }
 }
@@ -80,7 +81,8 @@ async fn time_prof<'a>(
     let merge_threads = params.get("threads").map(AsRef::as_ref) == Some("merge");
     // SAFETY: We ensure above that memory profiling is off.
     // Since we hold the mutex, nobody else can be turning it back on in the intervening time.
-    let stacks = unsafe { prof_time(Duration::from_secs(10), 99, merge_threads) }.await?;
+    let stacks =
+        unsafe { prof::time::prof_time(Duration::from_secs(10), 99, merge_threads) }.await?;
     // Fail with a compile error if we weren't holding the jemalloc lock.
     drop(ctl_lock);
     flamegraph(stacks, "CPU Time Flamegraph", false, &[])
@@ -92,7 +94,7 @@ fn flamegraph(
     display_bytes: bool,
     extras: &[&str],
 ) -> anyhow::Result<Response<Body>> {
-    let collated = collate_stacks(stacks);
+    let collated = prof::collate_stacks(stacks);
     let data_json = RefCell::new(String::new());
     collated.dfs(
         |node| {
@@ -107,13 +109,13 @@ fn flamegraph(
         |_node, is_last| {
             data_json.borrow_mut().push_str("]}");
             if !is_last {
-                data_json.borrow_mut().push_str(",");
+                data_json.borrow_mut().push(',');
             }
         },
     );
     let data_json = &*data_json.borrow();
     Ok(util::template_response(FlamegraphTemplate {
-        version: crate::VERSION,
+        version: BUILD_INFO.version,
         title,
         data_json,
         display_bytes,
@@ -122,17 +124,19 @@ fn flamegraph(
 }
 
 mod disabled {
+    use std::collections::HashMap;
+
     use hyper::{Body, Method, Request, Response, StatusCode};
+    use url::form_urlencoded;
 
     use super::{time_prof, MemProfilingStatus, ProfTemplate};
     use crate::http::util;
-    use std::collections::HashMap;
-    use url::form_urlencoded;
+    use crate::BUILD_INFO;
 
     pub async fn handle(req: Request<Body>) -> anyhow::Result<Response<Body>> {
         match req.method() {
             &Method::GET => Ok(util::template_response(ProfTemplate {
-                version: crate::VERSION,
+                version: BUILD_INFO.version,
                 mem_prof: MemProfilingStatus::Disabled,
             })),
             &Method::POST => handle_post(req).await,
@@ -167,11 +171,14 @@ mod disabled {
 
 #[cfg(not(target_os = "macos"))]
 mod enabled {
-
+    use std::borrow::Cow;
+    use std::collections::HashMap;
+    use std::fmt::Write;
     use std::io::{BufReader, Read};
-    use std::{collections::HashMap, sync::Arc};
+    use std::sync::Arc;
 
     use hyper::{header, Body, Method, Request, Response, StatusCode};
+    use prof::symbolicate;
     use tokio::sync::Mutex;
     use url::form_urlencoded;
 
@@ -179,6 +186,7 @@ mod enabled {
 
     use super::{flamegraph, time_prof, MemProfilingStatus, ProfTemplate};
     use crate::http::util;
+    use crate::BUILD_INFO;
 
     struct HumanFormattedBytes(usize);
     impl std::fmt::Display for HumanFormattedBytes {
@@ -254,6 +262,42 @@ mod enabled {
                     .body(Body::from(s))
                     .unwrap())
             }
+            "dump_symbolicated_file" => {
+                let mut borrow = prof_ctl.lock().await;
+                let f = borrow.dump()?;
+                let r = BufReader::new(f);
+                let stacks = parse_jeheap(r)?;
+                let syms = symbolicate(&stacks);
+                let mut s = String::new();
+                // Emitting the format expected by Brendan Gregg's flamegraph tool.
+                //
+                // foo;bar;quux 30
+                // foo;bar;asdf 40
+                //
+                // etc.
+                for (stack, _anno) in stacks.iter() {
+                    for (i, addr) in stack.addrs.iter().enumerate() {
+                        let syms = match syms.get(addr) {
+                            Some(syms) => Cow::Borrowed(syms),
+                            None => Cow::Owned(vec!["???".to_string()]),
+                        };
+                        for (j, sym) in syms.iter().enumerate() {
+                            if j != 0 || i != 0 {
+                                s.push_str(";");
+                            }
+                            s.push_str(&*sym);
+                        }
+                    }
+                    writeln!(&mut s, " {}", stack.weight).unwrap();
+                }
+                Ok(Response::builder()
+                    .header(
+                        header::CONTENT_DISPOSITION,
+                        "attachment; filename=\"mz.fg\"",
+                    )
+                    .body(Body::from(s))
+                    .unwrap())
+            }
             "mem_fg" => {
                 let mut borrow = prof_ctl.lock().await;
                 let f = borrow.dump()?;
@@ -290,7 +334,7 @@ mod enabled {
 
     pub fn handle_get(prof_md: JemallocProfMetadata) -> anyhow::Result<Response<Body>> {
         Ok(util::template_response(ProfTemplate {
-            version: crate::VERSION,
+            version: BUILD_INFO.version,
             mem_prof: MemProfilingStatus::Enabled(prof_md.start_time),
         }))
     }

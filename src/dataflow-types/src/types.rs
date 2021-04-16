@@ -19,14 +19,17 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Context;
+use globset::Glob;
 use log::warn;
 use regex::Regex;
-use rusoto_core::Region;
 use serde::{Deserialize, Serialize};
 use timely::progress::frontier::Antichain;
+use tokio::sync::mpsc;
 use url::Url;
+use uuid::Uuid;
 
-use expr::{GlobalId, OptimizedRelationExpr, PartitionId, RelationExpr, ScalarExpr};
+use aws_util::aws;
+use expr::{GlobalId, MirRelationExpr, MirScalarExpr, OptimizedMirRelationExpr, PartitionId};
 use interchange::avro::{self, DebeziumDeduplicationStrategy};
 use interchange::protobuf::{decode_descriptors, validate_descriptors};
 use kafka_util::KafkaAddrs;
@@ -64,16 +67,16 @@ pub struct Update {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BuildDesc {
     pub id: GlobalId,
-    pub relation_expr: OptimizedRelationExpr,
+    pub relation_expr: OptimizedMirRelationExpr,
     /// If building a view, the types of columns of the built view
     /// None if building an index
     pub typ: Option<RelationType>,
 }
 
 /// A description of a dataflow to construct and results to surface.
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct DataflowDesc {
-    pub source_imports: BTreeMap<GlobalId, SourceDesc>,
+    pub source_imports: BTreeMap<GlobalId, (SourceDesc, GlobalId)>,
     pub index_imports: BTreeMap<GlobalId, (IndexDesc, RelationType)>,
     /// Views and indexes to be built and stored in the local context.
     /// Objects must be built in the specific order as the Vec
@@ -98,9 +101,10 @@ pub struct DataflowDesc {
 
 impl DataflowDesc {
     pub fn new(name: String) -> Self {
-        let mut dd = DataflowDesc::default();
-        dd.debug_name = name;
-        dd
+        DataflowDesc {
+            debug_name: name,
+            ..Default::default()
+        }
     }
 
     pub fn add_index_import(
@@ -114,33 +118,39 @@ impl DataflowDesc {
         self.add_dependency(requesting_view, id);
     }
 
-    pub fn add_dependency(&mut self, view_id: GlobalId, dependent_id: GlobalId) {
+    /// Records a dependency of `view_id` on `depended_upon`.
+    fn add_dependency(&mut self, view_id: GlobalId, depended_upon: GlobalId) {
         self.dependent_objects
             .entry(view_id)
             .or_insert_with(Vec::new)
-            .push(dependent_id);
+            .push(depended_upon);
     }
 
     pub fn add_source_import(
         &mut self,
         id: GlobalId,
         connector: SourceConnector,
-        desc: RelationDesc,
+        bare_desc: RelationDesc,
+        orig_id: GlobalId,
     ) {
         let source_description = SourceDesc {
             connector,
             operators: None,
-            desc,
+            bare_desc,
         };
-        self.source_imports.insert(id, source_description);
+        self.source_imports
+            .insert(id, (source_description, orig_id));
     }
 
     pub fn add_view_to_build(
         &mut self,
         id: GlobalId,
-        expr: OptimizedRelationExpr,
+        expr: OptimizedMirRelationExpr,
         typ: RelationType,
     ) {
+        for get_id in expr.as_ref().global_uses() {
+            self.add_dependency(id, get_id);
+        }
         self.objects_to_build.push(BuildDesc {
             id,
             relation_expr: expr,
@@ -153,14 +163,16 @@ impl DataflowDesc {
         id: GlobalId,
         on_id: GlobalId,
         on_type: RelationType,
-        keys: Vec<ScalarExpr>,
+        keys: Vec<MirScalarExpr>,
     ) {
         self.objects_to_build.push(BuildDesc {
             id,
-            relation_expr: OptimizedRelationExpr::declare_optimized(RelationExpr::ArrangeBy {
-                input: Box::new(RelationExpr::global_get(on_id, on_type)),
-                keys: vec![keys],
-            }),
+            relation_expr: OptimizedMirRelationExpr::declare_optimized(
+                MirRelationExpr::ArrangeBy {
+                    input: Box::new(MirRelationExpr::global_get(on_id, on_type)),
+                    keys: vec![keys],
+                },
+            ),
             typ: None,
         });
     }
@@ -170,7 +182,7 @@ impl DataflowDesc {
         id: GlobalId,
         on_id: GlobalId,
         on_type: RelationType,
-        keys: Vec<ScalarExpr>,
+        keys: Vec<MirScalarExpr>,
     ) {
         self.index_exports
             .push((id, IndexDesc { on_id, keys }, on_type));
@@ -182,14 +194,29 @@ impl DataflowDesc {
         from_id: GlobalId,
         from_desc: RelationDesc,
         connector: SinkConnector,
+        envelope: SinkEnvelope,
+        as_of: SinkAsOf,
     ) {
+        let key_desc = connector.get_key_desc().cloned();
+        let value_desc = connector.get_value_desc().clone();
         self.sink_exports.push((
             id,
             SinkDesc {
-                from: (from_id, from_desc),
+                from: from_id,
+                from_desc,
+                key_desc,
+                value_desc,
                 connector,
+                envelope,
+                as_of,
             },
         ));
+    }
+
+    /// Returns true iff the id is already imported.
+    pub fn is_imported(&self, id: &GlobalId) -> bool {
+        self.objects_to_build.iter().any(|bd| &bd.id == id)
+            || self.source_imports.iter().any(|(i, _)| i == id)
     }
 
     /// Assigns the `as_of` frontier to the supplied argument.
@@ -226,7 +253,7 @@ impl DataflowDesc {
             result.extend(self.get_imports(&desc.on_id))
         }
         for (_, sink) in &self.sink_exports {
-            result.extend(self.get_imports(&sink.from.0))
+            result.extend(self.get_imports(&sink.from))
         }
         result
     }
@@ -251,9 +278,9 @@ impl DataflowDesc {
 
     /// The number of columns associated with an identifier in the dataflow.
     pub fn arity_of(&self, id: &GlobalId) -> usize {
-        for (source_id, desc) in self.source_imports.iter() {
+        for (source_id, (desc, _orig_id)) in self.source_imports.iter() {
             if source_id == id {
-                return desc.desc.typ().arity();
+                return desc.bare_desc.arity();
             }
         }
         for (_index_id, (desc, typ)) in self.index_imports.iter() {
@@ -279,6 +306,7 @@ pub enum DataEncoding {
     Protobuf(ProtobufEncoding),
     Csv(CsvEncoding),
     Regex(RegexEncoding),
+    Postgres(RelationDesc),
     Bytes,
     Text,
 }
@@ -286,11 +314,11 @@ pub enum DataEncoding {
 impl DataEncoding {
     /// Computes the [`RelationDesc`] for the relation specified by the this
     /// data encoding and envelope.s
-    pub fn desc(&self, envelope: &Envelope) -> Result<RelationDesc, anyhow::Error> {
+    pub fn desc(&self, envelope: &SourceEnvelope) -> Result<RelationDesc, anyhow::Error> {
         // Add columns for the key, if using the upsert envelope.
         let key_desc = match envelope {
-            Envelope::Upsert(key_encoding) => {
-                let key_desc = key_encoding.desc(&Envelope::None)?;
+            SourceEnvelope::Upsert(key_encoding) => {
+                let key_desc = key_encoding.desc(&SourceEnvelope::None)?;
 
                 // It doesn't make sense for the key to have keys.
                 assert!(key_desc.typ().keys.is_empty());
@@ -314,32 +342,49 @@ impl DataEncoding {
         // Add columns for the data, based on the encoding format.
         Ok(match self {
             DataEncoding::Bytes => key_desc.with_column("data", ScalarType::Bytes.nullable(false)),
-            DataEncoding::AvroOcf(AvroOcfEncoding { reader_schema }) => {
-                avro::validate_value_schema(&*reader_schema, envelope.get_avro_envelope_type())
-                    .context("validating avro ocf reader schema")?
-                    .into_iter()
-                    .fold(key_desc, |desc, (name, ty)| desc.with_column(name, ty))
-            }
-            DataEncoding::Avro(AvroEncoding {
-                value_schema,
-                key_schema,
-                ..
-            }) => {
-                let desc =
+            DataEncoding::AvroOcf(AvroOcfEncoding { .. })
+            | DataEncoding::Avro(AvroEncoding { .. }) => {
+                let (value_schema, key_schema) = match self {
+                    DataEncoding::AvroOcf(AvroOcfEncoding { reader_schema }) => {
+                        (reader_schema, None)
+                    }
+                    DataEncoding::Avro(AvroEncoding {
+                        key_schema,
+                        value_schema,
+                        ..
+                    }) => (value_schema, key_schema.as_ref()),
+                    _ => unreachable!(),
+                };
+                let mut columns =
                     avro::validate_value_schema(value_schema, envelope.get_avro_envelope_type())
                         .context("validating avro value schema")?
                         .into_iter()
-                        .fold(key_desc, |desc, (name, ty)| desc.with_column(name, ty));
-                if let Some(key_schema) = key_schema {
-                    match avro::validate_key_schema(key_schema, &desc) {
-                        Ok(key) => desc.with_key(key),
-                        Err(e) => {
+                        .collect::<Vec<_>>();
+                if envelope.get_avro_envelope_type() == avro::EnvelopeType::Debezium {
+                    // TODO [btv] - Get rid of this, when we can. Right now source processing is still not fully orthogonal,
+                    // so we have some special logic in the debezium processor that only passes on
+                    // the first two columns ("before" and "after"), and uses the information in the other ones itself
+                    columns.truncate(2);
+                }
+                let desc = columns
+                    .into_iter()
+                    .fold(key_desc, |desc, (name, ty)| desc.with_column(name, ty));
+                let key_schema_indices = key_schema.as_ref().and_then(|key_schema| {
+                    avro::validate_key_schema(key_schema, &desc)
+                        .map(Some)
+                        .unwrap_or_else(|e| {
                             warn!("Not using key due to error: {}", e);
-                            desc
-                        }
-                    }
-                } else {
+                            None
+                        })
+                });
+                if envelope.get_avro_envelope_type() == avro::EnvelopeType::Debezium {
                     desc
+                } else {
+                    if let Some(key) = key_schema_indices {
+                        desc.with_key(key)
+                    } else {
+                        desc
+                    }
                 }
             }
             DataEncoding::Protobuf(ProtobufEncoding {
@@ -348,6 +393,10 @@ impl DataEncoding {
             }) => {
                 let d = decode_descriptors(descriptors)?;
                 validate_descriptors(message_name, &d)?
+                    .into_iter()
+                    .fold(key_desc, |desc, (name, ty)| {
+                        desc.with_column(name.unwrap(), ty)
+                    })
             }
             DataEncoding::Regex(RegexEncoding { regex }) => regex
                 .capture_names()
@@ -371,6 +420,7 @@ impl DataEncoding {
                 })
             }
             DataEncoding::Text => key_desc.with_column("text", ScalarType::String.nullable(false)),
+            DataEncoding::Postgres(desc) => desc.clone(),
         })
     }
 
@@ -383,6 +433,7 @@ impl DataEncoding {
             DataEncoding::Regex { .. } => "Regex",
             DataEncoding::Csv(_) => "Csv",
             DataEncoding::Text => "Text",
+            DataEncoding::Postgres(_) => "Postgres",
         }
     }
 }
@@ -393,6 +444,7 @@ pub struct AvroEncoding {
     pub key_schema: Option<String>,
     pub value_schema: String,
     pub schema_registry_config: Option<ccsr::ClientConfig>,
+    pub confluent_wire_format: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -432,40 +484,64 @@ pub struct SourceDesc {
     /// Optionally, filtering and projection that may optimistically be applied
     /// to the output of the source.
     pub operators: Option<LinearOperator>,
-    pub desc: RelationDesc,
-}
-
-impl SourceDesc {
-    /// Computes the arity of this source.
-    pub fn arity(&self) -> usize {
-        self.desc.arity()
-    }
+    pub bare_desc: RelationDesc,
 }
 
 /// A sink for updates to a relational collection.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct SinkDesc {
-    pub from: (GlobalId, RelationDesc),
+    pub from: GlobalId,
+    pub from_desc: RelationDesc,
+    pub value_desc: RelationDesc,
+    pub key_desc: Option<RelationDesc>,
     pub connector: SinkConnector,
+    pub envelope: SinkEnvelope,
+    pub as_of: SinkAsOf,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SinkEnvelope {
+    Debezium,
+    Upsert,
+    Tail { emit_progress: bool },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SinkAsOf {
+    pub frontier: Antichain<Timestamp>,
+    pub strict: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum Envelope {
+pub enum SourceEnvelope {
     None,
-    Debezium(DebeziumDeduplicationStrategy),
+    Debezium(DebeziumDeduplicationStrategy, DebeziumMode),
     Upsert(DataEncoding),
     CdcV2,
 }
 
-impl Envelope {
+impl SourceEnvelope {
     pub fn get_avro_envelope_type(&self) -> avro::EnvelopeType {
         match self {
-            Envelope::None => avro::EnvelopeType::None,
-            Envelope::Debezium { .. } => avro::EnvelopeType::Debezium,
-            Envelope::Upsert(_) => avro::EnvelopeType::Upsert,
-            Envelope::CdcV2 => avro::EnvelopeType::CdcV2,
+            SourceEnvelope::None => avro::EnvelopeType::None,
+            SourceEnvelope::Debezium { .. } => avro::EnvelopeType::Debezium,
+            SourceEnvelope::Upsert(_) => avro::EnvelopeType::Upsert,
+            SourceEnvelope::CdcV2 => avro::EnvelopeType::CdcV2,
         }
     }
+}
+
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DebeziumMode {
+    Plain,
+    /// Keep track of keys from upstream and discard retractions for new keys
+    Upsert,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum Compression {
+    Gzip,
+    None,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -473,11 +549,37 @@ pub enum SourceConnector {
     External {
         connector: ExternalSourceConnector,
         encoding: DataEncoding,
-        envelope: Envelope,
+        envelope: SourceEnvelope,
         consistency: Consistency,
         ts_frequency: Duration,
     },
     Local,
+}
+
+impl SourceConnector {
+    /// Returns `true` if this connector yields input data (including
+    /// timestamps) that is stable across restarts. This is important for
+    /// exactly-once Sinks that need to ensure that the same data is written,
+    /// even when failures/restarts happen.
+    pub fn yields_stable_input(&self) -> bool {
+        if let SourceConnector::External {
+            connector: ExternalSourceConnector::Kafka(_),
+            consistency: Consistency::BringYourOwn(_),
+            ..
+        } = self
+        {
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn caching_enabled(&self) -> bool {
+        match self {
+            SourceConnector::External { connector, .. } => connector.caching_enabled(),
+            SourceConnector::Local => false,
+        }
+    }
 }
 
 pub fn cached_files(e: &ExternalSourceConnector) -> Vec<PathBuf> {
@@ -495,15 +597,31 @@ pub enum ExternalSourceConnector {
     Kinesis(KinesisSourceConnector),
     File(FileSourceConnector),
     AvroOcf(FileSourceConnector),
+    S3(S3SourceConnector),
+    Postgres(PostgresSourceConnector),
+    PubNub(PubNubSourceConnector),
 }
 
 impl ExternalSourceConnector {
+    /// Returns the name and type of each additional metadata column that
+    /// Materialize will automatically append to the source's inherent columns.
+    ///
+    /// Presently, each source type exposes precisely one metadata column that
+    /// corresponds to some source-specific record counter. For example, file
+    /// sources use a line number, while Kafka sources use a topic offset.
+    ///
+    /// The columns declared here must be kept in sync with the actual source
+    /// implementations that produce these columns.
     pub fn metadata_columns(&self) -> Vec<(ColumnName, ColumnType)> {
         match self {
             Self::Kafka(_) => vec![("mz_offset".into(), ScalarType::Int64.nullable(false))],
             Self::File(_) => vec![("mz_line_no".into(), ScalarType::Int64.nullable(false))],
             Self::Kinesis(_) => vec![("mz_offset".into(), ScalarType::Int64.nullable(false))],
             Self::AvroOcf(_) => vec![("mz_obj_no".into(), ScalarType::Int64.nullable(false))],
+            // TODO: should we include object key and possibly object-internal offset here?
+            Self::S3(_) => vec![("mz_record".into(), ScalarType::Int64.nullable(false))],
+            Self::Postgres(_) => vec![],
+            Self::PubNub(_) => vec![],
         }
     }
 
@@ -514,6 +632,9 @@ impl ExternalSourceConnector {
             ExternalSourceConnector::Kinesis(_) => "kinesis",
             ExternalSourceConnector::File(_) => "file",
             ExternalSourceConnector::AvroOcf(_) => "avro-ocf",
+            ExternalSourceConnector::S3(_) => "s3",
+            ExternalSourceConnector::Postgres(_) => "postgres",
+            ExternalSourceConnector::PubNub(_) => "pubnub",
         }
     }
 
@@ -558,12 +679,12 @@ pub struct KafkaOffset {
 /// with Timestamp.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum TimestampSourceUpdate {
-    /// Update for an RT source: contains an updated partition count for this source
-    RealTime(i32),
-    ///  Timestamp update for a BYO source: contains an updated partition count for this source,
-    /// combined with a PartitionID, Timestamp, MzOffset tuple. This tuple informs workers that
-    /// messages with Offset on PartitionId will be timestamped with Timestamp.
-    BringYourOwn(i32, PartitionId, u64, MzOffset),
+    /// Update for an RT source: contains a new partition to add to this source.
+    RealTime(PartitionId),
+    /// Timestamp update for a BYO source: contains a PartitionID, Timestamp,
+    /// MzOffset tuple. This tuple informs workers that messages with Offset on
+    /// PartitionId will be timestamped with Timestamp.
+    BringYourOwn(PartitionId, u64, MzOffset),
 }
 
 /// Convert from KafkaOffset to MzOffset (1-indexed)
@@ -591,11 +712,12 @@ pub struct KafkaSourceConnector {
     pub topic: String,
     // Represents options specified by user when creating the source, e.g.
     // security settings.
-    pub config_options: HashMap<String, String>,
+    pub config_options: BTreeMap<String, String>,
     // Map from partition -> starting offset
     pub start_offsets: HashMap<i32, i64>,
     pub group_id_prefix: Option<String>,
     pub enable_caching: bool,
+    pub cluster_id: Uuid,
     // This field gets set after the initial construction of this struct, so this is None if it has
     // not yet been set.
     pub cached_files: Option<Vec<PathBuf>>,
@@ -604,19 +726,52 @@ pub struct KafkaSourceConnector {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct KinesisSourceConnector {
     pub stream_name: String,
-    pub region: Region,
-    pub access_key_id: Option<String>,
-    pub secret_access_key: Option<String>,
-    pub token: Option<String>,
+    pub aws_info: aws::ConnectInfo,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FileSourceConnector {
     pub path: PathBuf,
     pub tail: bool,
+    pub compression: Compression,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PostgresSourceConnector {
+    pub conn: String,
+    pub publication: String,
+    pub namespace: String,
+    pub table: String,
+    pub cast_exprs: Vec<MirScalarExpr>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PubNubSourceConnector {
+    pub subscribe_key: String,
+    pub channel: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct S3SourceConnector {
+    pub key_sources: Vec<S3KeySource>,
+    pub pattern: Option<Glob>,
+    pub aws_info: aws::ConnectInfo,
+    pub compression: Compression,
+}
+
+/// A Source of Object Key names, the argument of the `DISCOVER OBJECTS` clause
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum S3KeySource {
+    /// Scan the S3 Bucket to discover keys to download
+    Scan { bucket: String },
+    /// Load object keys based on the contents of an S3 Notifications channel
+    ///
+    /// S3 notifications channels can be configured to go to SQS, which is the
+    /// only target we currently support.
+    SqsNotifications { queue: String },
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub enum SinkConnector {
     Kafka(KafkaSinkConnector),
     Tail(TailSinkConnector),
@@ -627,48 +782,70 @@ pub enum SinkConnector {
 pub struct KafkaSinkConsistencyConnector {
     pub topic: String,
     pub schema_id: i32,
+    // gate_ts is the most recent high watermark tailed from the consistency topic
+    // Exactly-once sinks use this to determine when they should start publishing again. This
+    // tells them when they have caught up to where the previous materialize instance stopped.
+    pub gate_ts: Option<Timestamp>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct KafkaSinkConnector {
     pub addrs: KafkaAddrs,
     pub topic: String,
+    pub key_desc_and_indices: Option<(RelationDesc, Vec<usize>)>,
+    pub value_desc: RelationDesc,
     pub key_schema_id: Option<i32>,
     pub value_schema_id: i32,
     pub consistency: Option<KafkaSinkConsistencyConnector>,
+    pub exactly_once: bool,
     // Maximum number of records the sink will attempt to send each time it is
     // invoked
     pub fuel: usize,
-    pub frontier: Antichain<Timestamp>,
-    pub strict: bool,
-    pub config_options: HashMap<String, String>,
-    pub key_indices: Option<Vec<usize>>,
+    pub config_options: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AvroOcfSinkConnector {
+    pub value_desc: RelationDesc,
     pub path: PathBuf,
-    pub frontier: Antichain<Timestamp>,
-    pub strict: bool,
 }
 
 impl SinkConnector {
-    pub fn get_frontier(&self) -> Antichain<Timestamp> {
+    pub fn get_key_desc(&self) -> Option<&RelationDesc> {
         match self {
-            SinkConnector::AvroOcf(avro) => avro.frontier.clone(),
-            SinkConnector::Kafka(kafka) => kafka.frontier.clone(),
-            SinkConnector::Tail(tail) => tail.frontier.clone(),
+            SinkConnector::Kafka(k) => k.key_desc_and_indices.as_ref().map(|(desc, _indices)| desc),
+            SinkConnector::Tail(_) => None,
+            SinkConnector::AvroOcf(_) => None,
+        }
+    }
+
+    pub fn get_key_indices(&self) -> Option<&[usize]> {
+        match self {
+            SinkConnector::Kafka(k) => k
+                .key_desc_and_indices
+                .as_ref()
+                .map(|(_desc, indices)| indices.as_slice()),
+            SinkConnector::Tail(_) => None,
+            SinkConnector::AvroOcf(_) => None,
+        }
+    }
+
+    pub fn get_value_desc(&self) -> &RelationDesc {
+        match self {
+            SinkConnector::Kafka(k) => &k.value_desc,
+            SinkConnector::Tail(t) => &t.value_desc,
+            SinkConnector::AvroOcf(a) => &a.value_desc,
         }
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct TailSinkConnector {
-    pub tx: comm::mpsc::Sender<Vec<Row>>,
-    pub frontier: Antichain<Timestamp>,
-    pub strict: bool,
+    #[serde(skip)]
+    pub tx: mpsc::UnboundedSender<Vec<Row>>,
     pub emit_progress: bool,
     pub object_columns: usize,
+    pub value_desc: RelationDesc,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -681,32 +858,36 @@ pub enum SinkConnectorBuilder {
 pub struct AvroOcfSinkConnectorBuilder {
     pub path: PathBuf,
     pub file_name_suffix: String,
+    pub value_desc: RelationDesc,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct KafkaSinkConnectorBuilder {
     pub broker_addrs: KafkaAddrs,
     pub schema_registry_url: Url,
+    pub key_schema: Option<String>,
     pub value_schema: String,
+    pub key_desc_and_indices: Option<(RelationDesc, Vec<usize>)>,
+    pub value_desc: RelationDesc,
     pub topic_prefix: String,
-    pub topic_suffix: String,
-    pub replication_factor: u32,
+    pub topic_suffix_nonce: String,
+    pub partition_count: i32,
+    pub replication_factor: i32,
     pub fuel: usize,
     pub consistency_value_schema: Option<String>,
-    pub config_options: HashMap<String, String>,
+    pub config_options: BTreeMap<String, String>,
     pub ccsr_config: ccsr::ClientConfig,
-    pub key_indices: Option<Vec<usize>>,
-    pub key_schema: Option<String>,
+    pub exactly_once: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash)]
 /// An index storing processed updates so they can be queried
 /// or reused in other computations
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash)]
 pub struct IndexDesc {
     /// Identity of the collection the index is on.
     pub on_id: GlobalId,
     /// Expressions to be arranged, in order of decreasing primacy.
-    pub keys: Vec<ScalarExpr>,
+    pub keys: Vec<MirScalarExpr>,
 }
 
 // TODO: change contract to ensure that the operator is always applied to
@@ -725,7 +906,7 @@ pub struct IndexDesc {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash)]
 pub struct LinearOperator {
     /// Rows that do not pass all predicates may be discarded.
-    pub predicates: Vec<ScalarExpr>,
+    pub predicates: Vec<MirScalarExpr>,
     /// Columns not present in `projection` may be replaced with
     /// default values.
     pub projection: Vec<usize>,

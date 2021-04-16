@@ -11,7 +11,11 @@
 
 #![deny(missing_debug_implementations)]
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
+
+use repr::{ColumnType, ScalarType};
 
 mod id;
 mod linear;
@@ -20,45 +24,86 @@ mod scalar;
 
 pub mod explain;
 
-pub use id::{DummyHumanizer, GlobalId, Id, IdHumanizer, LocalId, PartitionId, SourceInstanceId};
-pub use linear::MapFilterProject;
+pub use relation::canonicalize;
+
+pub use id::{GlobalId, Id, LocalId, PartitionId, SourceInstanceId};
+pub use linear::{memoize_expr, MapFilterProject};
 pub use relation::func::{AggregateFunc, TableFunc};
 pub use relation::func::{AnalyzedRegex, CaptureGroupDesc};
 pub use relation::join_input_mapper::JoinInputMapper;
 pub use relation::{
-    compare_columns, AggregateExpr, ColumnOrder, IdGen, JoinImplementation, RelationExpr,
+    compare_columns, AggregateExpr, ColumnOrder, IdGen, JoinImplementation, MirRelationExpr,
     RowSetFinishing,
 };
 pub use scalar::func::{BinaryFunc, NullaryFunc, UnaryFunc, VariadicFunc};
-pub use scalar::{like_pattern, EvalError, ScalarExpr};
+pub use scalar::{like_pattern, EvalError, MirScalarExpr};
 
-/// A [`RelationExpr`] that claims to have been optimized, e.g., by an
-/// [`Optimizer`].
+/// A [`MirRelationExpr`] that claims to have been optimized, e.g., by an
+/// `transform::Optimizer`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash)]
-pub struct OptimizedRelationExpr(pub RelationExpr);
+pub struct OptimizedMirRelationExpr(pub MirRelationExpr);
 
-impl OptimizedRelationExpr {
+impl OptimizedMirRelationExpr {
     /// Declare that the input `expr` is optimized, without actually running it
     /// through an optimizer. This can be useful to mark as optimized literal
-    /// `RelationExpr`s that are obviously optimal, without invoking the whole
+    /// `MirRelationExpr`s that are obviously optimal, without invoking the whole
     /// machinery of the optimizer.
-    pub fn declare_optimized(expr: RelationExpr) -> OptimizedRelationExpr {
-        OptimizedRelationExpr(expr)
+    pub fn declare_optimized(expr: MirRelationExpr) -> OptimizedMirRelationExpr {
+        OptimizedMirRelationExpr(expr)
     }
 
-    pub fn into_inner(self) -> RelationExpr {
+    pub fn into_inner(self) -> MirRelationExpr {
         self.0
     }
 }
 
-impl AsRef<RelationExpr> for OptimizedRelationExpr {
-    fn as_ref(&self) -> &RelationExpr {
+impl AsRef<MirRelationExpr> for OptimizedMirRelationExpr {
+    fn as_ref(&self) -> &MirRelationExpr {
         &self.0
     }
 }
 
-impl AsMut<RelationExpr> for OptimizedRelationExpr {
-    fn as_mut(&mut self) -> &mut RelationExpr {
+impl AsMut<MirRelationExpr> for OptimizedMirRelationExpr {
+    fn as_mut(&mut self) -> &mut MirRelationExpr {
         &mut self.0
+    }
+}
+
+/// A trait for humanizing components of an expression.
+pub trait ExprHumanizer: fmt::Debug {
+    /// Attempts to return the a human-readable string for the relation
+    /// identified by `id`.
+    fn humanize_id(&self, id: GlobalId) -> Option<String>;
+
+    /// Returns a human-readable name for the specified scalar type.
+    fn humanize_scalar_type(&self, ty: &ScalarType) -> String;
+
+    /// Returns a human-readable name for the specified scalar type.
+    fn humanize_column_type(&self, ty: &ColumnType) -> String;
+}
+
+/// A bare-minimum implementation of [`ExprHumanizer`].
+///
+/// The `DummyHumanizer` does a poor job of humanizing expressions. It is
+/// intended for use in contexts where polish is not required, like in tests or
+/// while debugging.
+#[derive(Debug)]
+pub struct DummyHumanizer;
+
+impl ExprHumanizer for DummyHumanizer {
+    fn humanize_id(&self, _: GlobalId) -> Option<String> {
+        // Returning `None` allows the caller to fall back to displaying the
+        // ID, if they so desire.
+        None
+    }
+
+    fn humanize_scalar_type(&self, ty: &ScalarType) -> String {
+        // The debug implementation is better than nothing.
+        format!("{:?}", ty)
+    }
+
+    fn humanize_column_type(&self, ty: &ColumnType) -> String {
+        // The debug implementation is better than nothing.
+        format!("{:?}", ty)
     }
 }

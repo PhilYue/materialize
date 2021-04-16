@@ -15,7 +15,10 @@ menu:
 Detail | Info
 -------|------
 **Quick Syntax** | `'foo'`
+**Aliases** | `string`
 **Size** | Variable
+**Catalog name** | `pg_catalog.text`
+**OID** | 25
 
 ## Syntax
 
@@ -23,8 +26,8 @@ Detail | Info
 
 {{< diagram "type-text.svg" >}}
 
-To escape a single quote character (`'`) in a standard string literal, write
-two adjacent single quotes:
+To escape a single quote character (`'`) in a standard string literal, write two
+adjacent single quotes:
 
 ```sql
 SELECT 'single''quote' AS output
@@ -70,12 +73,12 @@ in order to ensure that escape string literals are always valid UTF-8.
 
 #### From `text`
 
-You can [cast](../../functions/cast) `text` to [all types](../). Casts from
-text will error if the string is not valid input for the destination type.
+You can [cast](../../functions/cast) `text` to [all types](../) except [`record`](../../types/record/). All casts are explicit. Casts from text
+will error if the string is not valid input for the destination type.
 
 #### To `text`
 
-You can [cast](../../functions/cast) [all types](../) to `text`.
+You can [cast](../../functions/cast) [all types](../) to `text`. All casts are by assignment.
 
 ## Examples
 

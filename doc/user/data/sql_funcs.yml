@@ -27,6 +27,10 @@
     description: Aggregate values (including nulls) as a jsonb array.
     url: jsonb_agg
 
+  - signature: jsonb_object_agg(keys, values) -> jsonb
+    description: Aggregate keys and values (including nulls) as a jsonb object.
+    url: jsonb_object_agg
+
   - signature: 'max(x: T) -> T'
     description: Maximum value among `T`
 
@@ -49,10 +53,13 @@
     description: Sample standard deviation of `T`'s values. *(imprecise)*
       <br><br>
       Returns `numeric` if `x` is `int`, `double` if `x` is `real`, else returns
-      same typ as `x`.
+      same type as `x`.
 
-  - signature: 'sum(x: T) -> T'
+  - signature: 'sum(x: T) -> U'
     description: Sum of `T`'s values
+      <br><br>
+      Returns `bigint` if `x` is `int`, `numeric` if `x` is `bigint`, else returns
+      same type as `x`.
 
   - signature: 'variance(x: T) -> U'
     description: Historical alias for `variance_samp`. *(imprecise)*
@@ -70,28 +77,121 @@
       Returns `numeric` if `x` is `int`, `double` if `x` is `real`, else returns
       same type as `x`.
 
+- type: List
+  description: List functions take [`list`](../types/list) arguments, and are [polymorphic](../types/list/#polymorphism).
+  functions:
+    - signature: 'list_append(l: listany, e: listelementany) -> L'
+      description: Appends `e` to `l`.
+
+    - signature: 'list_cat(l1: listany, l2: listany) -> L'
+      description: Concatenates `l1` and `l2`.
+
+    - signature: 'list_ndims(l: listany) -> int'
+      description: '[Experimental](/cli/#experimental-mode)––Returns the number of dimensions on `l`.'
+
+    - signature: 'list_length(l: listany) -> int'
+      description: Return the number of elements in `l`.
+
+    - signature: 'list_length_max(l: listany, d: int) -> int'
+      description: '[Experimental](/cli/#experimental-mode)––Return the greatest length among all lists on dimension `d` of `l`.'
+
+    - signature: 'list_prepend(e: listelementany, l: listany) -> listany'
+      description: Prepends `e` to `l`.
+
 - type: Numbers
   description: Number functions take number-like arguments, e.g. [`int`](../types/int),
-    [`float`](../types/float), [`numeric`](../types/numeric).
+    [`float`](../types/float), [`numeric`](../types/numeric), unless otherwise specified.
   functions:
   - signature: 'abs(x: N) -> N'
     description: The absolute value of `x`
 
+  - signature: 'cbrt(x: double precision) -> double precision'
+    description: The cube root of `x`.
+
   - signature: 'ceil(x: N) -> N'
     description: The largest integer >= `x`
+
+  - signature: 'exp(x: N) -> N'
+    description: Exponential of `x` (e raised to the given power)
 
   - signature: 'floor(x: N) -> N'
     description: The largest integer <= `x`
 
+  - signature: 'ln(x: double precision) -> double precision'
+    description: Natural logarithm of `x`
+
+  - signature: 'ln(x: numeric) -> numeric'
+    description: Natural logarithm of `x`
+
+  - signature: 'log(x: double precision) -> double precision'
+    description: Base 10 logarithm of `x`
+
+  - signature: 'log(x: numeric) -> numeric'
+    description: Base 10 logarithm of `x`
+
+  - signature: 'log10(x: double precision) -> double precision'
+    description: Base 10 logarithm of `x`, same as `log`
+
+  - signature: 'log10(x: numeric) -> numeric'
+    description: Base 10 logarithm of `x`, same as `log`
+
+  - signature: 'log(x: numeric, b: numeric) -> numeric'
+    description: Base `b` logarithm of `x`
+
   - signature: 'mod(x: N, y: N) -> N'
     description: "`x % y`"
 
+  - signature: 'pow(x: double precision, y: double precision) -> double precision'
+    description: "Alias of `power`"
+
+  - signature: 'pow(x: numeric, y: numeric) -> numeric'
+    description: "Alias of `power`"
+
+  - signature: 'power(x: double precision, y: double precision) -> double precision'
+    description: "`x` raised to the power of `y`"
+
+  - signature: 'power(x: numeric, y: numeric) -> numeric'
+    description: "`x` raised to the power of `y`"
+
   - signature: 'round(x: N) -> N'
-    description: "`x` rounded to the nearest whole number; halves are rounded up"
+    description: >-
+      `x` rounded to the nearest whole number.
+      If `N` is `real` or `double precision`, rounds ties to the nearest even number.
+      If `N` is `numeric`, rounds ties away from zero.
 
   - signature: 'round(x: numeric, y: int) -> numeric'
     description: "`x` rounded to `y` decimal places, while retaining the same
-      [`numeric`](../types/numeric) scale; halves are rounded up"
+      [`numeric`](../types/numeric) scale; rounds ties away from zero."
+
+  - signature: 'sqrt(x: numeric) -> numeric'
+    description: The square root of `x`.
+
+  - signature: 'sqrt(x: double precision) -> double precision'
+    description: The square root of `x`.
+
+- type: Trigonometric
+  description: Trigonometric functions take and return `double precision` values.
+  functions:
+  - signature: 'cos(x: double precision) -> double precision'
+    description: The cosine of `x`, with `x` in radians.
+
+  - signature: 'cosh(x: double precision) -> double precision'
+    description: The hyperbolic cosine of `x`, with `x` as a hyperbolic angle.
+
+  - signature: 'cot(x: double precision) -> double precision'
+    description: The cotangent of `x`, with `x` in radians.
+
+  - signature: 'sin(x: double precision) -> double precision'
+    description: The sine of `x`, with `x` in radians.
+
+  - signature: 'sinh(x: double precision) -> double precision'
+    description: The hyperbolic sine of `x`, with `x` as a hyperbolic angle.
+
+  - signature: 'tan(x: double precision) -> double precision'
+    description: The tangent of `x`, with `x` in radians.
+
+  - signature: 'tanh(x: double precision) -> double precision'
+    description: The hyperbolic tangent of `x`, with `x` as a hyperbolic angle.
 
 - type: String
   functions:
@@ -113,6 +213,14 @@
   - signature: 'char_length(s: str) -> int'
     description: Number of code points in `s`
 
+  - signature: 'decode(s: text, format: text) -> bytea'
+    description: Decode `s` using the specified textual representation.
+    url: encode
+
+  - signature: 'encode(b: bytea, format: text) -> text'
+    description: Encode `b` using the specified textual representation.
+    url: encode
+
   - signature: 'length(s: str) -> int'
     description: Number of code points in `s`
     url: length
@@ -124,6 +232,9 @@
   - signature: 'length(s: bytea, encoding_name: str) -> int'
     description: Number of code points in `s` after encoding
     url: length
+
+  - signature: 'lower(s: str) -> str'
+    description: Convert `s` to lowercase.
 
   - signature: 'lpad(s: str, len: int) -> str'
     description: "Prepend `s` with spaces up to length `len`,
@@ -145,6 +256,9 @@
   - signature: 'octet_length(b: bytea) -> int'
     description: Number of bytes in `b`
 
+  - signature: 'position(sub: str IN s: str) -> int'
+    description: The starting index of `sub` within `s` or `0` if `sub` is not a substring of `s`.
+
   - signature: 'regexp_match(haystack: str, needle: str [, flags: str]]) -> str[]'
     description: >-
       Matches the regular expression `needle` against haystack, returning a
@@ -152,8 +266,14 @@
       `needle`, in order. If `flags` is set to the string `i` matches
       case-insensitively.
 
+  - signature: 'repeat(s: str, n: int) -> str'
+    description: Replicate the string `n` times.
+
   - signature: 'replace(s: str, f: str, r: str) -> str'
     description: "`s` with all instances of `f` replaced with `r`"
+
+  - signature: 'right(s: str, n: int) -> str'
+    description: The last `n` characters of `s`. If `n` is negative, all but the first `|n|` characters of `s`.
 
   - signature: 'rtrim(s: str) -> str'
     description: Trim all spaces from the right side of `s`.
@@ -176,6 +296,9 @@
     description: "Trims any character in `c` from `s` on the specified side.<br/><br/>Defaults:<br/>
       &bull; Side: `BOTH`<br/>
       &bull; `'c'`: `' '` (space)"
+
+  - signature: 'upper(s: str) -> str'
+    description: Convert `s` to uppercase.
 
 - type: Scalar
   description: Scalar functions take a list of scalar expressions
@@ -228,12 +351,12 @@
     description: "`s` must return exactly one column; `true` if applying [bool_op](#boolean)
       to `expression` and any value of `s` evaluates to `true`"
 
-- type: Time
+- type: Date and Time
   description: Time functions take or produce a time-like type, e.g. [`date`](../types/date),
-    [`timestamp`](../types/timestamp), [`timestamptz`](../types/timestamptz).
+    [`timestamp`](../types/timestamp), [`timestamp with time zone`](../types/timestamptz).
   functions:
   - signature: current_timestamp() -> timestamptz
-    description: 'The `timestamptz` representing when the query was executed.<br/><br/>**NOTE**:
+    description: 'The `timestamp with time zone` representing when the query was executed.<br/><br/>**NOTE**:
       Users cannot define views with queries containing `current_timestamp()`.'
 
   - signature: 'date_trunc(time_component: str, val: timestamp) -> timestamp'
@@ -249,12 +372,32 @@
       cannot define views with queries containing `mz_logical_timestamp()`.'
 
   - signature: now() -> timestamptz
-    description: 'The `timestamptz` representing when the query was executed.<br/><br/>**NOTE**:
+    description: 'The `timestamp with time zone` representing when the query was executed.<br/><br/>**NOTE**:
       Users cannot define views with queries containing `now()`.'
+
+  - signature: timestamp AT TIME ZONE zone -> timestamptz
+    description: 'Converts `timestamp` to the specified time zone, expressed as an offset from UTC. <br/><br/>**Known limitation:** You must explicitly cast the type for the time zone.'
+    url: timezone-and-at-time-zone
+
+  - signature: timestamptz AT TIME ZONE zone -> timestamp
+    description: 'Converts `timestamp with time zone` from UTC to the specified time zone, expressed as the local time. <br/><br/>**Known limitation:** You must explicitly cast the type for the time zone.'
+    url: timezone-and-at-time-zone
+
+  - signature: timezone(zone, timestamp) -> timestamptz
+    description: 'Converts `timestamp` to specified time zone, expressed as an offset from UTC. <br/><br/>**Known limitation:** You must explicitly cast the type for the time zone.'
+    url: timezone-and-at-time-zone
+
+  - signature: timezone(zone, timestamptz) -> timestamp
+    description: 'Converts `timestamp with time zone` from UTC to specified time zone, expressed as the local time. <br/><br/>**Known limitation:** You must explicitly cast the type for the time zone.'
+    url: timezone-and-at-time-zone
 
   - signature: 'to_timestamp(val: double precision) -> timestamptz'
     description: Converts Unix epoch (seconds since 00:00:00 UTC on January 1, 1970)
       to timestamp
+
+  - signature: 'to_char(val: timestamp, format: str)'
+    description: Converts a timestamp into a string using the specified format.
+    url: to_char
 
 - type: UUID
   functions:
@@ -331,9 +474,48 @@
       Null elements are omitted unless `ifnull` is non-null, in which case
       null elements are replaced with the value of `ifnull`.
 
+- type: Cryptography
+  functions:
+    - signature: 'digest(data: text, type: text) -> bytea'
+      description: >-
+        Computes a binary hash of the given text `data` using the specified `type` algorithm.
+        Supported hash algorithms are: `md5`, `sha1`, `sha224`, `sha256`, `sha384`, and `sha512`.
+    - signature: 'digest(data: bytea, type: text) -> bytea'
+      description: >-
+        Computes a binary hash of the given bytea `data` using the specified `type` algorithm.
+        The supported hash algorithms are the same as for the text variant of this function.
+    - signature: 'hmac(data: text, key: text, type: text) -> bytea'
+      description: >-
+        Computes a hashed MAC of the given text `data` using the specified `key` and
+        `type` algorithm. Supported hash algorithms are the same as for `digest`.
+    - signature: 'hmac(data: bytea, key: bytea, type: text) -> bytea'
+      description: >-
+        Computes a hashed MAC of the given bytea `data` using the specified `key` and
+        `type` algorithm. The supported hash algorithms are the same as for `digest`.
+
+- type: System information
+  description: Functions that return information about the system
+  functions:
+  - signature: 'mz_uptime() -> interval'
+    description: Returns the length of time that the materialized process has been running.
+  - signature: 'mz_version() -> text'
+    description: Returns the server's version information as a human-readable string.
+  - signature: 'mz_workers() -> bigint'
+    description: Returns the number of workers in use by the server.
+  - signature: 'format_type(oid: int, typemod: int) -> text'
+    description: Returns the canonical SQL name for the type specified by `oid` with `typemod` applied.
+  - signature: 'current_user() -> text'
+    description: >-
+      Returns the name of the user who executed the containing query.
+      At the moment this is always `materialize`.
+
 - type: PostgreSQL compatibility
   description: Functions whose primary purpose is to facilitate compatibility with PostgreSQL tools
   functions:
+  - signature: 'current_schema() -> text'
+    description: >-
+      Returns the name of the first non-implicit schema on the search path, or
+      `NULL` if the search path is empty.
   - signature: 'current_schemas(include_implicit: bool) -> text[]'
     description: >-
       Returns the names of the schemas on the search path.
@@ -347,3 +529,7 @@
     description: Returns the type of its input argument as a string.
   - signature: 'pg_encoding_to_char(encoding_id: integer) -> text'
     description: PostgreSQL compatibility shim. Not intended for direct use.
+  - signature: 'pg_postmaster_start_time() -> timestamptz'
+    description: Returns the time when the server started.
+  - signature: 'version() -> text'
+    description: Returns a PostgreSQL-compatible version string.

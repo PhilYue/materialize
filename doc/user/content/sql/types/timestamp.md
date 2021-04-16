@@ -8,18 +8,33 @@ aliases:
     - /sql/types/timestamptz
 ---
 
-`timestamp` and `timestamp with time zone` data expresses a date and time in UTC.
+`timestamp` and `timestamp with time zone` data expresses a date and time in
+UTC.
+
+## `timestamp` info
 
 Detail | Info
 -------|------
-**Quick Syntax** | `TIMESTAMP '2007-02-01 15:04:05'` <br/> `TIMESTAMP WITH TIME ZONE '2007-02-01 15:04:05+06'`
+**Quick Syntax** | `TIMESTAMP WITH TIME ZONE '2007-02-01 15:04:05+06'`
 **Size** | 8 bytes
+**Catalog name** | `pg_catalog.timestamp`
+**OID** | 1083
 **Min value** | 4713 BC
 **Max value** | 294276 AD
 **Resolution** | 1 microsecond / 14 digits
 
-For convenience and compatibility with PostgreSQL, `timestamptz` is accepted
-as an alias for `timestamp with time zone`.
+## `timestamp with time zone` info
+
+Detail | Info
+-------|------
+**Quick Syntax** | `TIMESTAMPTZ '2007-02-01 15:04:05+06'`
+**Aliases** | `timestamp with time zone`
+**Size** | 8 bytes
+**Catalog name** | `pg_catalog.timestamptz`
+**OID** | 1184
+**Min value** | 4713 BC
+**Max value** | 294276 AD
+**Resolution** | 1 microsecond / 14 digits
 
 ## Syntax
 
@@ -35,44 +50,50 @@ _tz&lowbar;offset_ | The timezone's distance, in hours, from UTC.
 
 ## Details
 
-- `timestamp` and `timestamptz` store data in [UTC](https://en.wikipedia.org/wiki/Coordinated_Universal_Time).
-- The difference between the two types is that `timestamptz` can read or write timestamps with the offset specified by the timezone. Importantly, `timestamptz` itself doesn't store any timezone data; Materialize simply performs the conversion from the time provided and UTC.
-- Materialize assumes all clients expect UTC time, and does not currently support any other timezones.
+- `timestamp` and `timestamp with time zone` store data in
+  [UTC](https://en.wikipedia.org/wiki/Coordinated_Universal_Time).
+- The difference between the two types is that `timestamp with time zone` can read or write
+  timestamps with the offset specified by the timezone. Importantly,
+  `timestamp with time zone` itself doesn't store any timezone data; Materialize simply
+  performs the conversion from the time provided and UTC.
+- Materialize assumes all clients expect UTC time, and does not currently
+  support any other timezones.
 
 ### Valid casts
 
-#### From `timestamp`
+In addition to the casts listed below, `timestamp` and `timestamptz` can be cast to and from each other implicitly.
+
+#### From `timestamp` or `timestamptz`
 
 You can [cast](../../functions/cast) `timestamp` or `timestamptz` to:
 
-- [`date`](../date)
-- [`text`](../text)
-- `timestamp`
-- `timestamptz`
+- [`date`](../date) (by assignment)
+- [`text`](../text) (by assignment)
 
-#### To `timestamp`
+#### To `timestamp` or `timestamptz`
 
 You can [cast](../../functions/cast) the following types to `timestamp` or `timestamptz`:
 
-- [`date`](../date)
-- [`text`](../text)
-- `timestamp`
-- `timestamptz`
+- [`date`](../date) (implicitly)
+- [`text`](../text) (explicitly)
 
 ### Valid operations
 
-`timestamp` data supports the following operations with other types.
+`timestamp` and `timestamp with time zone` data (collectively referred to as
+`timestamp/tz`) supports the following operations with other types.
 
 Operation | Computes
 ----------|------------
-[`date`](../date) `+` [`interval`](../interval) | [`timestamp`](../timestamp)
-[`date`](../date) `-` [`interval`](../interval) | [`timestamp`](../timestamp)
-[`date`](../date) `+` [`time`](../time) | [`timestamp`](../timestamp)
-[`timestamp`](../timestamp) `+` [`interval`](../interval) | [`timestamp`](../timestamp)
-[`timestamp`](../timestamp) `-` [`interval`](../interval) | [`timestamp`](../timestamp)
-[`timestamp`](../timestamp) `-` [`timestamp`](../timestamp) | [`interval`](../interval)
+[`date`](../date) `+` [`interval`](../interval) | [`timestamp/tz`](../timestamp)
+[`date`](../date) `-` [`interval`](../interval) | [`timestamp/tz`](../timestamp)
+[`date`](../date) `+` [`time`](../time) | [`timestamp/tz`](../timestamp)
+[`timestamp/tz`](../timestamp) `+` [`interval`](../interval) | [`timestamp/tz`](../timestamp)
+[`timestamp/tz`](../timestamp) `-` [`interval`](../interval) | [`timestamp/tz`](../timestamp)
+[`timestamp/tz`](../timestamp) `-` [`timestamp/tz`](../timestamp) | [`interval`](../interval)
 
 ## Examples
+
+### Return timestamp
 
 ```sql
 SELECT TIMESTAMP '2007-02-01 15:04:05' AS ts_v;
@@ -83,7 +104,7 @@ SELECT TIMESTAMP '2007-02-01 15:04:05' AS ts_v;
  2007-02-01 15:04:05
 ```
 
-<hr/>
+### Return timestamp with time zone
 
 ```sql
 SELECT TIMESTAMPTZ '2007-02-01 15:04:05+06' AS tstz_v;
@@ -93,3 +114,6 @@ SELECT TIMESTAMPTZ '2007-02-01 15:04:05+06' AS tstz_v;
 -------------------------
  2007-02-01 09:04:05 UTC
 ```
+
+## Related topics
+* [`TIMEZONE` and `AT TIME ZONE` functions](../../functions/timezone-and-at-time-zone)

@@ -26,12 +26,16 @@ Binary tarballs are built for every merge to the [main branch on
 GitHub][github]. These tarballs are not suitable for use in production.
 **Run unstable builds at your own risk.**
 
-Version | Binary tarball links
---------|---------------------
-main    | [Linux] / [macOS]
+| Method       | Available at                        |
+|--------------|-------------------------------------|
+| Tarball      | [Linux] / [macOS]                   |
+| Docker image | `materialize/materialized:unstable` |
 
-The tarballs for other commits on main can be constructed by replacing
-`latest` in the links above with the full 40-character commit hash.
+To get an arbitrary commit for:
+
+- **Tarballs**, replace `latest` in the URL with the full 40-character commit hash.
+- **Docker images**, append `-[40-char hash]` to the image name, e.g.
+  `materialize/materialized:unstable-edcedc23df0cc29f1d9f77a656444a00b53cfcb1`
 
 ## Support
 
@@ -45,8 +49,7 @@ To engage with our community support team:
     very seriously and usually provide an initial response within one business
     day.
 
-  * Start discussions or ask questions on our [Slack
-    workspace](https://join.slack.com/t/materializecommunity/shared_invite/zt-fpfvczj5-efOE_8qvM4fWpHSvMxpKbA).
+  * Start discussions or ask questions on our [Slack workspace](https://materialize.com/s/chat).
 
 We do not investigate issues with unsupported versions of Materialize. If you
 are using an unsupported version, please check that the issue reproduces on a
@@ -136,7 +139,7 @@ If you choose to use these unstable interfaces, you do so at your own risk.
 Backwards-incompatible changes may be made to these unstable interfaces at any
 time and without mention in the release notes.
 
-[Linux]: http://downloads.mtrlz.dev/materialized-latest-x86_64-unknown-linux-gnu.tar.gz
-[macOS]: http://downloads.mtrlz.dev/materialized-latest-x86_64-apple-darwin.tar.gz
+[Linux]: https://downloads.mtrlz.dev/materialized-latest-x86_64-unknown-linux-gnu.tar.gz
+[macOS]: https://downloads.mtrlz.dev/materialized-latest-x86_64-apple-darwin.tar.gz
 [github]: https://github.com/MaterializeInc/materialize
 [Semantic Versioning]: https://semver.org

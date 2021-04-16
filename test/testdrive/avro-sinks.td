@@ -129,6 +129,21 @@ $ set trxschema={
 $ kafka-create-topic topic=consistency
 $ kafka-create-topic topic=input
 
+> CREATE MATERIALIZED SOURCE input
+  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-input-${testdrive.seed}'
+    WITH (consistency = 'testdrive-consistency-${testdrive.seed}')
+  FORMAT AVRO USING SCHEMA '${schema}' ENVELOPE DEBEZIUM
+
+> CREATE SINK input_sink FROM input
+  INTO KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'input-sink' KEY (a)
+  WITH (consistency = true) FORMAT AVRO
+  USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
+
+> CREATE SINK input_sink_multiple_keys FROM input
+  INTO KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'input-sink' KEY (b, a)
+  WITH (consistency = true) FORMAT AVRO
+  USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
+
 $ kafka-ingest format=avro topic=input schema=${schema} timestamp=1
 {"before": null, "after": {"row": {"a": 1, "b": 1}}}
 {"before": null, "after": {"row": {"a": 2, "b": 2}}}
@@ -136,17 +151,15 @@ $ kafka-ingest format=avro topic=input schema=${schema} timestamp=1
 $ kafka-ingest format=avro topic=input schema=${schema} timestamp=1
 {"before": null, "after": {"row": {"a": 3, "b": 1}}}
 {"before": null, "after": {"row": {"a": 4, "b": 2}}}
+{"before": null, "after": {"row": {"a": 1, "b": 7}}}
 
 $ kafka-ingest format=avro topic=consistency timestamp=1 schema=${trxschema}
 {"status":"BEGIN","id":"1","event_count":null,"data_collections":null}
 {"status":"END","id":"1","event_count":{"long": 2},"data_collections":{"array": [{"event_count": 2, "data_collection": "testdrive-input-${testdrive.seed}"}]}}
 {"status":"BEGIN","id":"2","event_count":null,"data_collections":null}
 {"status":"END","id":"2","event_count":{"long": 2},"data_collections":{"array": [{"event_count": 2, "data_collection": "testdrive-input-${testdrive.seed}"}]}}
-
-> CREATE MATERIALIZED SOURCE input
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-input-${testdrive.seed}'
-    WITH (consistency = 'testdrive-consistency-${testdrive.seed}')
-  FORMAT AVRO USING SCHEMA '${schema}' ENVELOPE DEBEZIUM
+{"status":"BEGIN","id":"3","event_count":null,"data_collections":null}
+{"status":"END","id":"3","event_count":{"long": 1},"data_collections":{"array": [{"event_count": 1, "data_collection": "testdrive-input-${testdrive.seed}"}]}}
 
 > SELECT * FROM input;
 a  b
@@ -155,12 +168,7 @@ a  b
 2  2
 3  1
 4  2
-
-> CREATE SINK input_sink FROM input
-  INTO KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'input-sink' KEY (a)
-  WITH (consistency = true) FORMAT AVRO
-  USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-  AS OF 1
+1  7
 
 $ kafka-verify format=avro sink=materialize.public.input_sink
 {"a": 1} {"before": null, "after": {"row": {"a": 1, "b": 1}}, "transaction": {"id": "1"}}
@@ -170,10 +178,9 @@ $ kafka-verify format=avro sink=materialize.public.input_sink
 
 $ kafka-verify format=avro sink=materialize.public.input_sink consistency=debezium
 {"id": "1", "status": "BEGIN", "event_count": null}
-{"id": "2", "status": "BEGIN", "event_count": null}
 {"id": "1", "status": "END", "event_count": {"long": 2}}
+{"id": "2", "status": "BEGIN", "event_count": null}
 {"id": "2", "status": "END", "event_count": {"long": 2}}
-
 ! CREATE SINK bad_sink FROM input
   INTO KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'input-sink' KEY (a, a)
   FORMAT AVRO
@@ -187,12 +194,6 @@ Repeated column name in sink key: a
   FORMAT AVRO
   USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
 Ambiguous column: a
-
-> CREATE SINK input_sink_multiple_keys FROM input
-  INTO KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'input-sink' KEY (b, a)
-  WITH (consistency = true) FORMAT AVRO
-  USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-  AS OF 1
 
 $ kafka-verify format=avro sink=materialize.public.input_sink_multiple_keys
 {"b": 1, "a": 1} {"before": null, "after": {"row": {"a": 1, "b": 1}}, "transaction": {"id": "1"}}

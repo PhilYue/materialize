@@ -11,17 +11,17 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use rdkafka::admin::NewPartitions;
+use rdkafka::producer::Producer;
 
-use ore::cast::CastFrom;
 use ore::collections::CollectionExt;
-use ore::retry;
+use ore::retry::Retry;
 
 use crate::action::{Action, State};
 use crate::parser::BuiltinCommand;
 
 pub struct AddPartitionsAction {
     topic_prefix: String,
-    partitions: i32,
+    partitions: usize,
 }
 
 pub fn build_add_partitions(mut cmd: BuiltinCommand) -> Result<AddPartitionsAction, String> {
@@ -65,7 +65,7 @@ impl Action for AddPartitionsAction {
             }
         }
 
-        let partitions = NewPartitions::new(&topic_name, usize::cast_from(self.partitions));
+        let partitions = NewPartitions::new(&topic_name, self.partitions);
         let res = state
             .kafka_admin
             .create_partitions(&[partitions], &state.kafka_admin_opts)
@@ -81,27 +81,29 @@ impl Action for AddPartitionsAction {
             return Err(e.to_string());
         }
 
-        retry::retry_for(Duration::from_secs(8), |_| async {
-            let metadata = state
-                .kafka_producer
-                .client()
-                .fetch_metadata(Some(&topic_name), Some(Duration::from_secs(1)))
-                .map_err(|e| e.to_string())?;
-            if metadata.topics().len() != 1 {
-                return Err("metadata fetch returned no topics".to_string());
-            }
-            let topic = metadata.topics().into_element();
-            if topic.partitions().len() as i32 != self.partitions {
-                return Err(format!(
-                    "topic {} has {} partitions when exactly {} was expected",
-                    topic_name,
-                    topic.partitions().len(),
-                    self.partitions,
-                ));
-            }
-            Ok(())
-        })
-        .await?;
+        Retry::default()
+            .max_duration(state.default_timeout)
+            .retry(|_| async {
+                let metadata = state
+                    .kafka_producer
+                    .client()
+                    .fetch_metadata(Some(&topic_name), Some(Duration::from_secs(1)))
+                    .map_err(|e| e.to_string())?;
+                if metadata.topics().len() != 1 {
+                    return Err("metadata fetch returned no topics".to_string());
+                }
+                let topic = metadata.topics().into_element();
+                if topic.partitions().len() != self.partitions {
+                    return Err(format!(
+                        "topic {} has {} partitions when exactly {} was expected",
+                        topic_name,
+                        topic.partitions().len(),
+                        self.partitions,
+                    ));
+                }
+                Ok(())
+            })
+            .await?;
 
         state.kafka_topics.insert(topic_name, self.partitions);
         Ok(())
